@@ -1,0 +1,510 @@
+<meta charset="utf-8">
+<title>CouchDB Erlang vs Rust</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: one reading column; each benchmark is a figure (chart + table view)
+   under a short heading. Summary ratio chart first, detail after. */
+:root {
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11,11,11,0.10);
+  --erlang: #2a78d6;
+  --rust: #eb6834;
+  --good: #006300;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --erlang: #3987e5; --rust: #d95926; --good: #0ca30c; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --erlang: #3987e5; --rust: #d95926; --good: #0ca30c; color-scheme: dark;
+}
+body {
+  background: var(--page); color: var(--ink); font: 15px/1.55 var(--font);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+main { max-width: 980px; margin: 0 auto; padding-block: 40px 64px; display: grid; gap: 40px; }
+header { display: grid; gap: 12px; }
+.eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+h1 { font-size: clamp(28px, 4.5vw, 40px); line-height: 1.15; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+h2 { font-size: 22px; margin: 0; text-wrap: balance; }
+h3 { font-size: 15px; margin: 0; }
+p { margin: 0; max-width: 68ch; color: var(--ink-2); }
+.facts { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; color: var(--ink-2); }
+.facts b { color: var(--ink); font-variant-numeric: tabular-nums; }
+section { display: grid; gap: 16px; }
+.figure { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 18px 18px 12px; display: grid; gap: 10px; min-width: 0; }
+.figrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; }
+.fighead { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 16px; }
+.sub { font-size: 12.5px; color: var(--muted); }
+.legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg text { font-family: var(--font); }
+.tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+.rowlabel { font-size: 12.5px; fill: var(--ink-2); }
+.val { font-size: 11.5px; fill: var(--ink-2); font-variant-numeric: tabular-nums; }
+.ratio-lbl { font-size: 12px; fill: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.hit { fill: transparent; cursor: default; }
+.hit:focus { outline: none; }
+.bar { transition: opacity .12s; }
+.hovered .bar:not(.on) { opacity: .45; }
+details { font-size: 13px; }
+summary { cursor: pointer; color: var(--muted); width: fit-content; }
+summary:focus-visible, .hit:focus-visible { outline: 2px solid var(--erlang); outline-offset: 2px; }
+.tablewrap { overflow-x: auto; margin-top: 8px; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; min-width: 100%; }
+th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 500; }
+.alltable th:nth-child(2), .alltable td:nth-child(2) { text-align: left; color: var(--ink-2); }
+#tip { position: fixed; pointer-events: none; z-index: 20; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--ring); border-radius: 8px; padding: 8px 10px; font-size: 12.5px;
+  box-shadow: 0 4px 18px rgba(0,0,0,.12); display: grid; gap: 3px; min-width: 150px; }
+#tip .t { color: var(--muted); font-size: 11.5px; }
+#tip .r { display: grid; grid-template-columns: 12px 1fr auto; gap: 8px; align-items: center; }
+#tip .k { height: 2px; border-radius: 1px; }
+#tip .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+ul.notes { margin: 0; padding-left: 18px; color: var(--ink-2); display: grid; gap: 6px; max-width: 76ch; }
+code { font-family: var(--mono); font-size: 0.92em; }
+.seg { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; padding: 2px; gap: 2px; background: var(--surface); width: fit-content; }
+.seg button { font: inherit; font-size: 13px; color: var(--ink-2); background: transparent; border: 0; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--grid); color: var(--ink); font-weight: 600; }
+.seg button:focus-visible { outline: 2px solid var(--erlang); outline-offset: 1px; }
+.ctlrow { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; font-size: 13px; color: var(--muted); }
+.warn { color: var(--ink); background: color-mix(in srgb, var(--rust) 12%, transparent); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
+@media (prefers-reduced-motion: reduce) { .bar { transition: none; } }
+</style>
+
+<main>
+  <header>
+    <div class="eyebrow">Stress benchmark · same machine, same data, same replicator</div>
+    <h1>Apache CouchDB 3.5.3 (Erlang) vs couchdb-rs</h1>
+    <p id="intro"></p>
+    <div class="facts" id="facts"></div>
+    <div class="legend" aria-hidden="true">
+      <span><i style="background:var(--erlang)"></i>CouchDB (Erlang)</span>
+      <span><i style="background:var(--rust)"></i>couchdb-rs</span>
+    </div>
+    <div id="partial" class="warn" hidden></div>
+  </header>
+
+  <section>
+    <h2>Summary</h2>
+    <p>How many times faster couchdb-rs is than CouchDB on each headline measure. Right of 1× means couchdb-rs is faster; left means CouchDB is faster.</p>
+    <div class="figure" id="fig-summary"></div>
+  </section>
+
+  <section>
+    <h2>Bulk load</h2>
+    <p id="load-text"></p>
+    <div class="figrow"><div class="figure" id="fig-load-mb"></div><div class="figure" id="fig-load-docs"></div></div>
+  </section>
+
+  <section>
+    <h2>Writes</h2>
+    <p>Single-document PUTs of exact sizes, written into the loaded database. Docs up to 64 KB are JSON; larger ones carry the bytes as one attachment, uploaded as <code>multipart/related</code>.</p>
+    <div class="figrow"><div class="figure" id="fig-put-ops"></div><div class="figure" id="fig-put-mb"></div></div>
+  </section>
+
+  <section>
+    <h2>Reads</h2>
+    <p>Random GETs of documents (or their attachment) drawn from the loaded dataset in each size band. The dataset is larger than RAM, so many reads go to disk.</p>
+    <div class="figrow"><div class="figure" id="fig-get-ops"></div><div class="figure" id="fig-get-mb"></div></div>
+  </section>
+
+  <section>
+    <h2>Deletes</h2>
+    <p>Deleting the documents created by the write test, with their current revision.</p>
+    <div class="figure" id="fig-del"></div>
+  </section>
+
+  <section>
+    <h2>Latency</h2>
+    <p>Per-request latency from the client's side, measured for every operation in the tests above. Mean and nearest-rank percentiles; lower is better.</p>
+    <div class="ctlrow"><span id="pct-label">Show</span>
+      <div class="seg" role="group" aria-labelledby="pct-label" id="pct">
+        <button type="button" id="pct-mean" data-k="mean_ms" aria-pressed="false">mean</button>
+        <button type="button" id="pct-p50" data-k="p50_ms" aria-pressed="false">p50</button>
+        <button type="button" id="pct-p90" data-k="p90_ms" aria-pressed="false">p90</button>
+        <button type="button" id="pct-p99" data-k="p99_ms" aria-pressed="true">p99</button>
+      </div>
+    </div>
+    <div class="figrow"><div class="figure" id="fig-lat-put"></div><div class="figure" id="fig-lat-get"></div></div>
+    <div class="figrow"><div class="figure" id="fig-lat-del"></div><div class="figure" id="fig-lat-view"></div></div>
+    <div class="figure" id="fig-lat-all"></div>
+  </section>
+
+  <section>
+    <h2>Views</h2>
+    <p>A JavaScript map function (<code>emit([doc.band, doc.group], doc.size)</code>) with the built-in <code>_sum</code> reduce, built over every document, then queried. Both servers run map functions in QuickJS.</p>
+    <div class="figrow"><div class="figure" id="fig-view-build"></div><div class="figure" id="fig-view-q"></div></div>
+  </section>
+
+  <section>
+    <h2>Replication</h2>
+    <p>One full replication of the loaded database into a new database on the same server, driven by CouchDB's own replicator in both cases. That replicator talks to couchdb-rs over HTTP, so this also shows the two interoperate.</p>
+    <div class="figrow"><div class="figure" id="fig-repl-time"></div><div class="figure" id="fig-repl-rate"></div></div>
+  </section>
+
+  <section>
+    <h2>Disk</h2>
+    <div class="figure" id="fig-disk"></div>
+  </section>
+
+  <section>
+    <h2>Method</h2>
+    <ul class="notes" id="method"></ul>
+  </section>
+</main>
+<div id="tip" hidden></div>
+
+<script id="data" type="application/json">{"results": {"erlang": {"delete": {"100B": {"bytes": 0, "errors": 0, "max_ms": 17.466667, "mb_per_sec": 0.0, "mean_ms": 3.3986441901999873, "ops": 5000, "ops_per_sec": 4680.994148076698, "p50_ms": 3.27425, "p90_ms": 3.694125, "p95_ms": 4.076541000000001, "p99_ms": 6.260458, "secs": 1.068149167}, "100KB": {"bytes": 0, "errors": 0, "max_ms": 6.767874999999999, "mb_per_sec": 0.0, "mean_ms": 4.1316000496666625, "ops": 3000, "ops_per_sec": 3851.710847660309, "p50_ms": 4.081708, "p90_ms": 4.6686250000000005, "p95_ms": 5.0435, "p99_ms": 6.021958, "secs": 0.778874666}, "100MB": {"bytes": 0, "errors": 0, "max_ms": 86.05225, "mb_per_sec": 0.0, "mean_ms": 79.87076665000001, "ops": 20, "ops_per_sec": 127.18418973337424, "p50_ms": 85.981084, "p90_ms": 86.024041, "p95_ms": 86.03991599999999, "p99_ms": 86.05225, "secs": 0.15725225}, "10KB": {"bytes": 0, "errors": 0, "max_ms": 16.439625, "mb_per_sec": 0.0, "mean_ms": 3.634222457799996, "ops": 5000, "ops_per_sec": 4380.432215056443, "p50_ms": 3.556291, "p90_ms": 4.10375, "p95_ms": 4.484458, "p99_ms": 5.478249999999999, "secs": 1.141439875}, "10MB": {"bytes": 0, "errors": 0, "max_ms": 12.466125, "mb_per_sec": 0.0, "mean_ms": 11.165654565, "ops": 200, "ops_per_sec": 1393.5861937415784, "p50_ms": 11.259458, "p90_ms": 11.842166, "p95_ms": 12.32775, "p99_ms": 12.464959, "secs": 0.143514625}, "1GB": {"bytes": 0, "errors": 0, "max_ms": 345.655167, "mb_per_sec": 0.0, "mean_ms": 290.05560449999996, "ops": 4, "ops_per_sec": 11.571395510298542, "p50_ms": 345.654667, "p90_ms": 345.655167, "p95_ms": 345.655167, "p99_ms": 345.655167, "secs": 0.34568}, "1KB": {"bytes": 0, "errors": 0, "max_ms": 4.9065840000000005, "mb_per_sec": 0.0, "mean_ms": 3.4298946062000004, "ops": 5000, "ops_per_sec": 4637.315189495112, "p50_ms": 3.44875, "p90_ms": 3.787375, "p95_ms": 3.987375, "p99_ms": 4.441333, "secs": 1.078210084}, "1MB": {"bytes": 0, "errors": 0, "max_ms": 6.271332999999999, "mb_per_sec": 0.0, "mean_ms": 4.486434673000001, "ops": 1000, "ops_per_sec": 3533.7099033647664, "p50_ms": 4.373416, "p90_ms": 5.533958, "p95_ms": 5.733125, "p99_ms": 6.141167, "secs": 0.282988708}}, "get": {"100B": {"avg_doc_bytes": 388, "band": "1e2", "bytes": 2166795, "concurrency": 16, "errors": 0, "max_ms": 6.214125, "mb_per_sec": 5.0062984245342586, "mean_ms": 1.379387275600003, "ops": 5000, "ops_per_sec": 11552.312111977042, "p50_ms": 1.340333, "p90_ms": 1.655333, "p95_ms": 1.794292, "p99_ms": 2.795875, "secs": 0.432813791}, "100KB": {"avg_doc_bytes": 393662, "band": "1e5", "bytes": 1180988949, "concurrency": 16, "errors": 0, "max_ms": 350.861125, "mb_per_sec": 50.21799929969473, "mean_ms": 125.3221696956667, "ops": 3000, "ops_per_sec": 127.5659675110848, "p50_ms": 101.353667, "p90_ms": 253.870458, "p95_ms": 282.84925, "p99_ms": 317.143167, "secs": 23.517244125}, "100MB": {"avg_doc_bytes": 500864507, "band": "1e8", "bytes": 10017290149, "concurrency": 4, "errors": 0, "max_ms": 24888.802, "mb_per_sec": 153.3819950145673, "mean_ms": 12247.0664186, "ops": 20, "ops_per_sec": 0.30623450600535723, "p50_ms": 10616.270083, "p90_ms": 22424.084084, "p95_ms": 22972.162167, "p99_ms": 24888.802, "secs": 65.309426625}, "10KB": {"avg_doc_bytes": 39282, "band": "1e4", "bytes": 196595163, "concurrency": 16, "errors": 0, "max_ms": 33.833, "mb_per_sec": 122.19868442507774, "mean_ms": 5.134253108800004, "ops": 5000, "ops_per_sec": 3107.876169493492, "p50_ms": 0.757375, "p90_ms": 24.329667, "p95_ms": 27.357041, "p99_ms": 30.753917, "secs": 1.6088157079999998}, "10MB": {"avg_doc_bytes": 37326922, "band": "1e7", "bytes": 7465384430, "concurrency": 8, "errors": 0, "max_ms": 8364.295666, "mb_per_sec": 102.1302347142827, "mean_ms": 2897.7181816800003, "ops": 200, "ops_per_sec": 2.736101152510446, "p50_ms": 2321.972583, "p90_ms": 5569.964875000001, "p95_ms": 6982.579708, "p99_ms": 7741.373, "secs": 73.09671275}, "1KB": {"avg_doc_bytes": 3897, "band": "1e3", "bytes": 19713813, "concurrency": 16, "errors": 0, "max_ms": 7.463125, "mb_per_sec": 47.29793072589241, "mean_ms": 1.3277197079999985, "ops": 5000, "ops_per_sec": 11996.13964226312, "p50_ms": 1.2855, "p90_ms": 1.5987079999999998, "p95_ms": 1.733209, "p99_ms": 2.9720419999999996, "secs": 0.41680075}, "1MB": {"avg_doc_bytes": 3885492, "band": "1e6", "bytes": 3885492543, "concurrency": 16, "errors": 0, "max_ms": 2706.793834, "mb_per_sec": 68.51649229006664, "mean_ms": 903.8954725699992, "ops": 1000, "ops_per_sec": 17.633927110091648, "p50_ms": 730.1096249999999, "p90_ms": 1834.1265, "p95_ms": 2135.883917, "p99_ms": 2456.9254159999996, "secs": 56.708865459}}, "load": {"attachment_docs": 91510, "bands": {"1e2": {"bytes": 1000000099, "docs": 2560333}, "1e3": {"bytes": 4000004487, "docs": 1024214}, "1e4": {"bytes": 10000051309, "docs": 255765}, "1e5": {"bytes": 15000224033, "docs": 38583}, "1e6": {"bytes": 20005163650, "docs": 5101}, "1e7": {"bytes": 25013540439, "docs": 640}, "1e8": {"bytes": 25225888261, "docs": 59}}, "bytes": 100244872278, "doc_count_after": 3884695, "docs": 3884695, "docs_per_sec": 4847.5570027810845, "errors": 0, "file_bytes_after": 108342575327, "json_docs": 3793185, "mb_per_sec": 125.09160503054018, "secs": 801.371700791}, "put": {"100B": {"bytes": 500000, "concurrency": 16, "errors": 0, "max_ms": 4.307083, "mb_per_sec": 0.8129940289312089, "mean_ms": 1.9419182334000071, "ops": 5000, "ops_per_sec": 8129.940289312089, "p50_ms": 1.918875, "p90_ms": 2.203792, "p95_ms": 2.29725, "p99_ms": 2.635167, "secs": 0.615010667}, "100KB": {"bytes": 300000000, "concurrency": 16, "errors": 0, "max_ms": 10.300792, "mb_per_sec": 238.18944277601295, "mean_ms": 6.695176675666652, "ops": 3000, "ops_per_sec": 2381.8944277601295, "p50_ms": 6.663083, "p90_ms": 7.494541000000001, "p95_ms": 7.839375, "p99_ms": 9.136083, "secs": 1.259501666}, "100MB": {"bytes": 2000000000, "concurrency": 4, "errors": 0, "max_ms": 858.231125, "mb_per_sec": 485.6325409993749, "mean_ms": 821.27929585, "ops": 20, "ops_per_sec": 4.856325409993748, "p50_ms": 815.3704160000001, "p90_ms": 857.809083, "p95_ms": 858.034042, "p99_ms": 858.231125, "secs": 4.118340167}, "10KB": {"bytes": 50000000, "concurrency": 16, "errors": 0, "max_ms": 4.6155, "mb_per_sec": 70.36032578238044, "mean_ms": 2.232226311399998, "ops": 5000, "ops_per_sec": 7036.032578238044, "p50_ms": 2.17475, "p90_ms": 2.5174580000000004, "p95_ms": 2.67025, "p99_ms": 3.6585, "secs": 0.71062775}, "10MB": {"bytes": 2000000000, "concurrency": 8, "errors": 0, "max_ms": 168.478542, "mb_per_sec": 560.2134581339528, "mean_ms": 142.54001413999998, "ops": 200, "ops_per_sec": 56.02134581339528, "p50_ms": 139.297708, "p90_ms": 154.348708, "p95_ms": 156.232833, "p99_ms": 167.900542, "secs": 3.57006775}, "1GB": {"bytes": 4000000000, "concurrency": 2, "errors": 0, "max_ms": 7009.3336659999995, "mb_per_sec": 286.8419699037533, "mean_ms": 6972.4642082499995, "ops": 4, "ops_per_sec": 0.28684196990375327, "p50_ms": 6935.619167000001, "p90_ms": 7009.3336659999995, "p95_ms": 7009.3336659999995, "p99_ms": 7009.3336659999995, "secs": 13.944960709}, "1KB": {"bytes": 5000000, "concurrency": 16, "errors": 0, "max_ms": 3.318625, "mb_per_sec": 8.127494933693523, "mean_ms": 1.946536891799998, "ops": 5000, "ops_per_sec": 8127.494933693523, "p50_ms": 1.9235, "p90_ms": 2.2098750000000003, "p95_ms": 2.297542, "p99_ms": 2.453583, "secs": 0.615195708}, "1MB": {"bytes": 1000000000, "concurrency": 16, "errors": 0, "max_ms": 48.626792, "mb_per_sec": 418.9462871286235, "mean_ms": 38.08904550500003, "ops": 1000, "ops_per_sec": 418.9462871286235, "p50_ms": 38.073625, "p90_ms": 41.034875, "p95_ms": 41.893, "p99_ms": 45.00025, "secs": 2.386940834}}, "replicate": {"doc_write_failures": 0, "docs_per_sec": 2890.987586446693, "docs_written": 3903920, "error": null, "mb_per_sec": 74.5339550720821, "ok": true, "reason": null, "secs": 1343.726281708, "source_docs": 3884696, "source_external_bytes": 100153234310, "target_docs": 3884696}, "server": {"bands": [{"band": 2, "share": 0.01}, {"band": 3, "share": 0.04}, {"band": 4, "share": 0.1}, {"band": 5, "share": 0.15}, {"band": 6, "share": 0.2}, {"band": 7, "share": 0.25}, {"band": 8, "share": 0.25}], "dataset_bytes": 100244872278, "dataset_docs": 3884695, "json_max_bytes": 65536, "seed": 42, "url": "http://127.0.0.1:15984", "welcome": {"couchdb": "Welcome", "features": ["quickjs", "access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"], "git_sha": "7a1f97558", "uuid": "6c5c5e7a1f0b4a3a9c2f0e1d2c3b4a59", "vendor": {"name": "The Apache Software Foundation"}, "version": "3.5.3"}}, "view": {"build_secs": 183.912603958, "docs_indexed": 3884696, "docs_per_sec": 21122.51099923062, "index_file_bytes": 2088535949, "queries": {"group_level1_reduce": {"bytes": 124500, "errors": 0, "max_ms": 8.727250000000002, "mb_per_sec": 0.27041612297640827, "mean_ms": 7.339413184, "ops": 500, "ops_per_sec": 1086.008526009672, "p50_ms": 7.343667, "p90_ms": 7.80375, "p95_ms": 7.939625, "p99_ms": 8.181209, "secs": 0.460401542}, "include_docs_limit10": {"bytes": 190501716, "errors": 0, "max_ms": 11.8545, "mb_per_sec": 196.5199427260423, "mean_ms": 7.735949529999998, "ops": 2000, "ops_per_sec": 2063.182913544383, "p50_ms": 7.677542, "p90_ms": 8.616999999999999, "p95_ms": 9.067334, "p99_ms": 9.90125, "secs": 0.969376}, "key_lookup_limit20": {"bytes": 4440777, "errors": 0, "max_ms": 2.632583, "mb_per_sec": 11.800532802874208, "mean_ms": 1.1969643875999996, "ops": 5000, "ops_per_sec": 13286.563142974988, "p50_ms": 1.182458, "p90_ms": 1.466167, "p95_ms": 1.568708, "p99_ms": 1.789583, "secs": 0.376320042}, "key_reduce": {"bytes": 131785, "errors": 0, "max_ms": 2.788333, "mb_per_sec": 0.4986469785495, "mean_ms": 1.4021918803333349, "ops": 3000, "ops_per_sec": 11351.374857901124, "p50_ms": 1.348917, "p90_ms": 1.9055, "p95_ms": 2.059625, "p99_ms": 2.3353750000000004, "secs": 0.264285167}}, "reduce_expected": 100244872278, "reduce_total": 100244872278, "request_timeouts_during_build": 3, "rows": 3884695}}, "rust": {"delete": {"100B": {"bytes": 0, "errors": 0, "max_ms": 2.8350839999999997, "mb_per_sec": 0.0, "mean_ms": 0.7690994540000008, "ops": 5000, "ops_per_sec": 20643.42807342887, "p50_ms": 0.67875, "p90_ms": 0.948458, "p95_ms": 1.429833, "p99_ms": 2.0440419999999997, "secs": 0.242207834}, "100KB": {"bytes": 0, "errors": 0, "max_ms": 32.945291000000005, "mb_per_sec": 0.0, "mean_ms": 1.707969471333335, "ops": 3000, "ops_per_sec": 9331.069848028164, "p50_ms": 1.129625, "p90_ms": 2.8125, "p95_ms": 3.961832999999999, "p99_ms": 7.80525, "secs": 0.321506542}, "100MB": {"bytes": 0, "errors": 0, "max_ms": 1.880209, "mb_per_sec": 0.0, "mean_ms": 1.5406291500000002, "ops": 20, "ops_per_sec": 8833.11073894271, "p50_ms": 1.81925, "p90_ms": 1.855792, "p95_ms": 1.8595, "p99_ms": 1.880209, "secs": 0.002264208}, "10KB": {"bytes": 0, "errors": 0, "max_ms": 4.287333, "mb_per_sec": 0.0, "mean_ms": 1.330072755400001, "ops": 5000, "ops_per_sec": 11944.482028420727, "p50_ms": 1.077417, "p90_ms": 2.3305, "p95_ms": 2.773458, "p99_ms": 3.957959, "secs": 0.418603334}, "10MB": {"bytes": 0, "errors": 0, "max_ms": 3.212667, "mb_per_sec": 0.0, "mean_ms": 1.769725665, "ops": 200, "ops_per_sec": 8820.659324879085, "p50_ms": 1.640666, "p90_ms": 2.882875, "p95_ms": 3.136875, "p99_ms": 3.167959, "secs": 0.022674042}, "1GB": {"bytes": 0, "errors": 0, "max_ms": 1.1019580000000002, "mb_per_sec": 0.0, "mean_ms": 0.8455312500000001, "ops": 4, "ops_per_sec": 3627.022405024152, "p50_ms": 0.601125, "p90_ms": 1.1019580000000002, "p95_ms": 1.1019580000000002, "p99_ms": 1.1019580000000002, "secs": 0.001102833}, "1KB": {"bytes": 0, "errors": 0, "max_ms": 3.403083, "mb_per_sec": 0.0, "mean_ms": 0.8480485954000022, "ops": 5000, "ops_per_sec": 18725.463814102914, "p50_ms": 0.71925, "p90_ms": 1.1104159999999998, "p95_ms": 1.778584, "p99_ms": 2.514875, "secs": 0.267016083}, "1MB": {"bytes": 0, "errors": 0, "max_ms": 4.2260420000000005, "mb_per_sec": 0.0, "mean_ms": 1.506163114999999, "ops": 1000, "ops_per_sec": 10561.334952738023, "p50_ms": 1.1855, "p90_ms": 2.648666, "p95_ms": 3.575166, "p99_ms": 4.137333, "secs": 0.094685}}, "get": {"100B": {"avg_doc_bytes": 388, "band": "1e2", "bytes": 2166795, "concurrency": 16, "errors": 0, "max_ms": 5.350334, "mb_per_sec": 15.889365236066846, "mean_ms": 0.4324334524000001, "ops": 5000, "ops_per_sec": 36665.59419803638, "p50_ms": 0.3947500000000001, "p90_ms": 0.618042, "p95_ms": 0.7116250000000001, "p99_ms": 1.36, "secs": 0.136367625}, "100KB": {"avg_doc_bytes": 393662, "band": "1e5", "bytes": 1180988949, "concurrency": 16, "errors": 0, "max_ms": 9.067083, "mb_per_sec": 2668.9111334581594, "mean_ms": 2.350208728333329, "ops": 3000, "ops_per_sec": 6779.685285924278, "p50_ms": 2.082709, "p90_ms": 4.104, "p95_ms": 4.564042, "p99_ms": 5.407375, "secs": 0.442498416}, "100MB": {"avg_doc_bytes": 500864507, "band": "1e8", "bytes": 10017290149, "concurrency": 4, "errors": 0, "max_ms": 2113.26525, "mb_per_sec": 1766.0239794096783, "mean_ms": 1055.95696045, "ops": 20, "ops_per_sec": 3.525951536076802, "p50_ms": 989.938, "p90_ms": 1942.263833, "p95_ms": 2013.3182500000005, "p99_ms": 2113.26525, "secs": 5.672227708}, "10KB": {"avg_doc_bytes": 39282, "band": "1e4", "bytes": 196595163, "concurrency": 16, "errors": 0, "max_ms": 2.0604579999999997, "mb_per_sec": 986.570215864566, "mean_ms": 0.6340062036000006, "ops": 5000, "ops_per_sec": 25091.416309783926, "p50_ms": 0.616833, "p90_ms": 1.0110830000000002, "p95_ms": 1.142208, "p99_ms": 1.490833, "secs": 0.199271334}, "10MB": {"avg_doc_bytes": 37326922, "band": "1e7", "bytes": 7465384430, "concurrency": 8, "errors": 0, "max_ms": 320.706834, "mb_per_sec": 2713.6180967274, "mean_ms": 107.32477376499996, "ops": 200, "ops_per_sec": 72.698683428079, "p50_ms": 84.34733299999999, "p90_ms": 217.355417, "p95_ms": 268.237166, "p99_ms": 308.468666, "secs": 2.751081458}, "1KB": {"avg_doc_bytes": 3897, "band": "1e3", "bytes": 19713813, "concurrency": 16, "errors": 0, "max_ms": 1.601292, "mb_per_sec": 159.90931075237353, "mean_ms": 0.3898488699999992, "ops": 5000, "ops_per_sec": 40557.68175146369, "p50_ms": 0.367583, "p90_ms": 0.5812080000000001, "p95_ms": 0.64925, "p99_ms": 1.028834, "secs": 0.123281208}, "1MB": {"avg_doc_bytes": 3885492, "band": "1e6", "bytes": 3885492543, "concurrency": 16, "errors": 0, "max_ms": 48.738042, "mb_per_sec": 3713.855031761536, "mean_ms": 16.529268418, "ops": 1000, "ops_per_sec": 955.8260608303876, "p50_ms": 13.640042, "p90_ms": 33.820083000000004, "p95_ms": 38.567249999999994, "p99_ms": 43.633584000000006, "secs": 1.046215458}}, "load": {"attachment_docs": 91510, "bands": {"1e2": {"bytes": 1000000099, "docs": 2560333}, "1e3": {"bytes": 4000004487, "docs": 1024214}, "1e4": {"bytes": 10000051309, "docs": 255765}, "1e5": {"bytes": 15000224033, "docs": 38583}, "1e6": {"bytes": 20005163650, "docs": 5101}, "1e7": {"bytes": 25013540439, "docs": 640}, "1e8": {"bytes": 25225888261, "docs": 59}}, "bytes": 100244872278, "doc_count_after": 3884695, "docs": 3884695, "docs_per_sec": 12454.45700442018, "errors": 0, "file_bytes_after": 107697811586, "json_docs": 3793185, "mb_per_sec": 321.38828188569335, "secs": 311.912032666}, "put": {"100B": {"bytes": 500000, "concurrency": 16, "errors": 0, "max_ms": 6.217625, "mb_per_sec": 1.8998765080269784, "mean_ms": 0.8259440458000014, "ops": 5000, "ops_per_sec": 18998.765080269783, "p50_ms": 0.6585, "p90_ms": 0.973375, "p95_ms": 2.10675, "p99_ms": 3.995958, "secs": 0.263175}, "100KB": {"bytes": 300000000, "concurrency": 16, "errors": 0, "max_ms": 6.998334, "mb_per_sec": 741.4845137869777, "mean_ms": 2.125996014333338, "ops": 3000, "ops_per_sec": 7414.845137869777, "p50_ms": 1.938958, "p90_ms": 3.184375, "p95_ms": 4.523208, "p99_ms": 5.240749999999999, "secs": 0.40459375}, "100MB": {"bytes": 2000000000, "concurrency": 4, "errors": 0, "max_ms": 567.0735, "mb_per_sec": 1060.6697575212731, "mean_ms": 365.83754175, "ops": 20, "ops_per_sec": 10.606697575212731, "p50_ms": 319.25725, "p90_ms": 532.568625, "p95_ms": 566.1175000000001, "p99_ms": 567.0735, "secs": 1.885601042}, "10KB": {"bytes": 50000000, "concurrency": 16, "errors": 0, "max_ms": 5.101208000000001, "mb_per_sec": 133.71450882649472, "mean_ms": 1.1688998627999994, "ops": 5000, "ops_per_sec": 13371.450882649471, "p50_ms": 0.995042, "p90_ms": 1.367708, "p95_ms": 2.549125, "p99_ms": 4.105, "secs": 0.373931}, "10MB": {"bytes": 2000000000, "concurrency": 8, "errors": 0, "max_ms": 115.576792, "mb_per_sec": 1399.165263180898, "mean_ms": 56.740763535, "ops": 200, "ops_per_sec": 139.91652631808978, "p50_ms": 53.625541, "p90_ms": 64.731541, "p95_ms": 72.82454100000001, "p99_ms": 107.8945, "secs": 1.429423709}, "1GB": {"bytes": 4000000000, "concurrency": 2, "errors": 0, "max_ms": 5021.771959, "mb_per_sec": 451.4931619596976, "mean_ms": 4358.9170107499995, "ops": 4, "ops_per_sec": 0.4514931619596976, "p50_ms": 3837.718125, "p90_ms": 5021.771959, "p95_ms": 5021.771959, "p99_ms": 5021.771959, "secs": 8.859491875}, "1KB": {"bytes": 5000000, "concurrency": 16, "errors": 0, "max_ms": 5.44675, "mb_per_sec": 18.338621733375696, "mean_ms": 0.8553452552, "ops": 5000, "ops_per_sec": 18338.621733375698, "p50_ms": 0.6990419999999999, "p90_ms": 0.997542, "p95_ms": 2.0734999999999997, "p99_ms": 3.941292, "secs": 0.272648625}, "1MB": {"bytes": 1000000000, "concurrency": 16, "errors": 0, "max_ms": 20.157458, "mb_per_sec": 1622.6809700347244, "mean_ms": 9.824292540000004, "ops": 1000, "ops_per_sec": 1622.6809700347244, "p50_ms": 9.709834, "p90_ms": 12.611667, "p95_ms": 13.450333, "p99_ms": 18.433958, "secs": 0.616264083}}, "replicate": {"doc_write_failures": 0, "docs_per_sec": 6736.957751285242, "docs_written": 3903920, "error": null, "mb_per_sec": 173.6887798172731, "ok": true, "reason": null, "secs": 576.624664042, "source_docs": 3884696, "source_external_bytes": 100153234310, "target_docs": 3884696}, "server": {"bands": [{"band": 2, "share": 0.01}, {"band": 3, "share": 0.04}, {"band": 4, "share": 0.1}, {"band": 5, "share": 0.15}, {"band": 6, "share": 0.2}, {"band": 7, "share": 0.25}, {"band": 8, "share": 0.25}], "dataset_bytes": 100244872278, "dataset_docs": 3884695, "json_max_bytes": 65536, "seed": 42, "url": "http://127.0.0.1:25984", "welcome": {"couchdb": "Welcome", "features": ["access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"], "git_sha": "rust", "uuid": "98950d192c704504986e3b34e877f904", "vendor": {"name": "couchdb-rs"}, "version": "3.5.0"}}, "view": {"build_secs": 19.949068167, "docs_indexed": 3884697, "docs_per_sec": 194730.74970118728, "index_file_bytes": 213442719, "queries": {"group_level1_reduce": {"bytes": 116500, "errors": 0, "max_ms": 0.397167, "mb_per_sec": 6.772894724159183, "mean_ms": 0.27083983399999995, "ops": 500, "ops_per_sec": 29068.217700254005, "p50_ms": 0.268333, "p90_ms": 0.307959, "p95_ms": 0.321, "p99_ms": 0.339917, "secs": 0.017200917}, "include_docs_limit10": {"bytes": 190457716, "errors": 0, "max_ms": 2.9495419999999997, "mb_per_sec": 1781.171656346686, "mean_ms": 0.8450490240000003, "ops": 2000, "ops_per_sec": 18704.116522605847, "p50_ms": 0.7912089999999999, "p90_ms": 1.238167, "p95_ms": 1.4487910000000002, "p99_ms": 1.86975, "secs": 0.106928333}, "key_lookup_limit20": {"bytes": 4278293, "errors": 0, "max_ms": 1.486292, "mb_per_sec": 49.95165890906393, "mean_ms": 0.25905121499999983, "ops": 5000, "ops_per_sec": 58378.02472746015, "p50_ms": 0.249292, "p90_ms": 0.34725, "p95_ms": 0.373792, "p99_ms": 0.433542, "secs": 0.085648667}, "key_reduce": {"bytes": 119785, "errors": 0, "max_ms": 0.563584, "mb_per_sec": 2.907335310018762, "mean_ms": 0.20182373199999976, "ops": 3000, "ops_per_sec": 72813.8408820494, "p50_ms": 0.19525, "p90_ms": 0.26475, "p95_ms": 0.291291, "p99_ms": 0.347, "secs": 0.041200958}}, "reduce_expected": 100244872278, "reduce_total": 100244872278, "request_timeouts_during_build": 0, "rows": 3884695}}}, "generated": "2026-10-21", "machine": {"cpu": "Apple M4 Max, 14 cores", "ram": "36 GB"}, "method": ["Servers: Apache CouchDB 3.5.3 built from source on Erlang/OTP 27 with the QuickJS engine, and couchdb-rs (release build). Each ran alone while being measured.", "Same durability level: CouchDB on macOS syncs with fsync(), so couchdb-rs ran with plain fsync too. couchdb-rs can instead use F_FULLFSYNC (--fsync-mode full), which also flushes the drive cache and is slower.", "CouchDB was configured as a single node with q=1 (one shard, like couchdb-rs) and with automatic compaction (smoosh) disabled, since couchdb-rs has none. Both required admin credentials.", "Dataset: deterministic from a fixed seed, so both servers received identical documents and ids. Sizes are log-uniform within each power-of-ten band from 100 B to 1 GB, with the bands getting 1/4/10/15/20/25/25% of the volume. Attachment bytes are random, so neither server can compress them.", "Operation tests use 16 concurrent clients for small docs, fewer for very large ones (8 at 10 MB, 4 at 100 MB, 2 at 1 GB).", "Replication used CouchDB's replicator with default settings for both servers, copying each server's database to a new database on that same server.", "The load generator (bench/couchbench) is written in Rust and generates data on the fly, so it never holds the dataset in memory.", "CouchDB with q=1 serializes all reads of the database through one Erlang file process, which is likely why its large-document reads fall far behind; more shards (q>1) would parallelize them.", "couchdb-rs builds a new view index by running the JavaScript map function on up to 12 threads in parallel, then an external sort and a bottom-up B-tree build, so each node is written once. CouchDB updates its index incrementally even on a first build; on an append-only file every batch rewrites the B-tree nodes it touches, leaving its 100 GB index file about 91% dead space.", "CouchDB's first view request for the 100 GB build hit its request timeout (500 timeout) while indexing continued; the client kept asking, and build time runs until the index first answered."]}</script>
+<script>
+(function () {
+  const R = JSON.parse(document.getElementById('data').textContent);
+  const E = R.results.erlang || {}, S = R.results.rust || {};
+  const SERIES = [
+    { key: 'erlang', name: 'CouchDB (Erlang)', color: 'var(--erlang)' },
+    { key: 'rust', name: 'couchdb-rs', color: 'var(--rust)' },
+  ];
+  const tip = document.getElementById('tip');
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag, attrs, parent) => {
+    const n = document.createElementNS(NS, tag);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(n);
+    return n;
+  };
+  const h = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+
+  // ---------------------------------------------------------- formatting
+  function compact(v) {
+    if (v == null || !isFinite(v)) return '–';
+    const a = Math.abs(v);
+    if (a >= 1e9) return (v / 1e9).toFixed(a >= 1e10 ? 0 : 1) + 'B';
+    if (a >= 1e6) return (v / 1e6).toFixed(a >= 1e7 ? 0 : 1) + 'M';
+    if (a >= 1e4) return (v / 1e3).toFixed(0) + 'K';
+    if (a >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+    if (a >= 100) return v.toFixed(0);
+    if (a >= 10) return v.toFixed(1);
+    if (a >= 1) return v.toFixed(2);
+    return v.toPrecision(2);
+  }
+  function bytes(v) {
+    if (v == null) return '–';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
+    while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+    return (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)) + ' ' + u[i];
+  }
+  function dur(s) {
+    if (s == null) return '–';
+    if (s < 60) return s.toFixed(1) + ' s';
+    if (s < 3600) return (s / 60).toFixed(1) + ' min';
+    return (s / 3600).toFixed(2) + ' h';
+  }
+
+  // ------------------------------------------------------------ tooltip
+  function showTip(evt, title, rows) {
+    tip.replaceChildren(h('div', 't', title));
+    for (const r of rows) {
+      const row = h('div', 'r');
+      const k = h('span', 'k'); k.style.background = r.color || 'transparent';
+      row.append(k, h('span', null, r.name), h('span', 'v', r.value));
+      tip.appendChild(row);
+    }
+    tip.hidden = false;
+    const pad = 14, rect = tip.getBoundingClientRect();
+    let x = (evt.clientX ?? evt.x) + pad, y = (evt.clientY ?? evt.y) + pad;
+    if (x + rect.width > innerWidth - 8) x = (evt.clientX ?? evt.x) - rect.width - pad;
+    if (y + rect.height > innerHeight - 8) y = (evt.clientY ?? evt.y) - rect.height - pad;
+    tip.style.left = Math.max(8, x) + 'px'; tip.style.top = Math.max(8, y) + 'px';
+  }
+  const hideTip = () => { tip.hidden = true; };
+
+  // ---------------------------------------------------------- scales
+  function scale(min, max, log, x0, x1) {
+    if (log) {
+      const a = Math.log10(min), b = Math.log10(max);
+      return v => x0 + (Math.log10(Math.max(v, min)) - a) / (b - a) * (x1 - x0);
+    }
+    return v => x0 + (v - min) / (max - min) * (x1 - x0);
+  }
+  function niceTicks(max) {
+    const step = Math.pow(10, Math.floor(Math.log10(max)));
+    const m = max / step;
+    const s = m <= 2 ? step / 2 : m <= 5 ? step : step * 2;
+    const ticks = []; for (let t = 0; t <= max * 1.0001; t += s) ticks.push(t);
+    if (ticks[ticks.length - 1] < max) ticks.push(ticks[ticks.length - 1] + s);
+    return ticks;
+  }
+
+  // ------------------------------------------------- grouped bar chart
+  // rows: [{label, erlang, rust}], opts: {title, sub, fmt, log, better}
+  // Charts are drawn at their container's real width (text stays at its
+  // true pixel size) and redrawn on resize.
+  const RENDERERS = [];
+  const width = host => Math.max(280, Math.floor(host.clientWidth - 36));
+  function bars(id, rows, opts) { RENDERERS.push(() => drawBars(id, typeof rows === 'function' ? rows() : rows, typeof opts === 'function' ? opts() : opts)); }
+  function ratios(id, rows) { RENDERERS.push(() => drawRatios(id, rows)); }
+  function drawBars(id, rows, opts) {
+    const host = document.getElementById(id);
+    host.replaceChildren();
+    rows = rows.filter(r => r.erlang != null || r.rust != null);
+    const head = h('div', 'fighead');
+    const t = h('div'); t.append(h('h3', null, opts.title), h('div', 'sub', opts.sub || ''));
+    const lg = h('div', 'legend');
+    for (const s of SERIES) { const sp = h('span'); const i = h('i'); i.style.background = s.color; sp.append(i, document.createTextNode(s.name)); lg.appendChild(sp); }
+    head.append(t, lg);
+    host.appendChild(head);
+    if (!rows.length) { host.appendChild(h('div', 'sub', 'No data in this run.')); return; }
+    const fmt = opts.fmt || compact;
+    const vals = rows.flatMap(r => [r.erlang, r.rust]).filter(v => v != null && v > 0);
+    let max = Math.max(...vals), min = Math.min(...vals);
+    const log = opts.log ?? (max / min > 40);
+    let lo, hi, ticks;
+    if (log) {
+      lo = Math.pow(10, Math.floor(Math.log10(min))); hi = Math.pow(10, Math.ceil(Math.log10(max)));
+      if (hi / lo < 10) hi = lo * 10;
+      ticks = []; for (let t = lo; t <= hi * 1.0001; t *= 10) ticks.push(t);
+    } else { lo = 0; ticks = niceTicks(max); hi = ticks[ticks.length - 1]; }
+    const W = width(host), labelW = 76, valW = 50, barH = 11, gapIn = 2, rowH = 2 * barH + gapIn + 14, top = 6, axisH = 22;
+    const H = top + rows.length * rowH + axisH;
+    const x0 = labelW, x1 = W - valW;
+    const sx = scale(lo, hi, log, x0, x1);
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': opts.title });
+    for (const tv of ticks) {
+      const x = sx(tv);
+      el('line', { x1: x, x2: x, y1: top - 2, y2: H - axisH + 2, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+      const tx = el('text', { x, y: H - 6, 'text-anchor': 'middle', class: 'tick' }, svg); tx.textContent = fmt(tv);
+    }
+    el('line', { x1: x0, x2: x0, y1: top - 2, y2: H - axisH + 2, stroke: 'var(--axis)', 'stroke-width': 1 }, svg);
+    rows.forEach((r, i) => {
+      const y = top + i * rowH + 7;
+      const g = el('g', {}, svg);
+      const lab = el('text', { x: labelW - 10, y: y + barH + 1 + 4, 'text-anchor': 'end', class: 'rowlabel' }, g); lab.textContent = r.label;
+      SERIES.forEach((s, si) => {
+        const v = r[s.key]; if (v == null) return;
+        const by = y + si * (barH + gapIn);
+        const xe = Math.max(sx(v), x0 + 4);
+        const w = xe - x0;
+        // 4px rounded data end, square at the baseline.
+        const rr = Math.min(4, w / 2, barH / 2);
+        const d = `M${x0},${by} H${xe - rr} Q${xe},${by} ${xe},${by + rr} V${by + barH - rr} Q${xe},${by + barH} ${xe - rr},${by + barH} H${x0} Z`;
+        el('path', { d, fill: s.color, class: 'bar' + (si === 0 ? ' b0' : ' b1') }, g);
+        const vt = el('text', { x: xe + 6, y: by + barH - 1.5, class: 'val' }, g); vt.textContent = fmt(v);
+      });
+      const hit = el('rect', { x: 0, y: y - 4, width: W, height: rowH - 6, class: 'hit', tabindex: 0 }, g);
+      const tipRows = () => {
+        const out = SERIES.filter(s => r[s.key] != null).map(s => ({ name: s.name, value: fmt(r[s.key]) + (opts.unit ? ' ' + opts.unit : ''), color: s.color }));
+        if (r.erlang && r.rust) {
+          const ratio = opts.better === 'lower' ? r.erlang / r.rust : r.rust / r.erlang;
+          out.push({ name: ratio >= 1 ? 'couchdb-rs faster' : 'CouchDB faster', value: (ratio >= 1 ? ratio : 1 / ratio).toFixed(2) + '×' });
+        }
+        return out;
+      };
+      const on = e => { svg.classList.add('hovered'); g.querySelectorAll('.bar').forEach(b => b.classList.add('on')); showTip(e, r.label, tipRows()); };
+      const off = () => { svg.classList.remove('hovered'); g.querySelectorAll('.bar').forEach(b => b.classList.remove('on')); hideTip(); };
+      hit.addEventListener('pointermove', on); hit.addEventListener('pointerleave', off);
+      hit.addEventListener('focus', () => { const b = hit.getBoundingClientRect(); on({ clientX: b.left + b.width * 0.6, clientY: b.top }); });
+      hit.addEventListener('blur', off);
+    });
+    host.appendChild(svg);
+    table(host, ['', ...SERIES.map(s => s.name), opts.better === 'lower' ? 'CouchDB / rs' : 'rs / CouchDB'],
+      rows.map(r => [r.label, r.erlang == null ? '–' : fmt(r.erlang), r.rust == null ? '–' : fmt(r.rust),
+        r.erlang && r.rust ? ((opts.better === 'lower' ? r.erlang / r.rust : r.rust / r.erlang).toFixed(2) + '×') : '–']));
+  }
+
+  function table(host, header, rows) {
+    const d = h('details'); d.appendChild(h('summary', null, 'Table view'));
+    const wrap = h('div', 'tablewrap'); const tb = h('table');
+    const tr = h('tr'); header.forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+    rows.forEach(r => { const row = h('tr'); r.forEach(c => row.appendChild(h('td', null, c))); tb.appendChild(row); });
+    wrap.appendChild(tb); d.appendChild(wrap); host.appendChild(d);
+  }
+
+  // ------------------------------------------------------ ratio chart
+  function drawRatios(id, rows) {
+    const host = document.getElementById(id);
+    host.replaceChildren();
+    rows = rows.filter(r => isFinite(r.ratio) && r.ratio > 0);
+    const head = h('div', 'fighead');
+    const t = h('div'); t.append(h('h3', null, 'couchdb-rs speed relative to CouchDB'), h('div', 'sub', 'log scale · each bar starts at 1× (parity)'));
+    head.append(t); host.appendChild(head);
+    if (!rows.length) { host.appendChild(h('div', 'sub', 'No comparable results yet.')); return; }
+    const ext = Math.max(2, ...rows.map(r => Math.max(r.ratio, 1 / r.ratio)));
+    const hiR = Math.pow(10, Math.ceil(Math.log10(ext) * 2) / 2);
+    const W = width(host), labelW = W < 520 ? 140 : 180, rowH = 26, top = 10, axisH = 24, valW = W < 520 ? 92 : 110;
+    const H = top + rows.length * rowH + axisH;
+    const x0 = labelW, x1 = W - valW;
+    const sx = scale(1 / hiR, hiR, true, x0, x1);
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'Speed ratio by benchmark' });
+    const ticks = []; for (let e = -Math.floor(Math.log10(hiR) * 2) / 2; e <= Math.log10(hiR) + 1e-9; e += 0.5) ticks.push(Math.pow(10, e));
+    for (const tv of ticks) {
+      const x = sx(tv);
+      el('line', { x1: x, x2: x, y1: top - 4, y2: H - axisH + 2, stroke: tv === 1 ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 }, svg);
+      const tx = el('text', { x, y: H - 6, 'text-anchor': 'middle', class: 'tick' }, svg);
+      tx.textContent = tv >= 1 ? (tv < 10 ? tv.toFixed(tv % 1 ? 1 : 0) : tv.toFixed(0)) + '×' : '1/' + (1 / tv < 10 ? (1 / tv).toFixed(1) : (1 / tv).toFixed(0)) + '×';
+    }
+    rows.forEach((r, i) => {
+      const y = top + i * rowH + rowH / 2;
+      const g = el('g', {}, svg);
+      const lab = el('text', { x: labelW - 12, y: y + 4, 'text-anchor': 'end', class: 'rowlabel' }, g); lab.textContent = r.label;
+      const xs = sx(1), xe = sx(r.ratio);
+      const color = r.ratio >= 1 ? 'var(--rust)' : 'var(--erlang)';
+      const a = Math.min(xs, xe), b = Math.max(xs, xe);
+      el('rect', { x: a, y: y - 5, width: Math.max(b - a, 2), height: 10, rx: 3, fill: color, class: 'bar' }, g);
+      const lbl = r.ratio >= 1 ? r.ratio.toFixed(1) + '×' : (1 / r.ratio).toFixed(1) + '× slower';
+      const lt = el('text', { x: r.ratio >= 1 ? b + 6 : a - 6, y: y + 4, 'text-anchor': r.ratio >= 1 ? 'start' : 'end', class: 'ratio-lbl' }, g); lt.textContent = lbl;
+      const hit = el('rect', { x: 0, y: y - rowH / 2, width: W, height: rowH, class: 'hit', tabindex: 0 }, g);
+      const tipRows = () => [
+        { name: 'CouchDB (Erlang)', value: r.efmt, color: 'var(--erlang)' },
+        { name: 'couchdb-rs', value: r.rfmt, color: 'var(--rust)' },
+        { name: r.ratio >= 1 ? 'couchdb-rs faster' : 'CouchDB faster', value: (r.ratio >= 1 ? r.ratio : 1 / r.ratio).toFixed(2) + '×' },
+      ];
+      hit.addEventListener('pointermove', e => showTip(e, r.label, tipRows()));
+      hit.addEventListener('pointerleave', hideTip);
+      hit.addEventListener('focus', () => { const bb = hit.getBoundingClientRect(); showTip({ clientX: bb.left + bb.width * 0.6, clientY: bb.top }, r.label, tipRows()); });
+      hit.addEventListener('blur', hideTip);
+    });
+    host.appendChild(svg);
+    table(host, ['Benchmark', 'CouchDB (Erlang)', 'couchdb-rs', 'couchdb-rs speed'], rows.map(r => [r.label, r.efmt, r.rfmt, r.ratio.toFixed(2) + '×']));
+  }
+
+  // ------------------------------------------------------------- data
+  const g = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
+  const CLASSES = ['100B', '1KB', '10KB', '100KB', '1MB', '10MB', '100MB', '1GB'];
+  const byClass = (phase, field) => CLASSES.map(c => ({ label: c, erlang: g(E, `${phase}.${c}.${field}`), rust: g(S, `${phase}.${c}.${field}`) }));
+
+  const srv = E.server || S.server || {};
+  const ds = srv.dataset_bytes;
+  document.getElementById('intro').textContent =
+    `Both servers ran on one machine, one after the other, against byte-identical data: ${bytes(ds)} in ${compact(srv.dataset_docs)} documents ` +
+    `sized from 100 bytes to 1 GB. Each was loaded, then measured for writes, reads, deletes, view indexing and queries, and replication.`;
+  const facts = document.getElementById('facts');
+  const fact = (k, v) => { const s = h('span'); s.append(document.createTextNode(k + ' '), h('b', null, v)); facts.appendChild(s); };
+  fact('Dataset', bytes(ds)); fact('Documents', compact(srv.dataset_docs));
+  fact('Machine', R.machine.cpu); fact('RAM', R.machine.ram); fact('Run', R.generated);
+  const missing = ['erlang', 'rust'].filter(k => !R.results[k]);
+  const phases = ['load', 'view', 'get', 'put', 'delete', 'replicate'];
+  const incomplete = ['erlang', 'rust'].filter(k => R.results[k] && phases.some(p => !R.results[k][p]));
+  if (missing.length || incomplete.length) {
+    const p = document.getElementById('partial'); p.hidden = false;
+    p.textContent = 'This run is still in progress: ' + [...missing.map(m => m + ' not started'), ...incomplete.map(m => m + ' partially complete')].join(', ') + '. Charts show what has finished.';
+  }
+
+  // Summary ratios (>1 = couchdb-rs faster).
+  const sumRows = [];
+  const addR = (label, ev, rv, lowerBetter, f) => {
+    if (ev == null || rv == null || !ev || !rv) return;
+    sumRows.push({ label, ratio: lowerBetter ? ev / rv : rv / ev, efmt: f(ev), rfmt: f(rv) });
+  };
+  addR('Bulk load (MB/s)', g(E, 'load.mb_per_sec'), g(S, 'load.mb_per_sec'), false, v => compact(v) + ' MB/s');
+  addR('PUT 1 KB (ops/s)', g(E, 'put.1KB.ops_per_sec'), g(S, 'put.1KB.ops_per_sec'), false, v => compact(v) + '/s');
+  addR('PUT 10 MB (MB/s)', g(E, 'put.10MB.mb_per_sec'), g(S, 'put.10MB.mb_per_sec'), false, v => compact(v) + ' MB/s');
+  addR('PUT 1 GB (MB/s)', g(E, 'put.1GB.mb_per_sec'), g(S, 'put.1GB.mb_per_sec'), false, v => compact(v) + ' MB/s');
+  addR('GET 1 KB (ops/s)', g(E, 'get.1KB.ops_per_sec'), g(S, 'get.1KB.ops_per_sec'), false, v => compact(v) + '/s');
+  addR('GET 10 MB (MB/s)', g(E, 'get.10MB.mb_per_sec'), g(S, 'get.10MB.mb_per_sec'), false, v => compact(v) + ' MB/s');
+  addR('DELETE 1 KB (ops/s)', g(E, 'delete.1KB.ops_per_sec'), g(S, 'delete.1KB.ops_per_sec'), false, v => compact(v) + '/s');
+  addR('View build (docs/s)', g(E, 'view.docs_per_sec'), g(S, 'view.docs_per_sec'), false, v => compact(v) + '/s');
+  addR('View key lookup (q/s)', g(E, 'view.queries.key_lookup_limit20.ops_per_sec'), g(S, 'view.queries.key_lookup_limit20.ops_per_sec'), false, v => compact(v) + '/s');
+  addR('View reduce (q/s)', g(E, 'view.queries.group_level1_reduce.ops_per_sec'), g(S, 'view.queries.group_level1_reduce.ops_per_sec'), false, v => compact(v) + '/s');
+  addR('Replication (time)', g(E, 'replicate.secs'), g(S, 'replicate.secs'), true, dur);
+  ratios('fig-summary', sumRows);
+
+  const loadTxt = (n, d) => d && d.load ? `${n}: ${bytes(d.load.bytes)} in ${dur(d.load.secs)}` : null;
+  document.getElementById('load-text').textContent =
+    'The whole dataset, loaded with 16 concurrent connections: small docs through _bulk_docs (1,000 per batch), large ones as streamed single-document uploads. ' +
+    [loadTxt('CouchDB', E), loadTxt('couchdb-rs', S)].filter(Boolean).join(' · ') + '.';
+  bars('fig-load-mb', [{ label: 'Throughput', erlang: g(E, 'load.mb_per_sec'), rust: g(S, 'load.mb_per_sec') }], { title: 'Load throughput', sub: 'MB/s · higher is better', unit: 'MB/s', log: false });
+  bars('fig-load-docs', [{ label: 'Documents', erlang: g(E, 'load.docs_per_sec'), rust: g(S, 'load.docs_per_sec') }], { title: 'Load rate', sub: 'docs/s · higher is better', unit: 'docs/s', log: false });
+
+  bars('fig-put-ops', byClass('put', 'ops_per_sec'), { title: 'PUT operations', sub: 'ops/s by doc size · log scale · higher is better', unit: 'ops/s' });
+  bars('fig-put-mb', byClass('put', 'mb_per_sec'), { title: 'PUT throughput', sub: 'MB/s by doc size · log scale · higher is better', unit: 'MB/s' });
+  bars('fig-get-ops', byClass('get', 'ops_per_sec'), { title: 'GET operations', sub: 'ops/s by size band · log scale · higher is better', unit: 'ops/s' });
+  bars('fig-get-mb', byClass('get', 'mb_per_sec'), { title: 'GET throughput', sub: 'MB/s by size band · log scale · higher is better', unit: 'MB/s' });
+  bars('fig-del', byClass('delete', 'ops_per_sec'), { title: 'DELETE operations', sub: 'ops/s by doc size · log scale · higher is better', unit: 'ops/s' });
+
+  let PCT = 'p99_ms';
+  const PNAME = { mean_ms: 'mean', p50_ms: 'p50', p90_ms: 'p90', p99_ms: 'p99' };
+  const latOpts = what => () => ({ title: `${what} latency, ${PNAME[PCT]}`, sub: 'ms · log scale · lower is better', unit: 'ms', better: 'lower' });
+  bars('fig-lat-put', () => byClass('put', PCT), latOpts('PUT'));
+  bars('fig-lat-get', () => byClass('get', PCT), latOpts('GET'));
+  bars('fig-lat-del', () => byClass('delete', PCT), latOpts('DELETE'));
+  const QL = [['key_lookup_limit20', 'Key lookup'], ['key_reduce', 'Key + reduce'], ['group_level1_reduce', 'Group reduce'], ['include_docs_limit10', 'include_docs']];
+  bars('fig-lat-view', () => QL.map(([k, l]) => ({ label: l, erlang: g(E, `view.queries.${k}.${PCT}`), rust: g(S, `view.queries.${k}.${PCT}`) })), latOpts('View query'));
+  document.querySelectorAll('#pct button').forEach(b => b.addEventListener('click', () => {
+    PCT = b.dataset.k;
+    document.querySelectorAll('#pct button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+    renderAll();
+  }));
+
+  // Every measured operation, every statistic.
+  RENDERERS.push(() => {
+    const host = document.getElementById('fig-lat-all');
+    host.replaceChildren();
+    const head = h('div', 'fighead'); const t = h('div');
+    t.append(h('h3', null, 'All operations'), h('div', 'sub', 'throughput and latency in ms for each server'));
+    head.append(t); host.appendChild(head);
+    const wrap = h('div', 'tablewrap'); const tb = h('table', 'alltable');
+    const cols = ['Operation', 'Server', 'ops/s', 'MB/s', 'mean', 'p50', 'p90', 'p95', 'p99', 'max'];
+    const tr = h('tr'); cols.forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+    const ms = v => v == null ? '–' : v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : v.toFixed(0);
+    const ops = [];
+    for (const ph of ['put', 'get', 'delete']) for (const c of CLASSES) ops.push([`${ph.toUpperCase()} ${c}`, `${ph}.${c}`]);
+    for (const [k, l] of QL) ops.push([`View: ${l}`, `view.queries.${k}`]);
+    for (const [label, path] of ops) {
+      for (const [src, name] of [[E, 'CouchDB'], [S, 'couchdb-rs']]) {
+        const m = g(src, path); if (!m) continue;
+        const row = h('tr');
+        [label, name, compact(m.ops_per_sec), m.bytes ? compact(m.mb_per_sec) : '–', ms(m.mean_ms), ms(m.p50_ms), ms(m.p90_ms), ms(m.p95_ms), ms(m.p99_ms), ms(m.max_ms)]
+          .forEach(c => row.appendChild(h('td', null, c)));
+        tb.appendChild(row);
+      }
+    }
+    wrap.appendChild(tb); host.appendChild(wrap);
+  });
+
+  bars('fig-view-build', [
+    { label: 'Index build', erlang: g(E, 'view.docs_per_sec'), rust: g(S, 'view.docs_per_sec') },
+  ], { title: 'View build rate', sub: 'docs indexed per second · higher is better', unit: 'docs/s', log: false });
+  const Q = [['key_lookup_limit20', 'Key lookup'], ['key_reduce', 'Key + reduce'], ['group_level1_reduce', 'Group reduce'], ['include_docs_limit10', 'include_docs']];
+  bars('fig-view-q', Q.map(([k, l]) => ({ label: l, erlang: g(E, `view.queries.${k}.ops_per_sec`), rust: g(S, `view.queries.${k}.ops_per_sec`) })),
+    { title: 'View queries', sub: 'queries/s · higher is better', unit: 'q/s', log: false });
+
+  bars('fig-repl-time', [{ label: 'Full copy', erlang: g(E, 'replicate.secs'), rust: g(S, 'replicate.secs') }],
+    { title: 'Replication time', sub: 'minutes · lower is better', unit: 'min', better: 'lower', log: false, fmt: v => compact(v / 60) });
+  bars('fig-repl-rate', [
+    { label: 'MB/s', erlang: g(E, 'replicate.mb_per_sec'), rust: g(S, 'replicate.mb_per_sec') },
+    { label: 'docs/s', erlang: g(E, 'replicate.docs_per_sec'), rust: g(S, 'replicate.docs_per_sec') },
+  ], { title: 'Replication rate', sub: 'higher is better · log scale', log: true });
+
+  bars('fig-disk', [
+    { label: 'Database file', erlang: g(E, 'load.file_bytes_after'), rust: g(S, 'load.file_bytes_after') },
+    { label: 'View index', erlang: g(E, 'view.index_file_bytes'), rust: g(S, 'view.index_file_bytes') },
+  ], { title: 'Space on disk', sub: 'after the load (no compaction) · log scale · lower is better', better: 'lower', log: true, fmt: bytes });
+
+  const renderAll = () => RENDERERS.forEach(f => f());
+  renderAll();
+  let rt;
+  addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(renderAll, 120); });
+
+  const M = R.method || [];
+  const ul = document.getElementById('method');
+  M.forEach(m => ul.appendChild(h('li', null, m)));
+})();
+</script>

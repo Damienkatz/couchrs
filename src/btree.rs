@@ -705,6 +705,110 @@ impl<S: Spec> Btree<S> {
     }
 }
 
+/// Bytes of entries buffered per level before they're written as a run of
+/// full nodes in one append.
+const BULK_FLUSH: usize = 4 << 20;
+
+/// Builds a tree bottom-up from kvs supplied in strictly increasing key
+/// order. Every node is written exactly once: leaves left to right, each
+/// level's nodes as soon as they fill, so there is no copy-on-write garbage
+/// and no read-modify-write of existing nodes.
+pub struct BulkBuilder<S: Spec> {
+    tree: Btree<S>,
+    leaf: Vec<(S::K, S::V)>,
+    leaf_bytes: usize,
+    levels: Vec<(Vec<(S::K, NodePtr<S::R>)>, usize)>,
+    last: Option<S::K>,
+}
+
+impl<S: Spec> Btree<S> {
+    /// Start a bulk build into this (empty) tree's file.
+    pub fn bulk_builder(&self) -> BulkBuilder<S> {
+        assert!(self.root.is_none(), "bulk build requires an empty tree");
+        BulkBuilder {
+            tree: self.clone(),
+            leaf: Vec::new(),
+            leaf_bytes: 0,
+            levels: Vec::new(),
+            last: None,
+        }
+    }
+}
+
+impl<S: Spec> BulkBuilder<S> {
+    pub fn push(&mut self, k: S::K, v: S::V) -> io::Result<()> {
+        if let Some(last) = &self.last {
+            if self.tree.spec.cmp(last, &k) != Ordering::Less {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "bulk build keys out of order"));
+            }
+        }
+        self.leaf_bytes += bincode::serialized_size(&(&k, &v)).unwrap_or(64) as usize;
+        self.last = Some(k.clone());
+        self.leaf.push((k, v));
+        if self.leaf_bytes >= BULK_FLUSH {
+            self.flush_leaf()?;
+        }
+        Ok(())
+    }
+
+    fn flush_leaf(&mut self) -> io::Result<()> {
+        let kvs = std::mem::take(&mut self.leaf);
+        self.leaf_bytes = 0;
+        for e in self.tree.write_kv(kvs)? {
+            self.push_level(0, e)?;
+        }
+        Ok(())
+    }
+
+    fn push_level(&mut self, l: usize, e: (S::K, NodePtr<S::R>)) -> io::Result<()> {
+        if self.levels.len() <= l {
+            self.levels.push((Vec::new(), 0));
+        }
+        self.levels[l].1 += bincode::serialized_size(&e).unwrap_or(64) as usize;
+        self.levels[l].0.push(e);
+        if self.levels[l].1 >= BULK_FLUSH {
+            let ents = std::mem::take(&mut self.levels[l].0);
+            self.levels[l].1 = 0;
+            for p in self.tree.write_kp(ents)? {
+                self.push_level(l + 1, p)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the remaining partial nodes and return the finished tree.
+    pub fn finish(mut self) -> io::Result<Btree<S>> {
+        if !self.leaf.is_empty() {
+            self.flush_leaf()?;
+        }
+        let mut l = 0;
+        let root = loop {
+            if l >= self.levels.len() {
+                break None;
+            }
+            let top = l == self.levels.len() - 1;
+            let ents = std::mem::take(&mut self.levels[l].0);
+            if top && ents.len() == 1 {
+                break ents.into_iter().next().map(|(_, p)| p);
+            }
+            if ents.len() == 1 {
+                // A lone pointer moves up as is; depth needn't be uniform.
+                let e = ents.into_iter().next().unwrap();
+                self.levels[l + 1].0.push(e);
+            } else if !ents.is_empty() {
+                for p in self.tree.write_kp(ents)? {
+                    if self.levels.len() <= l + 1 {
+                        self.levels.push((Vec::new(), 0));
+                    }
+                    self.levels[l + 1].0.push(p);
+                }
+            }
+            l += 1;
+        };
+        Ok(self.tree.with_root(root))
+    }
+}
+
 struct GroupAcc<S: Spec> {
     key: Option<S::K>,
     reds: Vec<S::R>,
@@ -736,6 +840,57 @@ mod tests {
         let p = std::env::temp_dir().join(format!("bt-{}", uuid::Uuid::new_v4()));
         let f = Arc::new(CouchFile::open(&p, true).unwrap());
         Btree::new(f, None, Arc::new(CountSpec))
+    }
+
+    #[test]
+    fn bulk_build_matches_incremental() {
+        let inc = tree();
+        let bulk = tree();
+        let keys: Vec<u64> = (0..50_000u64).map(|i| i * 3).collect();
+        // Incremental tree in random order and batches.
+        let mut shuffled = keys.clone();
+        let mut x = 99u64;
+        for i in (1..shuffled.len()).rev() {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            shuffled.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        let mut inc = inc;
+        for chunk in shuffled.chunks(700) {
+            inc = inc.modify(chunk.iter().map(|k| Action::Insert(*k, k % 13)).collect()).unwrap();
+        }
+        let mut b = bulk.bulk_builder();
+        for k in &keys {
+            b.push(*k, k % 13).unwrap();
+        }
+        assert!(b.push(0, 0).is_err(), "out-of-order key must be rejected");
+        let bulk = b.finish().unwrap();
+        assert_eq!(bulk.full_reduce(), inc.full_reduce());
+        let collect = |t: &Btree<CountSpec>, dir| {
+            let mut v = Vec::new();
+            t.fold(dir, &Range::default(), |k, val| { v.push((*k, *val)); Ok(true) }).unwrap();
+            v
+        };
+        assert_eq!(collect(&bulk, Dir::Fwd), collect(&inc, Dir::Fwd));
+        assert_eq!(collect(&bulk, Dir::Rev), collect(&inc, Dir::Rev));
+        for k in [0u64, 3, 299_997, 150_000, 150_001] {
+            assert_eq!(bulk.lookup(&k).unwrap(), inc.lookup(&k).unwrap());
+            assert_eq!(bulk.reduce_before(&k, Dir::Fwd).unwrap(), inc.reduce_before(&k, Dir::Fwd).unwrap());
+        }
+        let groups = |t: &Btree<CountSpec>| {
+            let mut g = Vec::new();
+            t.fold_reduce(Dir::Fwd, &Range::default(), |a, b| a / 10_000 == b / 10_000, |k, r| { g.push((k / 10_000, r)); Ok(true) }).unwrap();
+            g
+        };
+        assert_eq!(groups(&bulk), groups(&inc));
+        // Every node written once: the bulk file is a fraction of the incremental one.
+        assert!(bulk.file.eof() * 3 < inc.file.eof(), "bulk {} vs incremental {}", bulk.file.eof(), inc.file.eof());
+        // A bulk-built tree keeps working under incremental edits.
+        let bulk = bulk.modify(vec![Action::Remove(3), Action::Insert(4, 1)]).unwrap();
+        assert_eq!(bulk.lookup(&3).unwrap(), None);
+        assert_eq!(bulk.lookup(&4).unwrap(), Some(1));
+        assert_eq!(bulk.full_reduce().unwrap().0, 50_000);
+        // Empty input builds an empty tree.
+        assert!(tree().bulk_builder().finish().unwrap().root.is_none());
     }
 
     #[test]

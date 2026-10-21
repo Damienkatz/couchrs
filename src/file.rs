@@ -17,9 +17,16 @@ use std::path::{Path, PathBuf};
 
 pub const BLOCK: u64 = 4096;
 
+/// When set, commits use the platform's strongest sync (F_FULLFSYNC on
+/// macOS) instead of plain fsync. Set from `--fsync-mode full`.
+pub static FULL_FSYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub type Pos = u64;
 
 pub struct CouchFile {
+    /// Unique per opened file, so callers can tell when compaction has
+    /// swapped the file out from under data they already wrote.
+    pub generation: u64,
     path: PathBuf,
     file: File,
     eof: Mutex<u64>,
@@ -58,7 +65,9 @@ impl CouchFile {
             .truncate(false)
             .open(path)?;
         let eof = file.metadata()?.len();
+        static NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(CouchFile {
+            generation: NEXT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             path: path.to_path_buf(),
             file,
             eof: Mutex::new(eof),
@@ -89,13 +98,14 @@ impl CouchFile {
     }
 
     /// Append many chunks in a single write. Returns their positions.
-    pub fn append_raw_many(&self, payloads: &[Vec<u8>]) -> io::Result<Vec<(Pos, u64)>> {
+    pub fn append_raw_many<T: AsRef<[u8]>>(&self, payloads: &[T]) -> io::Result<Vec<(Pos, u64)>> {
         let mut eof = self.eof.lock();
         let start = *eof;
         let mut pos = start;
         let mut phys = Vec::new();
         let mut out = Vec::with_capacity(payloads.len());
         for payload in payloads {
+            let payload = payload.as_ref();
             let mut logical = Vec::with_capacity(payload.len() + 8);
             logical.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             logical.extend_from_slice(&crc32fast::hash(payload).to_be_bytes());
@@ -204,7 +214,16 @@ impl CouchFile {
     }
 
     pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()
+        if FULL_FSYNC.load(std::sync::atomic::Ordering::Relaxed) {
+            // On macOS this is F_FULLFSYNC, which also flushes the drive cache.
+            return self.file.sync_data();
+        }
+        // Plain fsync, the level Erlang's file:datasync (and so CouchDB) uses.
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::fsync(self.file.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub fn truncate(&self, len: u64) -> io::Result<()> {

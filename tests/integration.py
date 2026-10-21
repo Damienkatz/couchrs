@@ -283,6 +283,11 @@ def changes_feed():
     s, b, _ = req("GET", f"/{db}/_changes?limit=2")
     eq(len(b["results"]), 2)
     eq(b["pending"], 3)
+    # limit=0 must not advance last_seq past changes it didn't return
+    s, b0, _ = req("GET", f"/{db}/_changes?limit=0")
+    eq((b0["results"], b0["last_seq"].split("-")[0]), ([], "0"))
+    s, b0, _ = req("GET", f"/{db}/_changes?limit=0&since={b['last_seq']}")
+    eq(b0["last_seq"].split("-")[0], b["last_seq"].split("-")[0])
     s, b, _ = req("GET", f"/{db}/_changes?descending=true&limit=1")
     eq(b["results"][0]["id"], "c4")
     s, b, _ = req("POST", f"/{db}/_changes?filter=_doc_ids", {"doc_ids": ["c1", "c3"]})

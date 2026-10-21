@@ -5,6 +5,7 @@ pub mod collate;
 pub mod db;
 pub mod doc;
 pub mod error;
+pub mod extsort;
 pub mod file;
 pub mod http;
 pub mod js;
@@ -17,7 +18,7 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: couchdb-rs [--data-dir DIR] [--bind ADDR:PORT] [--admin USER:PASS]\n\
+        "usage: couchdb-rs [--data-dir DIR] [--bind ADDR:PORT] [--admin USER:PASS] [--fsync-mode fsync|full]\n\
          env: COUCHDB_DATA_DIR, COUCHDB_BIND, COUCHDB_USER, COUCHDB_PASSWORD"
     );
     std::process::exit(2)
@@ -40,6 +41,11 @@ fn main() {
         match a.as_str() {
             "--data-dir" => data_dir = args.next().unwrap_or_else(|| usage()),
             "--bind" => bind = args.next().unwrap_or_else(|| usage()),
+            "--fsync-mode" => match args.next().as_deref() {
+                Some("fsync") => {}
+                Some("full") => file::FULL_FSYNC.store(true, std::sync::atomic::Ordering::Relaxed),
+                _ => usage(),
+            },
             "--admin" => {
                 let s = args.next().unwrap_or_else(|| usage());
                 let (u, p) = s.split_once(':').unwrap_or_else(|| usage());

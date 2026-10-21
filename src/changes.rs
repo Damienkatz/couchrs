@@ -202,10 +202,13 @@ fn collect(snap: &Snapshot, args: &mut ChangesArgs, since: u64, limit: usize) ->
     let req = args.req_json.clone();
     let start = if args.descending && since == 0 { 0 } else { since };
     snap.fold_changes(start, dir, |fdi| {
-        last = fdi.update_seq;
+        // Check the limit before advancing `last`: a change we stop in
+        // front of must not be covered by last_seq, or a client that
+        // checkpoints last_seq would skip it.
         if rows.len() >= limit {
             return Ok(false);
         }
+        last = fdi.update_seq;
         if args.filter.matches(snap, fdi, &req)? {
             rows.push(change_row(snap, fdi, args)?);
             if rows.len() >= limit {

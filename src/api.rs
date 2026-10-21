@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
 use base64::Engine;
+use bytes::Bytes;
 use md5::{Digest, Md5};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -163,11 +164,28 @@ pub async fn save_docs(db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: bool) -> Res
             None => Ok(String::new()),
         })
         .collect();
-    if !to_save.is_empty() {
-        let saved = db.update_docs(to_save, new_edits).await?;
-        for (i, r) in idx.into_iter().zip(saved) {
-            results[i] = r;
+    // Stage attachment bytes outside the writer; retry docs whose staged
+    // chunks were orphaned by a concurrent compaction swap.
+    let mut pending: Vec<(usize, Doc)> = idx.into_iter().zip(to_save).collect();
+    for attempt in 0..3 {
+        if pending.is_empty() {
+            break;
         }
+        let mut staged = Vec::with_capacity(pending.len());
+        for (_, d) in &pending {
+            let mut d = d.clone();
+            blocking(|| db.stage_atts(&mut d))?;
+            staged.push(d);
+        }
+        let saved = db.update_docs(staged, new_edits).await?;
+        let mut retry = Vec::new();
+        for ((i, d), r) in pending.into_iter().zip(saved) {
+            match r {
+                Err(e) if e.error == "att_file_moved" && attempt < 2 => retry.push((i, d)),
+                r => results[i] = r,
+            }
+        }
+        pending = retry;
     }
     Ok(results)
 }
@@ -193,6 +211,7 @@ pub fn doc_opts(req: &Req) -> Result<DocOpts> {
         att_encoding_info: req.flag("att_encoding_info")?,
         atts_since,
         meta,
+        follows: false,
     })
 }
 
@@ -278,6 +297,21 @@ pub fn open_revs(
     latest: bool,
     opts: &DocOpts,
 ) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for r in resolve_open_revs(snap, id, spec, latest)? {
+        match r {
+            Ok((fdi, ri)) => out.push(json!({"ok": snap.doc_json(&fdi, &ri, opts)?})),
+            Err(missing) => out.push(json!({"missing": missing})),
+        }
+    }
+    Ok(out)
+}
+
+/// The revisions an `open_revs` request names: each found revision, or the
+/// rev string that is missing.
+pub type OpenRev = std::result::Result<(crate::doc::FullDocInfo, RevInfo), String>;
+
+pub fn resolve_open_revs(snap: &Snapshot, id: &str, spec: &Value, latest: bool) -> Result<Vec<OpenRev>> {
     let fdi = snap.get_fdi(id)?;
     let mut out = Vec::new();
     match spec {
@@ -285,7 +319,7 @@ pub fn open_revs(
             let fdi = fdi.ok_or_else(CouchError::missing)?;
             for l in fdi.sorted_leafs() {
                 if l.val.leaf().is_some() {
-                    out.push(json!({"ok": snap.doc_json(&fdi, &l, opts)?}));
+                    out.push(Ok((fdi.clone(), l)));
                 }
             }
         }
@@ -294,7 +328,7 @@ pub fn open_revs(
                 let rs = r.as_str().ok_or_else(|| CouchError::bad_request("Invalid rev format"))?;
                 let (p, rid) = parse_rev(rs)?;
                 let Some(fdi) = fdi.as_ref() else {
-                    out.push(json!({"missing": rs}));
+                    out.push(Err(rs.to_string()));
                     continue;
                 };
                 let found: Vec<RevInfo> = if latest {
@@ -313,10 +347,10 @@ pub fn open_revs(
                 };
                 let found: Vec<RevInfo> = found.into_iter().filter(|r| r.val.leaf().is_some()).collect();
                 if found.is_empty() {
-                    out.push(json!({"missing": rs}));
+                    out.push(Err(rs.to_string()));
                 }
                 for ri in found {
-                    out.push(json!({"ok": snap.doc_json(fdi, &ri, opts)?}));
+                    out.push(Ok((fdi.clone(), ri)));
                 }
             }
         }
@@ -332,35 +366,114 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
         serde_json::from_str(spec).map_err(|_| CouchError::bad_request("Invalid open_revs value"))?
     };
     let latest = req.flag("latest")?;
-    let mut opts = opts.clone();
-    let multipart = req.accepts("multipart/mixed");
-    if multipart && opts.atts_since.is_none() {
-        // inline data inside json parts
-    }
-    let results = blocking(|| open_revs(snap, id, &spec, latest, &opts))?;
-    if !multipart {
+    if !req.accepts("multipart/mixed") {
+        let results = blocking(|| open_revs(snap, id, &spec, latest, opts))?;
         return ok_json(Value::Array(results));
     }
+    // As CouchDB does: one part per revision; a revision with attachments
+    // is a nested multipart/related whose JSON marks them "follows" and
+    // whose following parts stream the raw bytes.
+    // CouchDB always sends attachment bodies in multipart open_revs
+    // responses (`[attachments, follows, att_encoding_info | Options]`);
+    // the replicator relies on it and never asks for attachments=true.
+    let mut opts = opts.clone();
+    opts.follows = true;
     opts.attachments = true;
+    opts.att_encoding_info = true;
+    let revs = blocking(|| resolve_open_revs(snap, id, &spec, latest))?;
     let boundary = hex::encode(uuid::Uuid::new_v4().as_bytes());
-    let mut body = Vec::new();
-    for r in &results {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        if let Some(doc) = r.get("ok") {
-            body.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
-            body.extend_from_slice(&serde_json::to_vec(doc)?);
-        } else {
-            body.extend_from_slice(b"Content-Type: application/json; error=\"true\"\r\n\r\n");
-            body.extend_from_slice(&serde_json::to_vec(r)?);
+    let mut pieces: Vec<Piece> = Vec::new();
+    for r in revs {
+        pieces.push(Piece::Data(Bytes::from(format!("--{boundary}\r\n"))));
+        let (fdi, ri) = match r {
+            Ok(x) => x,
+            Err(missing) => {
+                let j = serde_json::to_vec(&json!({"missing": missing}))?;
+                pieces.push(Piece::Data(Bytes::from(format!(
+                    "Content-Type: application/json; error=\"true\"\r\n\r\n{}\r\n",
+                    String::from_utf8_lossy(&j)
+                ))));
+                continue;
+            }
+        };
+        let doc = blocking(|| snap.doc_json(&fdi, &ri, &opts))?;
+        let follows: Vec<String> = doc
+            .get("_attachments")
+            .and_then(|a| a.as_object())
+            .map(|a| {
+                a.iter()
+                    .filter(|(_, v)| v.get("follows").is_some())
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let doc_bytes = serde_json::to_vec(&doc)?;
+        if follows.is_empty() {
+            pieces.push(Piece::Data(Bytes::from(b"Content-Type: application/json\r\n\r\n".to_vec())));
+            pieces.push(Piece::Data(Bytes::from(doc_bytes)));
+            pieces.push(Piece::Data(Bytes::from_static(b"\r\n")));
+            continue;
         }
-        body.extend_from_slice(b"\r\n");
+        let body = blocking(|| snap.read_body(ri.val.leaf().unwrap().ptr))?;
+        let inner = hex::encode(uuid::Uuid::new_v4().as_bytes());
+        pieces.push(Piece::Data(Bytes::from(format!(
+            "Content-Type: multipart/related; boundary=\"{inner}\"\r\n\r\n--{inner}\r\nContent-Type: application/json\r\n\r\n"
+        ))));
+        pieces.push(Piece::Data(Bytes::from(doc_bytes)));
+        for name in follows {
+            let Some(att) = body.atts.iter().find(|a| a.name == name) else { continue };
+            pieces.push(Piece::Data(Bytes::from(format!(
+                "\r\n--{inner}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+                name.replace('"', "\\\""),
+                att.content_type,
+                att.encoded_length
+            ))));
+            pieces.push(Piece::Att(att.clone()));
+        }
+        pieces.push(Piece::Data(Bytes::from(format!("\r\n--{inner}--\r\n"))));
     }
-    body.extend_from_slice(format!("--{boundary}--").as_bytes());
+    pieces.push(Piece::Data(Bytes::from(format!("--{boundary}--"))));
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, format!("multipart/mixed; boundary=\"{boundary}\""))
-        .body(Body::from(body))
+        .body(stream_pieces(snap.clone(), pieces))
         .unwrap())
+}
+
+enum Piece {
+    Data(Bytes),
+    Att(AttInfo),
+}
+
+/// Stream a response made of literal pieces and attachment data, reading
+/// attachment chunks from disk only as the client consumes them.
+fn stream_pieces(snap: Snapshot, pieces: Vec<Piece>) -> Body {
+    let stream = async_stream::stream! {
+        for p in pieces {
+            match p {
+                Piece::Data(b) => yield Ok::<Bytes, std::io::Error>(b),
+                Piece::Att(att) => {
+                    for group in att.chunks.chunks(16) {
+                        let r = tokio::task::block_in_place(|| -> std::io::Result<Vec<u8>> {
+                            let mut buf = Vec::new();
+                            for pos in group {
+                                buf.extend_from_slice(&snap.file.read_raw(*pos)?);
+                            }
+                            Ok(buf)
+                        });
+                        match r {
+                            Ok(b) => yield Ok(Bytes::from(b)),
+                            Err(e) => {
+                                yield Err(e);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    Body::from_stream(stream)
 }
 
 /// Parse a multipart/related document upload: JSON first, then one part
@@ -383,14 +496,14 @@ async fn parse_multipart_doc(req: &Req) -> Result<Doc> {
         .ok_or_else(|| CouchError::bad_request("empty multipart body"))?;
     let json_bytes = first.bytes().await.map_err(|e| CouchError::bad_request(e.to_string()))?;
     let mut doc = from_json(serde_json::from_slice(&json_bytes)?)?;
-    let mut parts: Vec<(Option<String>, Vec<u8>)> = Vec::new();
+    let mut parts: Vec<(Option<String>, bytes::Bytes)> = Vec::new();
     while let Some(f) = mp.next_field().await.map_err(|e| CouchError::bad_request(e.to_string()))? {
         let name = f.file_name().map(String::from);
         let data = f.bytes().await.map_err(|e| CouchError::bad_request(e.to_string()))?;
-        parts.push((name, data.to_vec()));
+        parts.push((name, data));
     }
     let mut it = parts.into_iter();
-    let mut pending: Vec<(Option<String>, Vec<u8>)> = Vec::new();
+    let mut pending: Vec<(Option<String>, bytes::Bytes)> = Vec::new();
     for a in doc.atts.iter_mut().filter(|a| matches!(a.data, AttData::Follows)) {
         let p = match pending.iter().position(|(n, _)| n.as_deref() == Some(a.name.as_str())) {
             Some(i) => pending.remove(i),
@@ -513,8 +626,9 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
             if req.header("if-none-match") == Some(etag.as_str()) {
                 return Ok(with_header(empty(StatusCode::NOT_MODIFIED), header::ETAG, &etag));
             }
-            let data = blocking(|| snap.read_att(att))?;
+            let len = att.encoded_length;
             let mut b = Response::builder()
+                .header(header::CONTENT_LENGTH, len)
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, &att.content_type)
                 .header(header::ETAG, &etag)
@@ -523,7 +637,8 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
             if let Some(e) = &att.encoding {
                 b = b.header(header::CONTENT_ENCODING, e);
             }
-            Ok(b.body(Body::from(data)).unwrap())
+            let att = att.clone();
+            Ok(b.body(stream_pieces(snap.clone(), vec![Piece::Att(att)])).unwrap())
         }
         Method::PUT | Method::DELETE => {
             let snap = db.snapshot();
@@ -557,12 +672,19 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                 doc.revs.1.truncate(1);
             }
             doc.deleted = false;
+            // Keep existing attachments as stubs: the writer resolves them
+            // from the parent revision, so they can't go stale if the file
+            // is compacted while this request is in flight.
+            for a in doc.atts.iter_mut() {
+                a.data = AttData::Stub;
+            }
+            doc.att_gen = 0;
             if req.method == Method::PUT {
                 let ct = req
                     .header("content-type")
                     .unwrap_or("application/octet-stream")
                     .to_string();
-                let data = req.body.to_vec();
+                let data = req.body.clone();
                 doc.atts.retain(|a| a.name != name);
                 doc.atts.push(Att {
                     name: name.to_string(),

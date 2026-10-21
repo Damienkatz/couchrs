@@ -14,6 +14,7 @@ use crate::error::{CouchError, Result};
 use crate::file::CouchFile;
 use crate::http::{Req, json_response, not_allowed, ok_json};
 use crate::js::JsFuns;
+use crate::extsort::Sorter;
 use crate::mango::Selector;
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
@@ -25,6 +26,7 @@ use serde_json::{Map, Value, json};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 // ---------------------------------------------------------------- keys
 
@@ -475,6 +477,54 @@ impl IndexDef {
     }
 }
 
+/// Build empty indexes with the sort-based bulk path (default on;
+/// COUCHDB_RS_VIEW_BULK=0 forces incremental batches, for comparison).
+fn bulk_enabled() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("COUCHDB_RS_VIEW_BULK").map(|v| v != "0").unwrap_or(true))
+}
+
+type SortCmp<T> = Box<dyn Fn(&T, &T) -> Ordering>;
+type ViewSorter = Sorter<(VKey, VVal), SortCmp<(VKey, VVal)>>;
+type IdSorter = Sorter<(String, IdEntry), SortCmp<(String, IdEntry)>>;
+/// Rows mapped from a batch of docs: (doc id, rows per view, id-tree entry).
+type Mapped = Vec<(String, Vec<Vec<(Json, VVal)>>, IdEntry)>;
+
+/// Hand a mapped batch to the external sorters.
+fn feed_sorters(mapped: Mapped, views: &mut [ViewSorter], ids: &mut IdSorter) -> std::io::Result<()> {
+    for (id, per_view, entry) in mapped {
+        for (vi, rows) in per_view.into_iter().enumerate() {
+            for (k, val) in rows {
+                // Rough size for the memory budget; exactness doesn't matter.
+                let approx = 64 + id.len() + k.0.to_string().len();
+                views[vi].push(((k, IdBound::Id(id.clone())), val), approx)?;
+            }
+        }
+        if !entry.keys.is_empty() {
+            let approx = 64 + id.len() * 2;
+            ids.push((id, entry), approx)?;
+        }
+    }
+    Ok(())
+}
+
+/// Upper bound on JS map threads for a bulk build: COUCHDB_RS_MAP_THREADS,
+/// else all cores but two (one for the collector, one for the reader).
+fn map_threads_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COUCHDB_RS_MAP_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2)
+        }).max(1)
+    })
+}
+
+/// Docs per view-index write batch. Experiment knob (COUCHDB_RS_VIEW_BATCH).
+fn view_batch_docs() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("COUCHDB_RS_VIEW_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(500))
+}
+
 // ----------------------------------------------------------- index state
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -503,6 +553,8 @@ pub struct Index {
     update_lock: Mutex<()>,
     db_uuid: String,
     updater_running: std::sync::atomic::AtomicBool,
+    /// How the last bulk build ran, reported in _info.
+    last_build: Mutex<Option<Value>>,
 }
 
 fn fresh_state(file: &Arc<CouchFile>, def: &IndexDef) -> IndexState {
@@ -554,6 +606,7 @@ impl Index {
             update_lock: Mutex::new(()),
             db_uuid,
             updater_running: std::sync::atomic::AtomicBool::new(false),
+            last_build: Mutex::new(None),
         })
     }
 
@@ -636,11 +689,18 @@ impl Index {
         }
         self.updater_running.store(true, std::sync::atomic::Ordering::Relaxed);
         let res = (|| -> Result<IndexState> {
+            let empty = st.seq == 0 && st.ids.root.is_none() && st.views.iter().all(|v| v.root.is_none());
+            if empty && bulk_enabled() {
+                self.bulk_build(&snap, &mut st)?;
+                self.commit(&st)?;
+                *self.state.write() = st.clone();
+                return Ok(st);
+            }
             let mut batch: Vec<FullDocInfo> = Vec::new();
             let mut err = None;
             snap.fold_changes(st.seq, Dir::Fwd, |fdi| {
                 batch.push(fdi.clone());
-                if batch.len() >= 500
+                if batch.len() >= view_batch_docs()
                     && let Err(e) = self.apply_batch(&snap, &mut st, std::mem::take(&mut batch)) {
                         err = Some(e);
                         return Ok(false);
@@ -660,6 +720,201 @@ impl Index {
         res
     }
 
+    /// The rows one doc contributes: per view, (key, value) with duplicate
+    /// keys from the same doc merged, plus its doc-id tree entry.
+    fn doc_entries(&self, snap: &Snapshot, st: &IndexState, fdi: &FullDocInfo) -> Result<(Vec<Vec<(Json, VVal)>>, IdEntry)> {
+        let rows = self.map_doc(snap, fdi)?;
+        let mut entry = IdEntry { keys: Vec::new() };
+        let mut per_view = Vec::with_capacity(rows.len());
+        for (vi, vrows) in rows.into_iter().enumerate() {
+            let mut out = Vec::new();
+            if !vrows.is_empty() {
+                let spec = st.views[vi].spec.clone();
+                let mut grouped: Vec<(Value, Vec<Json>)> = Vec::new();
+                for (k, v) in vrows {
+                    match grouped.iter_mut().find(|(gk, _)| spec.cmp_key(gk, &k) == Ordering::Equal) {
+                        Some((_, vs)) => vs.push(Json(v)),
+                        None => grouped.push((k, vec![Json(v)])),
+                    }
+                }
+                let mut keys = Vec::new();
+                for (k, mut vs) in grouped {
+                    let val = if vs.len() == 1 { VVal::One(vs.pop().unwrap()) } else { VVal::Dups(vs) };
+                    keys.push(Json(k.clone()));
+                    out.push((Json(k), val));
+                }
+                entry.keys.push((vi as u32, keys));
+            }
+            per_view.push(out);
+        }
+        Ok((per_view, entry))
+    }
+
+    /// Build a fresh index in one pass: map every doc, spill rows to
+    /// external sorters, then build each B-tree bottom-up from the sorted
+    /// stream. Each node is written once, contiguously, with no lookups of
+    /// old keys (there are none) and no copy-on-write rewrites.
+    fn bulk_build(&self, snap: &Snapshot, st: &mut IndexState) -> Result<()> {
+        type Cmp<T> = SortCmp<T>;
+        let budget = crate::extsort::budget_bytes();
+        let scratch = |name: &str| self.path.with_extension(format!("{name}.sort"));
+        let mut view_sorters: Vec<ViewSorter> = st
+            .views
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let spec = t.spec.clone();
+                let cmp: Cmp<(VKey, VVal)> = Box::new(move |a, b| spec.cmp(&a.0, &b.0));
+                Sorter::new(scratch(&format!("v{i}")), budget, cmp)
+            })
+            .collect();
+        let id_cmp: Cmp<(String, IdEntry)> = Box::new(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut id_sorter = Sorter::new(scratch("ids"), budget, id_cmp);
+        // Pipeline: one thread walks the by-seq tree, JS map workers load and
+        // map docs, and this thread feeds the sorters. Workers are added while
+        // this (serial) stage sits idle waiting for them, i.e. until it keeps
+        // a full core busy, up to the machine's core count.
+        let max_workers = map_threads_max();
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Vec<FullDocInfo>>(max_workers * 4);
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<Result<Mapped>>(max_workers * 4);
+        let producer_done = std::sync::atomic::AtomicBool::new(false);
+        let alive = std::sync::atomic::AtomicUsize::new(0);
+        // Nanoseconds the reader spent blocked handing out work (high means
+        // the map workers are the bottleneck, low means the reader is).
+        let reader_blocked = std::sync::atomic::AtomicU64::new(0);
+        let st_ref: &IndexState = st;
+        let mut err: Option<CouchError> = None;
+        let mut workers = 0usize;
+        let mut busy = std::time::Duration::ZERO;
+        let t_start = Instant::now();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let mut batch = Vec::with_capacity(256);
+                let _ = snap.fold_changes(0, Dir::Fwd, |fdi| {
+                    batch.push(fdi.clone());
+                    if batch.len() >= 256 {
+                        let t = Instant::now();
+                        if work_tx.send(std::mem::take(&mut batch)).is_err() {
+                            return Ok(false);
+                        }
+                        reader_blocked.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(true)
+                });
+                if !batch.is_empty() {
+                    let _ = work_tx.send(batch);
+                }
+                drop(work_tx);
+                producer_done.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let spawn_worker = |res_tx: std::sync::mpsc::SyncSender<Result<Mapped>>| {
+                let work_rx = work_rx.clone();
+                alive.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let alive = &alive;
+                sc.spawn(move || {
+                    loop {
+                        let next = work_rx.lock().recv();
+                        let Ok(batch) = next else { break };
+                        let out: Result<Mapped> = batch
+                            .iter()
+                            .map(|f| self.doc_entries(snap, st_ref, f).map(|(pv, e)| (f.id.clone(), pv, e)))
+                            .collect();
+                        if res_tx.send(out).is_err() {
+                            break;
+                        }
+                    }
+                    alive.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            };
+            spawn_worker(res_tx.clone());
+            workers = 1;
+            let mut window = Instant::now();
+            let mut idle = std::time::Duration::ZERO;
+            loop {
+                let t = Instant::now();
+                let got = res_rx.recv_timeout(std::time::Duration::from_millis(50));
+                idle += t.elapsed();
+                match got {
+                    Ok(Ok(mapped)) => {
+                        let t_work = Instant::now();
+                        if let Err(e) = feed_sorters(mapped, &mut view_sorters, &mut id_sorter) {
+                            err = Some(e.into());
+                            break;
+                        }
+                        busy += t_work.elapsed();
+                    }
+                    Ok(Err(e)) => {
+                        err = Some(e);
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                let done = producer_done.load(std::sync::atomic::Ordering::SeqCst);
+                if done && alive.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    // Drain anything already sent, then finish.
+                    while let Ok(r) = res_rx.try_recv() {
+                        match r.and_then(|m| Ok(feed_sorters(m, &mut view_sorters, &mut id_sorter)?)) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+                if window.elapsed() >= std::time::Duration::from_millis(100) {
+                    // Still waiting on workers more than 5% of the time: double
+                    // the pool (capped), so it reaches full width quickly.
+                    let frac_idle = idle.as_secs_f64() / window.elapsed().as_secs_f64();
+                    if frac_idle > 0.05 && workers < max_workers && !done {
+                        for _ in 0..workers.min(max_workers - workers) {
+                            spawn_worker(res_tx.clone());
+                            workers += 1;
+                        }
+                    }
+                    window = Instant::now();
+                    idle = std::time::Duration::ZERO;
+                }
+            }
+            // Stops the producer and workers early if we bailed out.
+            drop(res_rx);
+            drop(res_tx);
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        let map_secs = t_start.elapsed().as_secs_f64();
+        let t_build = Instant::now();
+        for (vi, sorter) in view_sorters.into_iter().enumerate() {
+            let mut sorted = sorter.finish()?;
+            let mut b = st.views[vi].bulk_builder();
+            while let Some((k, v)) = sorted.next_item()? {
+                b.push(k, v)?;
+            }
+            st.views[vi] = b.finish()?;
+        }
+        let mut sorted = id_sorter.finish()?;
+        let mut b = st.ids.bulk_builder();
+        while let Some((k, v)) = sorted.next_item()? {
+            b.push(k, v)?;
+        }
+        st.ids = b.finish()?;
+        st.seq = snap.update_seq();
+        *self.last_build.lock() = Some(json!({
+            "method": "bulk",
+            "map_threads": workers,
+            "map_threads_max": max_workers,
+            "map_phase_secs": map_secs,
+            "collector_busy": busy.as_secs_f64() / map_secs.max(1e-9),
+            "reader_blocked": reader_blocked.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9 / map_secs.max(1e-9),
+            "sort_and_build_secs": t_build.elapsed().as_secs_f64(),
+        }));
+        Ok(())
+    }
+
     fn apply_batch(&self, snap: &Snapshot, st: &mut IndexState, batch: Vec<FullDocInfo>) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -677,28 +932,11 @@ impl Index {
                     }
                 }
             }
-            let rows = self.map_doc(snap, &fdi)?;
-            let mut entry = IdEntry { keys: Vec::new() };
-            for (vi, vrows) in rows.into_iter().enumerate() {
-                if vrows.is_empty() {
-                    continue;
+            let (per_view, entry) = self.doc_entries(snap, st, &fdi)?;
+            for (vi, rows) in per_view.into_iter().enumerate() {
+                for (k, val) in rows {
+                    view_acts[vi].push(Action::Insert((k, IdBound::Id(fdi.id.clone())), val));
                 }
-                // Group duplicate keys from one doc.
-                let spec = st.views[vi].spec.clone();
-                let mut grouped: Vec<(Value, Vec<Json>)> = Vec::new();
-                for (k, v) in vrows {
-                    match grouped.iter_mut().find(|(gk, _)| spec.cmp_key(gk, &k) == Ordering::Equal) {
-                        Some((_, vs)) => vs.push(Json(v)),
-                        None => grouped.push((k, vec![Json(v)])),
-                    }
-                }
-                let mut keys = Vec::new();
-                for (k, mut vs) in grouped {
-                    let val = if vs.len() == 1 { VVal::One(vs.pop().unwrap()) } else { VVal::Dups(vs) };
-                    keys.push(Json(k.clone()));
-                    view_acts[vi].push(Action::Insert((Json(k), IdBound::Id(fdi.id.clone())), val));
-                }
-                entry.keys.push((vi as u32, keys));
             }
             if entry.keys.is_empty() {
                 if old.is_some() {
@@ -734,7 +972,8 @@ impl Index {
                 "waiting_commit": false,
                 "collator_versions": ["153.112"],
                 "updates_pending": {"minimum": 0, "preferred": 0, "total": 0}
-            }
+            },
+            "couchdb_rs_last_build": self.last_build.lock().clone()
         })
     }
 

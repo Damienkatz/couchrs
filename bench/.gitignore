@@ -1,0 +1,4 @@
+couchbench/target/
+# Scratch output from validation runs; results.json/report.html are the real run.
+results-small.json
+report-small.html

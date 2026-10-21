@@ -241,6 +241,8 @@ impl Snapshot {
             deleted: leaf.deleted,
             body: map,
             atts: body.atts.iter().map(Att::from_info).collect(),
+            // Stored chunk pointers are only valid in this file.
+            att_gen: if body.atts.is_empty() { 0 } else { self.file.generation },
         })
     }
 
@@ -273,8 +275,17 @@ impl Snapshot {
                     Some(sp) => a.revpos > sp,
                     None => opts.attachments,
                 };
-                let data = if want { Some(self.read_att(a)?) } else { None };
-                atts.insert(a.name.clone(), att_stub_json(a, opts, data));
+                let stub = if want && opts.follows {
+                    let mut j = att_stub_json(a, opts, None);
+                    let o = j.as_object_mut().unwrap();
+                    o.remove("stub");
+                    o.insert("follows".into(), json!(true));
+                    j
+                } else {
+                    let data = if want { Some(self.read_att(a)?) } else { None };
+                    att_stub_json(a, opts, data)
+                };
+                atts.insert(a.name.clone(), stub);
             }
             m.insert("_attachments".into(), Value::Object(atts));
         }
@@ -510,6 +521,32 @@ impl Db {
         rx.await.map_err(|_| CouchError::internal("purge failed"))?
     }
 
+    /// Write a doc's new attachment bytes to the file before it reaches the
+    /// writer thread (CouchDB streams attachments the same way), so large
+    /// uploads don't stall every other write. The writer rejects the doc if
+    /// compaction swapped the file in between.
+    pub fn stage_atts(&self, doc: &mut Doc) -> Result<()> {
+        if !doc.atts.iter().any(|a| matches!(a.data, AttData::Bytes(_))) {
+            return Ok(());
+        }
+        let file = self.snapshot().file;
+        for a in doc.atts.iter_mut() {
+            if let AttData::Bytes(bytes) = &a.data {
+                let chunks = write_att_chunks(&file, bytes)?;
+                if a.md5.is_empty() || a.encoding.is_none() {
+                    a.md5 = Md5::digest(bytes).to_vec();
+                }
+                if a.encoding.is_none() {
+                    a.length = bytes.len() as u64;
+                }
+                a.encoded_length = bytes.len() as u64;
+                a.data = AttData::Stored(chunks);
+            }
+        }
+        doc.att_gen = file.generation;
+        Ok(())
+    }
+
     pub fn is_compacting(&self) -> bool {
         self.compacting.load(AtomicOrdering::Relaxed)
     }
@@ -547,21 +584,41 @@ impl Db {
             file: file.clone(),
             header,
         };
-        let mut batch: Vec<FullDocInfo> = Vec::new();
+        // Copy bodies in seq order (sequential appends) while building the
+        // indexes without copy-on-write: by-seq keys already arrive sorted
+        // and stream into a bottom-up builder; by-id entries go through an
+        // external sort first. Every index node is written exactly once.
+        let mut seqs = new.seqs.bulk_builder();
+        type IdCmp = Box<dyn Fn(&(String, FdiVal), &(String, FdiVal)) -> Ordering>;
+        let id_cmp: IdCmp = Box::new(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut ids = crate::extsort::Sorter::new(
+            self.path.with_extension("couch.compact.idsort"),
+            crate::extsort::budget_bytes(),
+            id_cmp,
+        );
         snap.fold_changes(0, Dir::Fwd, |fdi| {
-            batch.push(fdi.clone());
-            if batch.len() >= 1000 {
-                copy_docs(&snap, &mut new, std::mem::take(&mut batch), false)?;
-            }
+            let copied = copy_fdi(&snap, &file, fdi)?;
+            let approx = 64 + copied.id.len() + 48 * keytree::leafs(&copied.tree).len();
+            ids.push(
+                (copied.id.clone(), FdiVal { update_seq: copied.update_seq, deleted: copied.deleted, tree: copied.tree.clone() }),
+                approx,
+            )?;
+            seqs.push(copied.update_seq, copied)?;
             Ok(true)
         })?;
-        copy_docs(&snap, &mut new, batch, false)?;
-        let mut locals = Vec::new();
+        new.seqs = seqs.finish()?;
+        let mut sorted = ids.finish()?;
+        let mut idb = new.ids.bulk_builder();
+        while let Some((k, v)) = sorted.next_item()? {
+            idb.push(k, v)?;
+        }
+        new.ids = idb.finish()?;
+        let mut locals = new.locals.bulk_builder();
         snap.locals.fold(Dir::Fwd, &Range::default(), |k, v| {
-            locals.push(Action::Insert(k.clone(), v.clone()));
+            locals.push(k.clone(), v.clone())?;
             Ok(true)
         })?;
-        new.locals = new.locals.modify(locals)?;
+        new.locals = locals.finish()?;
         commit_header(&mut new)?;
         let (reply, rx) = oneshot::channel();
         self.send(Msg::CompactDone(Box::new(new), tmp, reply))?;
@@ -571,37 +628,23 @@ impl Db {
     pub fn delete_files(&self) {
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_file(self.path.with_extension("couch.compact"));
+        let _ = std::fs::remove_file(self.path.with_extension("couch.compact.idsort"));
     }
 }
 
-/// Copy docs (latest leaf bodies and attachments) into a compaction target.
-/// When `catch_up` is set, previously copied entries are replaced.
-fn copy_docs(src: &Snapshot, dst: &mut Snapshot, fdis: Vec<FullDocInfo>, catch_up: bool) -> Result<()> {
+/// Copy docs changed since the bulk copy into a compaction target,
+/// replacing the entries copied earlier.
+fn copy_docs(src: &Snapshot, dst: &mut Snapshot, fdis: Vec<FullDocInfo>) -> Result<()> {
     if fdis.is_empty() {
         return Ok(());
     }
     let mut id_acts = Vec::new();
     let mut seq_acts = Vec::new();
     for fdi in fdis {
-        if catch_up
-            && let Some(old) = dst.ids.lookup(&fdi.id)? {
-                seq_acts.push(Action::Remove(old.update_seq));
-            }
-        let mut err = None;
-        let tree = keytree::map_vals(&fdi.tree, &mut |_, _, v, is_leaf| match v {
-            RevVal::Avail(l) if is_leaf => match copy_body(src, dst, l.ptr) {
-                Ok(ptr) => RevVal::Avail(LeafVal { ptr, ..l.clone() }),
-                Err(e) => {
-                    err = Some(e);
-                    RevVal::Missing
-                }
-            },
-            _ => RevVal::Missing,
-        });
-        if let Some(e) = err {
-            return Err(e);
+        if let Some(old) = dst.ids.lookup(&fdi.id)? {
+            seq_acts.push(Action::Remove(old.update_seq));
         }
-        let new = FullDocInfo { tree, ..fdi };
+        let new = copy_fdi(src, &dst.file, &fdi)?;
         id_acts.push(Action::Insert(
             new.id.clone(),
             FdiVal {
@@ -617,17 +660,37 @@ fn copy_docs(src: &Snapshot, dst: &mut Snapshot, fdis: Vec<FullDocInfo>, catch_u
     Ok(())
 }
 
-fn copy_body(src: &Snapshot, dst: &Snapshot, ptr: Pos) -> Result<Pos> {
+/// Copy a doc's leaf bodies (and their attachments) into `dst`. Non-leaf
+/// revisions keep their place in the tree but lose their bodies.
+fn copy_fdi(src: &Snapshot, dst: &CouchFile, fdi: &FullDocInfo) -> Result<FullDocInfo> {
+    let mut err = None;
+    let tree = keytree::map_vals(&fdi.tree, &mut |_, _, v, is_leaf| match v {
+        RevVal::Avail(l) if is_leaf => match copy_body(src, dst, l.ptr) {
+            Ok(ptr) => RevVal::Avail(LeafVal { ptr, ..l.clone() }),
+            Err(e) => {
+                err = Some(e);
+                RevVal::Missing
+            }
+        },
+        _ => RevVal::Missing,
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(FullDocInfo { tree, ..fdi.clone() }),
+    }
+}
+
+fn copy_body(src: &Snapshot, dst: &CouchFile, ptr: Pos) -> Result<Pos> {
     let mut body = src.read_body(ptr)?;
     for a in body.atts.iter_mut() {
         let mut chunks = Vec::with_capacity(a.chunks.len());
         for p in &a.chunks {
             let data = src.file.read_raw(*p)?;
-            chunks.push(dst.file.append_raw(&data)?.0);
+            chunks.push(dst.append_raw(&data)?.0);
         }
         a.chunks = chunks;
     }
-    Ok(dst.file.append_term(&body)?.0)
+    Ok(dst.append_term(&body)?.0)
 }
 
 fn commit_header(s: &mut Snapshot) -> Result<()> {
@@ -700,7 +763,7 @@ fn finish_compaction(db: &Db, cur: Snapshot, mut new: Snapshot, tmp: &FsPath) ->
         changed.push(fdi.clone());
         Ok(true)
     })?;
-    copy_docs(&cur, &mut new, changed, true)?;
+    copy_docs(&cur, &mut new, changed)?;
     let mut locals = Vec::new();
     cur.locals.fold(Dir::Fwd, &Range::default(), |k, v| {
         locals.push(Action::Insert(k.clone(), v.clone()));
@@ -776,6 +839,10 @@ fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<
                     local_changed.push(doc.id.clone());
                 }
                 res.push(r);
+                continue;
+            }
+            if doc.att_gen != 0 && doc.att_gen != snap.file.generation {
+                res.push(Err(att_file_moved()));
                 continue;
             }
             if !fdis.contains_key(&doc.id) {
@@ -904,11 +971,7 @@ fn prepare_atts(
                 chunks: chunks.clone(),
             },
             AttData::Bytes(bytes) => {
-                let mut chunks = Vec::new();
-                let payloads: Vec<Vec<u8>> = bytes.chunks(ATT_CHUNK).map(|c| c.to_vec()).collect();
-                for (p, _) in snap.file.append_raw_many(&payloads)? {
-                    chunks.push(p);
-                }
+                let chunks = write_att_chunks(&snap.file, bytes)?;
                 let md5 = if a.md5.is_empty() || a.encoding.is_none() {
                     Md5::digest(bytes).to_vec()
                 } else {
@@ -935,6 +998,24 @@ fn prepare_atts(
         out.push(info);
     }
     Ok(out)
+}
+
+/// Append attachment data as 64 KiB chunks, 16 MiB per write.
+fn write_att_chunks(file: &CouchFile, bytes: &[u8]) -> Result<Vec<Pos>> {
+    let mut chunks = Vec::with_capacity(bytes.len() / ATT_CHUNK + 1);
+    let pieces: Vec<&[u8]> = bytes.chunks(ATT_CHUNK).collect();
+    for group in pieces.chunks(256) {
+        chunks.extend(file.append_raw_many(group)?.into_iter().map(|(p, _)| p));
+    }
+    Ok(chunks)
+}
+
+fn att_file_moved() -> CouchError {
+    CouchError::new(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "att_file_moved",
+        "database file changed while attachments were being written; retry",
+    )
 }
 
 fn write_rev(snap: &Snapshot, doc: &Doc, atts: Vec<AttInfo>, body_json: Vec<u8>) -> Result<LeafVal> {

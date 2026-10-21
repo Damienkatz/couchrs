@@ -148,7 +148,8 @@ pub enum AttData {
     /// Refers to the attachment of the same name on the previous revision.
     Stub,
     /// Bytes supplied in the request (base64 inline, multipart, or PUT).
-    Bytes(Vec<u8>),
+    /// Refcounted so retries and clones never copy large payloads.
+    Bytes(bytes::Bytes),
     /// Already written to the file.
     Stored(Vec<Pos>),
     /// Will arrive in a later multipart part.
@@ -190,6 +191,9 @@ pub struct Doc {
     pub deleted: bool,
     pub body: Map<String, Value>,
     pub atts: Vec<Att>,
+    /// Generation of the file that `Stored` attachment chunks were staged
+    /// into before the update reached the writer (0 = none staged).
+    pub att_gen: u64,
 }
 
 impl Doc {
@@ -260,7 +264,8 @@ pub fn from_json(v: Value) -> Result<Doc> {
                         let ids: Option<Vec<String>> =
                             ids.iter().map(|i| i.as_str().map(String::from)).collect();
                         let ids = ids.ok_or_else(|| CouchError::doc_validation("RevId isn't a string"))?;
-                        if ids.is_empty() || (s as usize) < ids.len() {
+                        // start 0 is the `0-N` rev scheme of _local docs (replicator checkpoints).
+                        if ids.is_empty() || (s != 0 && (s as usize) < ids.len()) {
                             return Err(CouchError::doc_validation("RevId isn't a valid revision list"));
                         }
                         revisions = Some((s, ids));
@@ -349,7 +354,7 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
                 md5: Md5::digest(&bytes).to_vec(),
                 encoding: None,
                 encoded_length: bytes.len() as u64,
-                data: AttData::Bytes(bytes),
+                data: AttData::Bytes(bytes::Bytes::from(bytes)),
             });
         } else {
             return Err(CouchError::bad_request(format!(
@@ -391,6 +396,9 @@ pub struct DocOpts {
     pub att_encoding_info: bool,
     pub atts_since: Option<Vec<(u64, String)>>,
     pub meta: bool,
+    /// Mark included attachments `"follows": true` instead of inlining
+    /// base64 data; the bytes are sent as multipart parts.
+    pub follows: bool,
 }
 
 pub fn att_stub_json(a: &AttInfo, opts: &DocOpts, data: Option<Vec<u8>>) -> Value {
