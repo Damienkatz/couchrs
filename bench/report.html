@@ -158,12 +158,13 @@ code { font-family: var(--mono); font-size: 0.92em; }
   <section>
     <h2>Replication</h2>
     <p>One full replication of the loaded database into a new database on the same server, driven by CouchDB's own replicator in both cases. That replicator talks to couchdb-rs over HTTP, so this also shows the two interoperate.</p>
-    <div class="figrow"><div class="figure" id="fig-repl-time"></div><div class="figure" id="fig-repl-rate"></div></div>
+    <div class="figure" id="fig-repl-time"></div>
+    <div class="figrow"><div class="figure" id="fig-repl-mb"></div><div class="figure" id="fig-repl-docs"></div></div>
   </section>
 
   <section>
     <h2>Disk</h2>
-    <div class="figure" id="fig-disk"></div>
+    <div class="figrow"><div class="figure" id="fig-disk-db"></div><div class="figure" id="fig-disk-idx"></div></div>
   </section>
 
   <section>
@@ -237,11 +238,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
   const hideTip = () => { tip.hidden = true; };
 
   // ---------------------------------------------------------- scales
-  function scale(min, max, log, x0, x1) {
-    if (log) {
-      const a = Math.log10(min), b = Math.log10(max);
-      return v => x0 + (Math.log10(Math.max(v, min)) - a) / (b - a) * (x1 - x0);
-    }
+  function scale(min, max, x0, x1) {
     return v => x0 + (v - min) / (max - min) * (x1 - x0);
   }
   function niceTicks(max) {
@@ -254,7 +251,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
   }
 
   // ------------------------------------------------- grouped bar chart
-  // rows: [{label, erlang, rust}], opts: {title, sub, fmt, log, better}
+  // rows: [{label, erlang, rust}], opts: {title, sub, fmt, unit, better}
   // Charts are drawn at their container's real width (text stays at its
   // true pixel size) and redrawn on resize.
   const RENDERERS = [];
@@ -274,18 +271,12 @@ code { font-family: var(--mono); font-size: 0.92em; }
     if (!rows.length) { host.appendChild(h('div', 'sub', 'No data in this run.')); return; }
     const fmt = opts.fmt || compact;
     const vals = rows.flatMap(r => [r.erlang, r.rust]).filter(v => v != null && v > 0);
-    let max = Math.max(...vals), min = Math.min(...vals);
-    const log = opts.log ?? (max / min > 40);
-    let lo, hi, ticks;
-    if (log) {
-      lo = Math.pow(10, Math.floor(Math.log10(min))); hi = Math.pow(10, Math.ceil(Math.log10(max)));
-      if (hi / lo < 10) hi = lo * 10;
-      ticks = []; for (let t = lo; t <= hi * 1.0001; t *= 10) ticks.push(t);
-    } else { lo = 0; ticks = niceTicks(max); hi = ticks[ticks.length - 1]; }
+    const max = Math.max(...vals);
+    const lo = 0, ticks = niceTicks(max), hi = ticks[ticks.length - 1];
     const W = width(host), labelW = 76, valW = 50, barH = 11, gapIn = 2, rowH = 2 * barH + gapIn + 14, top = 6, axisH = 22;
     const H = top + rows.length * rowH + axisH;
     const x0 = labelW, x1 = W - valW;
-    const sx = scale(lo, hi, log, x0, x1);
+    const sx = scale(lo, hi, x0, x1);
     const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': opts.title });
     for (const tv of ticks) {
       const x = sx(tv);
@@ -343,23 +334,24 @@ code { font-family: var(--mono); font-size: 0.92em; }
     host.replaceChildren();
     rows = rows.filter(r => isFinite(r.ratio) && r.ratio > 0);
     const head = h('div', 'fighead');
-    const t = h('div'); t.append(h('h3', null, 'couchdb-rs speed relative to CouchDB'), h('div', 'sub', 'log scale · each bar starts at 1× (parity)'));
+    const t = h('div'); t.append(h('h3', null, 'couchdb-rs speed relative to CouchDB'), h('div', 'sub', 'each bar starts at 1× (parity)'));
     head.append(t); host.appendChild(head);
     if (!rows.length) { host.appendChild(h('div', 'sub', 'No comparable results yet.')); return; }
-    const ext = Math.max(2, ...rows.map(r => Math.max(r.ratio, 1 / r.ratio)));
-    const hiR = Math.pow(10, Math.ceil(Math.log10(ext) * 2) / 2);
+    const rticks = niceTicks(Math.max(2, ...rows.map(r => r.ratio)));
+    const hiR = rticks[rticks.length - 1];
     const W = width(host), labelW = W < 520 ? 140 : 180, rowH = 26, top = 10, axisH = 24, valW = W < 520 ? 92 : 110;
     const H = top + rows.length * rowH + axisH;
     const x0 = labelW, x1 = W - valW;
-    const sx = scale(1 / hiR, hiR, true, x0, x1);
+    const sx = scale(0, hiR, x0, x1);
     const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'Speed ratio by benchmark' });
-    const ticks = []; for (let e = -Math.floor(Math.log10(hiR) * 2) / 2; e <= Math.log10(hiR) + 1e-9; e += 0.5) ticks.push(Math.pow(10, e));
-    for (const tv of ticks) {
+    for (const tv of rticks) {
       const x = sx(tv);
-      el('line', { x1: x, x2: x, y1: top - 4, y2: H - axisH + 2, stroke: tv === 1 ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 }, svg);
+      el('line', { x1: x, x2: x, y1: top - 4, y2: H - axisH + 2, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
       const tx = el('text', { x, y: H - 6, 'text-anchor': 'middle', class: 'tick' }, svg);
-      tx.textContent = tv >= 1 ? (tv < 10 ? tv.toFixed(tv % 1 ? 1 : 0) : tv.toFixed(0)) + '×' : '1/' + (1 / tv < 10 ? (1 / tv).toFixed(1) : (1 / tv).toFixed(0)) + '×';
+      tx.textContent = (tv % 1 ? tv.toFixed(1) : tv.toFixed(0)) + '×';
     }
+    // Parity line: bars to its right mean couchdb-rs is faster.
+    el('line', { x1: sx(1), x2: sx(1), y1: top - 4, y2: H - axisH + 2, stroke: 'var(--axis)', 'stroke-width': 1.5 }, svg);
     rows.forEach((r, i) => {
       const y = top + i * rowH + rowH / 2;
       const g = el('g', {}, svg);
@@ -430,18 +422,18 @@ code { font-family: var(--mono); font-size: 0.92em; }
   document.getElementById('load-text').textContent =
     'The whole dataset, loaded with 16 concurrent connections: small docs through _bulk_docs (1,000 per batch), large ones as streamed single-document uploads. ' +
     [loadTxt('CouchDB', E), loadTxt('couchdb-rs', S)].filter(Boolean).join(' · ') + '.';
-  bars('fig-load-mb', [{ label: 'Throughput', erlang: g(E, 'load.mb_per_sec'), rust: g(S, 'load.mb_per_sec') }], { title: 'Load throughput', sub: 'MB/s · higher is better', unit: 'MB/s', log: false });
-  bars('fig-load-docs', [{ label: 'Documents', erlang: g(E, 'load.docs_per_sec'), rust: g(S, 'load.docs_per_sec') }], { title: 'Load rate', sub: 'docs/s · higher is better', unit: 'docs/s', log: false });
+  bars('fig-load-mb', [{ label: 'Throughput', erlang: g(E, 'load.mb_per_sec'), rust: g(S, 'load.mb_per_sec') }], { title: 'Load throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
+  bars('fig-load-docs', [{ label: 'Documents', erlang: g(E, 'load.docs_per_sec'), rust: g(S, 'load.docs_per_sec') }], { title: 'Load rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
 
-  bars('fig-put-ops', byClass('put', 'ops_per_sec'), { title: 'PUT operations', sub: 'ops/s by doc size · log scale · higher is better', unit: 'ops/s' });
-  bars('fig-put-mb', byClass('put', 'mb_per_sec'), { title: 'PUT throughput', sub: 'MB/s by doc size · log scale · higher is better', unit: 'MB/s' });
-  bars('fig-get-ops', byClass('get', 'ops_per_sec'), { title: 'GET operations', sub: 'ops/s by size band · log scale · higher is better', unit: 'ops/s' });
-  bars('fig-get-mb', byClass('get', 'mb_per_sec'), { title: 'GET throughput', sub: 'MB/s by size band · log scale · higher is better', unit: 'MB/s' });
-  bars('fig-del', byClass('delete', 'ops_per_sec'), { title: 'DELETE operations', sub: 'ops/s by doc size · log scale · higher is better', unit: 'ops/s' });
+  bars('fig-put-ops', byClass('put', 'ops_per_sec'), { title: 'PUT operations', sub: 'ops/s by doc size · higher is better', unit: 'ops/s' });
+  bars('fig-put-mb', byClass('put', 'mb_per_sec'), { title: 'PUT throughput', sub: 'MB/s by doc size · higher is better', unit: 'MB/s' });
+  bars('fig-get-ops', byClass('get', 'ops_per_sec'), { title: 'GET operations', sub: 'ops/s by size band · higher is better', unit: 'ops/s' });
+  bars('fig-get-mb', byClass('get', 'mb_per_sec'), { title: 'GET throughput', sub: 'MB/s by size band · higher is better', unit: 'MB/s' });
+  bars('fig-del', byClass('delete', 'ops_per_sec'), { title: 'DELETE operations', sub: 'ops/s by doc size · higher is better', unit: 'ops/s' });
 
   let PCT = 'p99_ms';
   const PNAME = { mean_ms: 'mean', p50_ms: 'p50', p90_ms: 'p90', p99_ms: 'p99' };
-  const latOpts = what => () => ({ title: `${what} latency, ${PNAME[PCT]}`, sub: 'ms · log scale · lower is better', unit: 'ms', better: 'lower' });
+  const latOpts = what => () => ({ title: `${what} latency, ${PNAME[PCT]}`, sub: 'ms · lower is better', unit: 'ms', better: 'lower' });
   bars('fig-lat-put', () => byClass('put', PCT), latOpts('PUT'));
   bars('fig-lat-get', () => byClass('get', PCT), latOpts('GET'));
   bars('fig-lat-del', () => byClass('delete', PCT), latOpts('DELETE'));
@@ -481,22 +473,22 @@ code { font-family: var(--mono); font-size: 0.92em; }
 
   bars('fig-view-build', [
     { label: 'Index build', erlang: g(E, 'view.docs_per_sec'), rust: g(S, 'view.docs_per_sec') },
-  ], { title: 'View build rate', sub: 'docs indexed per second · higher is better', unit: 'docs/s', log: false });
+  ], { title: 'View build rate', sub: 'docs indexed per second · higher is better', unit: 'docs/s' });
   const Q = [['key_lookup_limit20', 'Key lookup'], ['key_reduce', 'Key + reduce'], ['group_level1_reduce', 'Group reduce'], ['include_docs_limit10', 'include_docs']];
   bars('fig-view-q', Q.map(([k, l]) => ({ label: l, erlang: g(E, `view.queries.${k}.ops_per_sec`), rust: g(S, `view.queries.${k}.ops_per_sec`) })),
-    { title: 'View queries', sub: 'queries/s · higher is better', unit: 'q/s', log: false });
+    { title: 'View queries', sub: 'queries/s · higher is better', unit: 'q/s' });
 
   bars('fig-repl-time', [{ label: 'Full copy', erlang: g(E, 'replicate.secs'), rust: g(S, 'replicate.secs') }],
-    { title: 'Replication time', sub: 'minutes · lower is better', unit: 'min', better: 'lower', log: false, fmt: v => compact(v / 60) });
-  bars('fig-repl-rate', [
-    { label: 'MB/s', erlang: g(E, 'replicate.mb_per_sec'), rust: g(S, 'replicate.mb_per_sec') },
-    { label: 'docs/s', erlang: g(E, 'replicate.docs_per_sec'), rust: g(S, 'replicate.docs_per_sec') },
-  ], { title: 'Replication rate', sub: 'higher is better · log scale', log: true });
+    { title: 'Replication time', sub: 'minutes · lower is better', unit: 'min', better: 'lower', fmt: v => compact(v / 60) });
+  bars('fig-repl-mb', [{ label: 'Throughput', erlang: g(E, 'replicate.mb_per_sec'), rust: g(S, 'replicate.mb_per_sec') }],
+    { title: 'Replication throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
+  bars('fig-repl-docs', [{ label: 'Documents', erlang: g(E, 'replicate.docs_per_sec'), rust: g(S, 'replicate.docs_per_sec') }],
+    { title: 'Replication rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
 
-  bars('fig-disk', [
-    { label: 'Database file', erlang: g(E, 'load.file_bytes_after'), rust: g(S, 'load.file_bytes_after') },
-    { label: 'View index', erlang: g(E, 'view.index_file_bytes'), rust: g(S, 'view.index_file_bytes') },
-  ], { title: 'Space on disk', sub: 'after the load (no compaction) · log scale · lower is better', better: 'lower', log: true, fmt: bytes });
+  bars('fig-disk-db', [{ label: 'Database', erlang: g(E, 'load.file_bytes_after'), rust: g(S, 'load.file_bytes_after') }],
+    { title: 'Database file', sub: 'after the load, no compaction · lower is better', better: 'lower', fmt: bytes });
+  bars('fig-disk-idx', [{ label: 'View index', erlang: g(E, 'view.index_file_bytes'), rust: g(S, 'view.index_file_bytes') }],
+    { title: 'View index file', sub: 'after a fresh build · lower is better', better: 'lower', fmt: bytes });
 
   const renderAll = () => RENDERERS.forEach(f => f());
   renderAll();
