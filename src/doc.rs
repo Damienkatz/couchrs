@@ -2,6 +2,7 @@
 //! revision id generation.
 
 use crate::error::{CouchError, Result};
+use axum::http::StatusCode;
 use crate::file::Pos;
 use crate::keytree::{self, RevTree, RevValue};
 use base64::Engine;
@@ -313,17 +314,52 @@ pub fn parse_rev(s: &str) -> Result<(u64, String)> {
     Ok((pos, id.to_string()))
 }
 
+/// couch_doc:validate_docid, with its errors.
 pub fn validate_docid(id: &str) -> Result<()> {
+    let illegal = |reason: &str| Err(CouchError::new(StatusCode::BAD_REQUEST, "illegal_docid", reason));
     if id.is_empty() {
-        return Err(CouchError::bad_request("Document id must not be empty"));
+        return illegal("Document id must not be empty");
     }
-    if id.starts_with('_') && !id.starts_with("_design/") && !id.starts_with("_local/") {
-        return Err(CouchError::bad_request("Only reserved document ids may start with underscore."));
+    if id == "_local/" {
+        return Err(CouchError::bad_request("Invalid _local document id."));
     }
-    if id == "_design/" || id == "_local/" {
-        return Err(CouchError::bad_request("Document id must not be empty"));
+    if id == "_design/" || (id.starts_with('_') && !id.starts_with("_design/") && !id.starts_with("_local/")) {
+        return illegal("Only reserved document ids may start with underscore.");
     }
     Ok(())
+}
+
+/// A partition name (couch_partition:validate_partition).
+pub fn validate_partition(p: &str) -> Result<()> {
+    let bad = |reason: &str| Err(CouchError::new(StatusCode::BAD_REQUEST, "illegal_partition", reason));
+    if p.is_empty() {
+        return bad("Partition must not be empty");
+    }
+    if p.starts_with('_') {
+        return bad("Partition must not start with an underscore");
+    }
+    if p.contains(':') {
+        return bad("Partition must not contain a colon");
+    }
+    Ok(())
+}
+
+/// A document id in a partitioned database: PARTITION:ID, except design
+/// and local documents (couch_partition:validate_docid).
+pub fn validate_partitioned_docid(id: &str) -> Result<()> {
+    if id.starts_with("_design/") || id.starts_with("_local/") {
+        return Ok(());
+    }
+    let Some((p, rest)) = id.split_once(':') else {
+        return Err(CouchError::new(StatusCode::BAD_REQUEST, "illegal_docid", "Doc id must be of form partition:id"));
+    };
+    validate_partition(p)?;
+    validate_docid(rest)
+}
+
+/// The partition of a document id, if it has one.
+pub fn partition_of(id: &str) -> Option<&str> {
+    id.split_once(':').map(|(p, _)| p)
 }
 
 /// Parse a JSON object into a Doc (couch_doc:from_json_obj_validate).

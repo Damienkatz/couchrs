@@ -337,6 +337,8 @@ pub struct MangoIndex {
     /// (field, ascending)
     pub fields: Vec<(String, bool)>,
     pub partial: Option<Value>,
+    /// The index lives in a partitioned design doc (rows per partition).
+    pub partitioned: bool,
 }
 
 impl MangoIndex {
@@ -347,6 +349,7 @@ impl MangoIndex {
             kind: "special".into(),
             fields: vec![("_id".into(), true)],
             partial: None,
+            partitioned: false,
         }
     }
 
@@ -360,7 +363,10 @@ impl MangoIndex {
         if let Some(p) = &self.partial {
             def["partial_filter_selector"] = p.clone();
         }
-        json!({"ddoc": self.ddoc, "name": self.name, "type": self.kind, "partitioned": false, "def": def})
+        if self.kind == "special" {
+            return json!({"ddoc": self.ddoc, "name": self.name, "type": self.kind, "def": def});
+        }
+        json!({"ddoc": self.ddoc, "name": self.name, "type": self.kind, "partitioned": self.partitioned, "def": def})
     }
 }
 
@@ -392,6 +398,10 @@ pub fn list_indexes(snap: &Snapshot) -> Result<Vec<MangoIndex>> {
             continue;
         }
         let id = d["_id"].as_str().unwrap_or("").to_string();
+        let partitioned = match d.get("options").and_then(|o| o.get("partitioned")) {
+            Some(Value::Bool(b)) => *b,
+            _ => snap.partitioned(),
+        };
         let Some(vs) = d.get("views").and_then(|v| v.as_object()) else { continue };
         for (name, v) in vs {
             let fields = v
@@ -419,6 +429,7 @@ pub fn list_indexes(snap: &Snapshot) -> Result<Vec<MangoIndex>> {
                 kind: "json".into(),
                 fields,
                 partial,
+                partitioned,
             });
         }
     }
@@ -479,7 +490,15 @@ async fn create_index(req: &Req, db: &Arc<Db>) -> Result<Response> {
     } else {
         map["partial_filter_selector"] = json!({});
     }
-    let hash = hex::encode(Md5::digest(serde_json::to_vec(&json!([def, "json"]))?));
+    let snap = db.snapshot();
+    let partitioned = match body.get("partitioned") {
+        None | Some(Value::Null) => snap.partitioned(),
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(CouchError::bad_request("`partitioned` must be a boolean")),
+    };
+    // Partitioned and global indexes live in different design docs.
+    let hash_src = if snap.partitioned() { json!([def, "json", partitioned]) } else { json!([def, "json"]) };
+    let hash = hex::encode(Md5::digest(serde_json::to_vec(&hash_src)?));
     let ddoc_id = match body.get("ddoc").and_then(|d| d.as_str()) {
         Some(d) if d.starts_with("_design/") => d.to_string(),
         Some(d) => format!("_design/{d}"),
@@ -488,10 +507,12 @@ async fn create_index(req: &Req, db: &Arc<Db>) -> Result<Response> {
     let name = body.get("name").and_then(|n| n.as_str()).unwrap_or(&hash).to_string();
     let view = json!({"map": map, "reduce": "_count", "options": {"def": def}});
 
-    let snap = db.snapshot();
     let existing = snap.get_fdi(&ddoc_id)?;
     let mut doc_json = match existing.as_ref().filter(|f| !f.deleted) {
         Some(f) => snap.winner_json(f, &DocOpts::default())?,
+        None if snap.partitioned() || partitioned => {
+            json!({"_id": ddoc_id, "language": "query", "views": {}, "options": {"partitioned": partitioned}})
+        }
         None => json!({"_id": ddoc_id, "language": "query", "views": {}}),
     };
     if doc_json.get("language").and_then(|l| l.as_str()) != Some("query") {
@@ -574,6 +595,8 @@ pub struct FindQuery {
     pub conflicts: bool,
     pub execution_stats: bool,
     pub stable: bool,
+    /// Set for /db/_partition/P/_find.
+    pub partition: Option<String>,
 }
 
 fn parse_find(body: &Map<String, Value>) -> Result<FindQuery> {
@@ -629,6 +652,7 @@ fn parse_find(body: &Map<String, Value>) -> Result<FindQuery> {
         conflicts: body.get("conflicts").and_then(|u| u.as_bool()).unwrap_or(false),
         execution_stats: body.get("execution_stats").and_then(|u| u.as_bool()).unwrap_or(false),
         stable: body.get("stable").and_then(|u| u.as_bool()).unwrap_or(false),
+        partition: None,
     })
 }
 
@@ -703,7 +727,12 @@ fn usable(idx: &MangoIndex, q: &FindQuery, required: &[String]) -> bool {
 }
 
 fn choose_index(snap: &Snapshot, q: &FindQuery) -> Result<(MangoIndex, Option<String>)> {
-    let all = list_indexes(snap)?;
+    // A partition query can use partitioned indexes only, a global one
+    // global indexes only; _all_docs serves both.
+    let all: Vec<MangoIndex> = list_indexes(snap)?
+        .into_iter()
+        .filter(|i| i.kind == "special" || i.partitioned == q.partition.is_some())
+        .collect();
     let required = q.selector.required_fields();
     if let Some((ddoc, name)) = &q.use_index {
         let found: Vec<&MangoIndex> = all
@@ -713,10 +742,10 @@ fn choose_index(snap: &Snapshot, q: &FindQuery) -> Result<(MangoIndex, Option<St
         if let Some(i) = found.iter().find(|i| usable(i, q, &required)) {
             return Ok(((*i).clone(), None));
         }
-        let warn = format!("{ddoc} was not used because it is not a valid index for this query.");
+        let warn = format!("{ddoc} was not used because it does not contain a valid index for this query.");
         // Fall through to automatic selection with a warning.
         let (i, w) = auto_index(&all, q, &required)?;
-        return Ok((i, Some(w.map(|w| format!("{warn} {w}")).unwrap_or(warn))));
+        return Ok((i, Some(w.map(|w| format!("{warn}\n{w}")).unwrap_or(warn))));
     }
     auto_index(&all, q, &required)
 }
@@ -786,7 +815,7 @@ fn explain_json(db: &str, idx: &MangoIndex, q: &FindQuery, range: &Value) -> Val
     json!({
         "dbname": db,
         "index": idx.to_json(),
-        "partitioned": false,
+        "partitioned": q.partition.is_some(),
         "selector": q.selector.raw,
         "opts": {
             "use_index": q.use_index.as_ref().map(|(d, n)| match n { Some(n) => json!([d, n]), None => json!([d]) }).unwrap_or(json!([])),
@@ -795,7 +824,7 @@ fn explain_json(db: &str, idx: &MangoIndex, q: &FindQuery, range: &Value) -> Val
             "skip": q.skip,
             "sort": {},
             "fields": q.fields.clone().map(|f| json!(f)).unwrap_or(json!("all_fields")),
-            "partition": "",
+            "partition": q.partition.clone().unwrap_or_default(),
             "r": 1,
             "conflicts": q.conflicts,
             "stale": false,
@@ -908,11 +937,30 @@ fn run_find(req_server: &Req, db: &Arc<Db>, q: &FindQuery) -> Result<Value> {
                 start = Some(id.to_string());
                 after = Some(id.to_string());
             }
-        let range = Range {
+        let mut range = Range {
             start,
             end: args.end_key.as_ref().and_then(|v| v.as_str().map(String::from)),
             inclusive_end: true,
         };
+        // Within a partition: ids from "P:" up to "P;".
+        if let Some(p) = &q.partition {
+            let (lo, hi) = (format!("{p}:"), format!("{p};"));
+            let (first, last) = if args.descending { (hi, lo) } else { (lo, hi) };
+            let clamp_start = |s: Option<String>| -> String {
+                match s {
+                    Some(s) if (s > first) != args.descending => s,
+                    _ => first.clone(),
+                }
+            };
+            range.start = Some(clamp_start(range.start.take()));
+            range.end = match range.end.take() {
+                Some(e) if (e < last) != args.descending => Some(e),
+                _ => {
+                    range.inclusive_end = false;
+                    Some(last.clone())
+                }
+            };
+        }
         snap.fold_docs(dir, &range, |fdi| {
             if after.as_deref() == Some(fdi.id.as_str()) {
                 return Ok(true);
@@ -943,10 +991,22 @@ fn run_find(req_server: &Req, db: &Arc<Db>, q: &FindQuery) -> Result<Value> {
         let fdir = if args.descending { Dir::Rev } else { Dir::Fwd };
         let start_id = if args.descending { IdBound::Max } else { IdBound::Min };
         let end_id = if args.descending { IdBound::Min } else { IdBound::Max };
+        // A partitioned index stores [partition, key]: bound the range to
+        // the partition and wrap the keys.
+        let wrap = |k: Value| match &q.partition {
+            Some(p) => json!([p, k]),
+            None => k,
+        };
+        let (pstart, pend) = match &q.partition {
+            Some(p) if args.descending => (Some(json!([p, views::key_max()])), Some(json!([p]))),
+            Some(p) => (Some(json!([p])), Some(json!([p, views::key_max()]))),
+            None => (None, None),
+        };
+        let end_inclusive = args.inclusive_end || args.end_key.is_none();
         let mut range = Range {
-            start: args.start_key.clone().map(|k| (crate::collate::Json(k), start_id.clone())),
-            end: args.end_key.clone().map(|k| {
-                let id = if args.inclusive_end { end_id.clone() } else if args.descending { IdBound::Max } else { IdBound::Min };
+            start: args.start_key.clone().map(wrap).or(pstart).map(|k| (crate::collate::Json(k), start_id.clone())),
+            end: args.end_key.clone().map(wrap).or(pend).map(|k| {
+                let id = if end_inclusive { end_id.clone() } else if args.descending { IdBound::Max } else { IdBound::Min };
                 (crate::collate::Json(k), id)
             }),
             inclusive_end: true,
@@ -1008,21 +1068,33 @@ fn run_find(req_server: &Req, db: &Arc<Db>, q: &FindQuery) -> Result<Value> {
 }
 
 pub async fn http_find(req: &Req, db: &Arc<Db>) -> Result<Response> {
+    http_find_in(req, db, None).await
+}
+
+/// _find, globally or within a partition.
+pub async fn http_find_in(req: &Req, db: &Arc<Db>, partition: Option<&str>) -> Result<Response> {
     if req.method != Method::POST {
         return not_allowed("POST");
     }
     let body = req.json_obj_body()?;
-    let q = parse_find(&body)?;
+    let mut q = parse_find(&body)?;
+    q.partition = partition.map(String::from);
     let v = blocking(|| run_find(req, db, &q))?;
     ok_json(v)
 }
 
 pub async fn http_explain(req: &Req, db: &Arc<Db>) -> Result<Response> {
+    http_explain_in(req, db, None).await
+}
+
+/// _explain, globally or within a partition.
+pub async fn http_explain_in(req: &Req, db: &Arc<Db>, partition: Option<&str>) -> Result<Response> {
     if req.method != Method::POST {
         return not_allowed("POST");
     }
     let body = req.json_obj_body()?;
-    let q = parse_find(&body)?;
+    let mut q = parse_find(&body)?;
+    q.partition = partition.map(String::from);
     let snap = db.snapshot();
     let (idx, _) = blocking(|| choose_index(&snap, &q))?;
     let (_, shown) = mrargs(&idx, &q);

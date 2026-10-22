@@ -53,13 +53,18 @@ impl Server {
     }
 
     pub fn create_db(&self, name: &str) -> Result<Arc<Db>> {
+        self.create_db_with(name, &serde_json::json!({}))
+    }
+
+    /// Create a database with properties ({"partitioned": true}).
+    pub fn create_db_with(&self, name: &str, props: &serde_json::Value) -> Result<Arc<Db>> {
         Self::check_name(name)?;
         let mut dbs = self.dbs.lock();
         let path = self.db_path(name);
         if dbs.contains_key(name) || crate::db::exists(&path) {
             return Err(CouchError::file_exists());
         }
-        let db = Db::create(&path, name, &crate::auth::default_security(&self.config))?;
+        let db = Db::create(&path, name, &crate::auth::default_security(&self.config), props)?;
         dbs.insert(name.to_string(), db.clone());
         let _ = self.db_events.send((name.to_string(), "created"));
         Ok(db)

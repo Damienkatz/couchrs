@@ -355,6 +355,8 @@ pub struct IndexDef {
     pub js: Option<JsFuns>,
     pub include_design: bool,
     pub local_seq: bool,
+    /// Rows are stored keyed [partition, key] and queried per partition.
+    pub partitioned: bool,
 }
 
 fn parse_reducer(src: &str, js_red: &mut Vec<String>, ddoc: &Value) -> Result<Reducer> {
@@ -381,7 +383,8 @@ fn parse_reducer(src: &str, js_red: &mut Vec<String>, ddoc: &Value) -> Result<Re
 }
 
 impl IndexDef {
-    pub fn from_ddoc(ddoc: &Value) -> Result<IndexDef> {
+    /// `db_partitioned` is the default for options.partitioned.
+    pub fn from_ddoc(ddoc: &Value, db_partitioned: bool) -> Result<IndexDef> {
         let id = ddoc["_id"].as_str().unwrap_or("").to_string();
         let language = ddoc.get("language").and_then(|l| l.as_str()).unwrap_or("javascript").to_string();
         let empty = Map::new();
@@ -451,12 +454,26 @@ impl IndexDef {
                 }
             }
         }
+        let partitioned = match opts.get("partitioned") {
+            Some(Value::Bool(b)) => *b,
+            _ => db_partitioned,
+        };
+        if partitioned && !db_partitioned {
+            return Err(CouchError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_design_doc",
+                "partitioned option cannot be true in a non-partitioned database.",
+            ));
+        }
         // Signature covers everything that affects index contents.
         let mut sig_src = json!({
             "language": language,
             "views": views,
             "options": opts,
         });
+        if partitioned {
+            sig_src["partitioned"] = json!(true);
+        }
         if language != "query" {
             sig_src["lib"] = views.get("lib").cloned().unwrap_or(Value::Null);
         }
@@ -469,6 +486,7 @@ impl IndexDef {
             js,
             include_design: opts.get("include_design").and_then(|b| b.as_bool()).unwrap_or(false),
             local_seq: opts.get("local_seq").and_then(|b| b.as_bool()).unwrap_or(false),
+            partitioned,
         })
     }
 
@@ -647,9 +665,20 @@ impl Index {
             _ => None,
         };
         let mut out = Vec::with_capacity(n);
+        // Partitioned rows are keyed [partition, key].
+        let part = if self.def.partitioned { crate::doc::partition_of(&fdi.id).map(|p| json!(p)) } else { None };
+        if self.def.partitioned && part.is_none() {
+            return Ok(vec![Vec::new(); n]);
+        }
+        let wrap = |rows: Vec<(Value, Value)>| -> Vec<(Value, Value)> {
+            match &part {
+                Some(p) => rows.into_iter().map(|(k, v)| (json!([p, k]), v)).collect(),
+                None => rows,
+            }
+        };
         for v in &self.def.views {
             match &v.map {
-                MapKind::Js(i) => out.push(js_rows.as_ref().and_then(|r| r.get(*i).cloned()).unwrap_or_default()),
+                MapKind::Js(i) => out.push(wrap(js_rows.as_ref().and_then(|r| r.get(*i).cloned()).unwrap_or_default())),
                 MapKind::Mango { fields, partial } => {
                     if let Some(p) = partial
                         && !p.matches(&doc) {
@@ -664,7 +693,7 @@ impl Index {
                         }
                     }
                     if key.len() == fields.len() {
-                        out.push(vec![(Value::Array(key), Value::Null)]);
+                        out.push(wrap(vec![(Value::Array(key), Value::Null)]));
                     } else {
                         out.push(Vec::new());
                     }
@@ -1022,7 +1051,7 @@ impl Index {
 
 /// Find or open the index for a design doc.
 pub fn get_index(db: &Arc<Db>, ddoc: &Value, index_dir: PathBuf) -> Result<Arc<Index>> {
-    let def = IndexDef::from_ddoc(ddoc)?;
+    let def = IndexDef::from_ddoc(ddoc, db.snapshot().partitioned())?;
     let key = format!("mrview:{}", def.sig);
     if let Some(i) = db.ext.lock().get(&key).cloned()
         && let Ok(idx) = i.downcast::<Index>() {
@@ -1149,6 +1178,24 @@ pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, a
     let dir = if args.descending { Dir::Rev } else { Dir::Fwd };
     let spec = tree.spec.clone();
     let total = tree.full_reduce().map(|r| r.count).unwrap_or(0);
+    // Within a partition: wrapped keys. Like CouchDB, total_rows and
+    // offset still count the whole view.
+    let part = args.partition.clone();
+    let pargs;
+    let args = match &part {
+        Some(p) => {
+            pargs = partition_args(args, p);
+            &pargs
+        }
+        None => args,
+    };
+    // Keys as the caller knows them (without the partition).
+    let user_key = |k: &Value| -> Value {
+        match (&part, k) {
+            (Some(_), Value::Array(a)) if a.len() == 2 => a[1].clone(),
+            _ => k.clone(),
+        }
+    };
     let opts = args.doc_opts();
     let mut rows = Vec::new();
 
@@ -1176,7 +1223,7 @@ pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, a
             tree.fold_reduce(
                 dir,
                 &range,
-                |x, y| same_group(args, &spec, &x.0.0, &y.0.0),
+                |x, y| same_group(args, &spec, &user_key(&x.0.0), &user_key(&y.0.0)),
                 |k, red| {
                     if skip > 0 {
                         skip -= 1;
@@ -1194,7 +1241,7 @@ pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, a
                         ));
                         return Ok(false);
                     }
-                    rows.push(json!({"key": group_key(args, &k.0.0), "value": v}));
+                    rows.push(json!({"key": group_key(args, &user_key(&k.0.0)), "value": v}));
                     Ok(true)
                 },
             )?;
@@ -1239,7 +1286,7 @@ pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, a
                 if rows.len() >= args.limit {
                     return Ok(false);
                 }
-                let mut row = json!({"id": id, "key": k.0, "value": val});
+                let mut row = json!({"id": id, "key": user_key(&k.0), "value": val});
                 if args.include_docs {
                     match row_doc(snap, &id, val, &opts) {
                         Ok(d) => row["doc"] = d,
@@ -1308,8 +1355,40 @@ pub fn view_json(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str, args: &Quer
     blocking(|| -> Result<Value> {
         let (snap, idx, st) = prepare(db, dir, ddoc_id, &args.update)?;
         let vi = idx.def.view_index(view).ok_or_else(|| CouchError::not_found("missing_named_view"))?;
+        check_partition(&idx.def, args)?;
         Ok(view_response(query_view(&snap, &st, &idx.def, vi, args)?, args))
     })
+}
+
+/// Partitioned views are queried within a partition, global ones not.
+fn check_partition(def: &IndexDef, args: &QueryArgs) -> Result<()> {
+    let err = |m: &str| Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", m));
+    match (def.partitioned, args.partition.is_some()) {
+        (true, false) => err("`partition` parameter is mandatory for queries to this view."),
+        (false, true) => err("`partition` parameter is not supported in this design doc"),
+        _ => Ok(()),
+    }
+}
+
+/// Above every key a view can emit, to end a partition's range.
+pub fn key_max() -> Value {
+    json!({"\u{10ffff}\u{10ffff}": null})
+}
+
+/// Translate a query within a partition to the [partition, key] keys the
+/// index stores: bound the range to the partition and wrap keys.
+fn partition_args(args: &QueryArgs, p: &str) -> QueryArgs {
+    let mut a = args.clone();
+    let wrap = |k: &Value| json!([p, k]);
+    let (lo, hi) = (json!([p]), json!([p, key_max()]));
+    a.keys = args.keys.as_ref().map(|ks| ks.iter().map(wrap).collect());
+    let (first, last) = if args.descending { (hi.clone(), lo.clone()) } else { (lo, hi) };
+    a.start_key = Some(args.start_key.as_ref().map(wrap).unwrap_or(first));
+    a.end_key = Some(args.end_key.as_ref().map(wrap).unwrap_or(last));
+    if args.end_key.is_none() {
+        a.inclusive_end = true;
+    }
+    a
 }
 
 pub async fn http_view(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Result<Response> {
@@ -1344,6 +1423,7 @@ pub async fn http_view_queries(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &st
         for q in &queries {
             let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
             let args = QueryArgs::from_obj(obj, base.clone())?;
+            check_partition(&idx.def, &args)?;
             results.push(view_response(query_view(&snap, &st, &idx.def, vi, &args)?, &args));
         }
         Ok(json!({"results": results}))
@@ -1396,7 +1476,7 @@ pub fn http_view_cleanup(req: &Req, db: &Arc<Db>) -> Result<Response> {
     })?;
     for id in ddocs {
         if let Ok(d) = crate::changes::load_ddoc(&snap, &id)
-            && let Ok(def) = IndexDef::from_ddoc(&d) {
+            && let Ok(def) = IndexDef::from_ddoc(&d, snap.partitioned()) {
                 live.insert(def.sig);
             }
     }

@@ -889,6 +889,94 @@ def rewrites():
 
 
 @test
+def partitioned_databases():
+    db = "p" + uuid.uuid4().hex[:12]
+    illegal = lambda reason: {"error": "illegal_docid", "reason": reason}
+    eq(req("PUT", f"/{db}?partitioned=maybe")[:2], (400, {"error": "bad_request", "reason": "Invalid `partitioned` parameter"}))
+    eq(req("PUT", f"/{db}?partitioned=true")[0], 201)
+    try:
+        eq(req("GET", f"/{db}")[1]["props"], {"partitioned": True})
+        eq(req("PUT", f"/{db}/nopart", {"a": 1})[:2], (400, illegal("Doc id must be of form partition:id")))
+        eq(req("PUT", f"/{db}/:x", {"a": 1})[:2], (400, {"error": "illegal_partition", "reason": "Partition must not be empty"}))
+        eq(req("PUT", f"/{db}/_p:x", {"a": 1})[:2], (400, illegal("Only reserved document ids may start with underscore.")))
+        eq(req("POST", f"/{db}", {"n": 5})[:2], (400, illegal("Doc id must be of form partition:id")))
+        # One bad id rejects the whole batch.
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": "p1:z"}, {"_id": "bad"}]})[:2],
+           (400, illegal("Doc id must be of form partition:id")))
+        eq(req("GET", f"/{db}/p1:z")[0], 404)
+        s, b, _ = req("POST", f"/{db}/_bulk_docs", {"docs": [
+            {"_id": "p1:a", "n": 1, "t": "x"}, {"_id": "p1:b", "n": 2, "t": "y"}, {"_id": "p2:a", "n": 3, "t": "x"}]})
+        eq(s, 201)
+        eq(req("PUT", f"/{db}/_local/x", {"a": 1})[0], 201)
+
+        s, info, _ = req("GET", f"/{db}/_partition/p1")
+        eq({k: info[k] for k in ("db_name", "partition", "doc_count", "doc_del_count")},
+           {"db_name": db, "partition": "p1", "doc_count": 2, "doc_del_count": 0})
+        assert info["sizes"]["active"] > 0 and info["sizes"]["external"] > 0, info
+        eq(req("GET", f"/{db}/_partition/zz")[1]["doc_count"], 0)
+        eq(req("GET", f"/{db}/_partition/_bad")[:2],
+           (400, {"error": "illegal_partition", "reason": "Partition must not start with an underscore"}))
+        # total_rows and offset count the whole database, as in CouchDB.
+        s, b, _ = req("GET", f"/{db}/_partition/p1/_all_docs")
+        eq((b["total_rows"], b["offset"], [r["id"] for r in b["rows"]]), (3, 0, ["p1:a", "p1:b"]))
+        eq(req("GET", f"/{db}/_partition/p2/_all_docs")[1]["offset"], 2)
+        eq([r["id"] for r in req("GET", f"/{db}/_partition/p2/_all_docs?include_docs=true")[1]["rows"]], ["p2:a"])
+        # keys= looks docs up by id, in any partition; key= stays inside it.
+        rows = req("POST", f"/{db}/_partition/p1/_all_docs", {"keys": ["p1:b", "p2:a", "p3:z"]})[1]["rows"]
+        eq(([r.get("id") for r in rows], rows[2]), (["p1:b", "p2:a", None], {"key": "p3:z", "error": "not_found"}))
+        eq(req("GET", f"/{db}/_partition/p1/_all_docs?key=%22p2:a%22")[1]["rows"], [])
+        # Start and end keys outside the partition are clamped to it.
+        for q, want in [("startkey=%22p2:a%22", (2, [])), ("endkey=%22p2:z%22", (0, ["p1:a", "p1:b"])),
+                        ("startkey=%22p0%22", (0, ["p1:a", "p1:b"])),
+                        ("startkey=%22p1:b%22&descending=true", (1, ["p1:b", "p1:a"])),
+                        ("endkey=%22a%22&descending=true", (1, ["p1:b", "p1:a"]))]:
+            b = req("GET", f"/{db}/_partition/p1/_all_docs?{q}")[1]
+            eq((b["offset"], [r["id"] for r in b["rows"]]), want)
+        eq(req("GET", f"/{db}/_partition/p1/p1:a")[0], 404)
+
+        # Views: partitioned by default, global with options.partitioned false.
+        eq(req("PUT", f"/{db}/_design/pv", {"views": {"v": {"map": "function(d){ emit(d.n, d.t); }", "reduce": "_count"}}})[0], 201)
+        eq(req("PUT", f"/{db}/_design/gv", {"options": {"partitioned": False},
+                                            "views": {"v": {"map": "function(d){ emit(d.n, d.t); }"}}})[0], 201)
+        s, b, _ = req("GET", f"/{db}/_partition/p1/_design/pv/_view/v?reduce=false")
+        eq(b, {"total_rows": 3, "offset": 0, "rows": [{"id": "p1:a", "key": 1, "value": "x"}, {"id": "p1:b", "key": 2, "value": "y"}]})
+        eq(req("GET", f"/{db}/_partition/p1/_design/pv/_view/v?reduce=false&startkey=2")[1]["offset"], 1)
+        eq(req("GET", f"/{db}/_partition/p2/_design/pv/_view/v?reduce=false")[1]["offset"], 2)
+        eq(req("GET", f"/{db}/_partition/p2/_design/pv/_view/v")[1]["rows"], [{"key": None, "value": 1}])
+        eq(req("GET", f"/{db}/_partition/p1/_design/pv/_view/v?group=true")[1]["rows"],
+           [{"key": 1, "value": 1}, {"key": 2, "value": 1}])
+        eq(req("GET", f"/{db}/_partition/p1/_design/pv/_view/v?reduce=false&include_docs=true&limit=1")[1]["rows"][0]["doc"]["t"], "x")
+        eq(req("GET", f"/{db}/_design/pv/_view/v?reduce=false")[:2],
+           (400, {"error": "query_parse_error", "reason": "`partition` parameter is mandatory for queries to this view."}))
+        eq(req("GET", f"/{db}/_design/gv/_view/v")[1]["total_rows"], 3)
+        eq(req("GET", f"/{db}/_partition/p1/_design/gv/_view/v")[:2],
+           (400, {"error": "query_parse_error", "reason": "`partition` parameter is not supported in this design doc"}))
+
+        # Mango: indexes are partitioned by default.
+        eq(req("POST", f"/{db}/_index", {"index": {"fields": ["n"]}, "name": "pn"})[1]["result"], "created")
+        eq(req("POST", f"/{db}/_index", {"index": {"fields": ["t"]}, "name": "gt", "partitioned": False})[1]["result"], "created")
+        idx = {i["name"]: i for i in req("GET", f"/{db}/_index")[1]["indexes"]}
+        eq((idx["pn"]["partitioned"], idx["gt"]["partitioned"], "partitioned" in idx["_all_docs"]), (True, False, False))
+        s, b, _ = req("POST", f"/{db}/_partition/p1/_find", {"selector": {"n": {"$gt": 0}}})
+        eq(([d["_id"] for d in b["docs"]], "warning" in b), (["p1:a", "p1:b"], False))
+        s, b, _ = req("POST", f"/{db}/_partition/p1/_explain", {"selector": {"n": {"$gt": 0}}})
+        eq((b["index"]["name"], b["partitioned"], b["opts"]["partition"]), ("pn", True, "p1"))
+        s, b, _ = req("POST", f"/{db}/_find", {"selector": {"n": {"$gt": 0}}, "use_index": "pn"})
+        eq(len(b["docs"]), 3)
+        assert b["warning"].startswith("_design/pn was not used because it does not contain a valid index"), b["warning"]
+        eq([d["_id"] for d in req("POST", f"/{db}/_partition/p2/_find", {"selector": {"t": "x"}})[1]["docs"]], ["p2:a"])
+
+        eq(req("GET", "/_users/_partition/x")[:2], (400, {"error": "bad_request", "reason": "database is not partitioned"}))
+        np = db + "_np"
+        eq(req("PUT", f"/{np}")[0], 201)
+        eq(req("PUT", f"/{np}/_design/x", {"options": {"partitioned": True}, "views": {"v": {"map": "function(d){emit(1)}"}}})[:2],
+           (400, {"error": "invalid_design_doc", "reason": "partitioned option cannot be true in a non-partitioned database."}))
+        req("DELETE", f"/{np}")
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
 def show_content_negotiation():
     db = new_db()
     req("PUT", f"/{db}/_design/fn", {

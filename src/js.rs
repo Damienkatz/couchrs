@@ -580,7 +580,7 @@ fn vdu_funs(db: &Db, snap: &Snapshot) -> Result<Option<JsFuns>> {
     Ok(funs)
 }
 
-fn doc_to_vdu_json(d: &doc::Doc) -> Value {
+pub fn doc_to_vdu_json(d: &doc::Doc) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("_id".into(), json!(d.id));
     if let Some(r) = d.rev() {

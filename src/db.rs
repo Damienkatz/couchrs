@@ -44,6 +44,8 @@ const CF_ATT: &str = "att";
 const CF_META: &str = "meta";
 const CFS: &[(&str, bool)] = &[(CF_ID, false), (CF_SEQ, false), (CF_LOCAL, false), (CF_BODY, false), (CF_ATT, true), (CF_META, false)];
 const HEADER_KEY: &[u8] = b"header";
+/// The database's properties ({"partitioned": true}), fixed at creation.
+const PROPS_KEY: &[u8] = b"props";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FdiVal {
@@ -98,6 +100,7 @@ fn add_signed(base: u64, delta: i128) -> u64 {
 pub struct Snapshot {
     pub name: String,
     pub header: Header,
+    pub props: Arc<Value>,
     view: Arc<View>,
 }
 
@@ -123,6 +126,37 @@ fn fdi_from(id: &str, v: FdiVal) -> FullDocInfo {
 }
 
 impl Snapshot {
+    pub fn partitioned(&self) -> bool {
+        self.props.get("partitioned").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    /// Document counts and sizes of one partition (/db/_partition/P).
+    pub fn partition_info(&self, partition: &str) -> Result<Value> {
+        let range = Range { start: Some(format!("{partition}:")), end: Some(format!("{partition};")), inclusive_end: false };
+        let (mut docs, mut deleted, mut active, mut external) = (0u64, 0u64, 0u64, 0u64);
+        self.fold_docs(Dir::Fwd, &range, |fdi| {
+            if fdi.deleted {
+                deleted += 1;
+            } else {
+                docs += 1;
+            }
+            for l in keytree::leafs(&fdi.tree) {
+                if let RevVal::Avail(v) = &l.val {
+                    active += v.stored;
+                    external += v.size;
+                }
+            }
+            Ok(true)
+        })?;
+        Ok(json!({
+            "db_name": self.name,
+            "sizes": {"active": active, "external": external},
+            "partition": partition,
+            "doc_count": docs,
+            "doc_del_count": deleted,
+        }))
+    }
+
     pub fn seq_str(&self, seq: u64) -> String {
         fmt_seq(seq, &self.header.uuid)
     }
@@ -193,7 +227,7 @@ impl Snapshot {
             "purge_seq": self.seq_str(self.header.purge_seq),
             "update_seq": self.seq_str(self.header.update_seq),
             "sizes": {"file": store.disk_bytes(), "external": self.header.external, "active": self.header.stored_live + meta},
-            "props": {},
+            "props": *self.props,
             "doc_del_count": self.header.del_count,
             "doc_count": self.header.doc_count,
             "disk_format_version": 8,
@@ -494,16 +528,18 @@ fn next_id_after(view: &View, cf: &str) -> Result<u64> {
 impl Db {
     /// Open an existing database, or create one when `create` is set.
     pub fn open(path: &FsPath, name: &str, create: bool) -> Result<Arc<Db>> {
-        Self::open_with(path, name, create.then_some(b"{}".as_slice()))
+        Self::open_with(path, name, create.then(|| (b"{}".to_vec(), json!({}))))
     }
 
-    /// Create a database whose _security object starts as `security`.
-    pub fn create(path: &FsPath, name: &str, security: &Value) -> Result<Arc<Db>> {
-        Self::open_with(path, name, Some(&serde_json::to_vec(security)?))
+    /// Create a database whose _security object starts as `security`, with
+    /// properties `props` ({"partitioned": true} or {}).
+    pub fn create(path: &FsPath, name: &str, security: &Value, props: &Value) -> Result<Arc<Db>> {
+        Self::open_with(path, name, Some((serde_json::to_vec(security)?, props.clone())))
     }
 
-    fn open_with(path: &FsPath, name: &str, new_security: Option<&[u8]>) -> Result<Arc<Db>> {
-        let create = new_security.is_some();
+    fn open_with(path: &FsPath, name: &str, new: Option<(Vec<u8>, Value)>) -> Result<Arc<Db>> {
+        let create = new.is_some();
+        let new_security = new.as_ref().map(|(s, _)| s.as_slice());
         let mut open = OPEN_GENS.lock();
         let generation = if create {
             if exists(path) {
@@ -553,11 +589,24 @@ impl Db {
                 h
             }
         };
+        let props: Value = match store.db.get_cf(&store.cf(CF_META), PROPS_KEY).map_err(rerr)? {
+            Some(b) => serde_json::from_slice(&b).unwrap_or_else(|_| json!({})),
+            None => {
+                let p = new.as_ref().map(|(_, p)| p.clone()).unwrap_or_else(|| json!({}));
+                if create {
+                    let mut wo = WriteOptions::default();
+                    wo.set_sync(true);
+                    store.db.put_cf_opt(&store.cf(CF_META), PROPS_KEY, serde_json::to_vec(&p)?, &wo).map_err(rerr)?;
+                }
+                p
+            }
+        };
+        let props = Arc::new(props);
         let view = View::new(store.clone());
         // Chunk ids are allocated before their doc commits; reusing one an
         // uncommitted upload took is harmless (it was never referenced).
         let next_ptr = next_id_after(&view, CF_BODY)?.max(next_id_after(&view, CF_ATT)?);
-        let snap = Snapshot { name: name.to_string(), header, view };
+        let snap = Snapshot { name: name.to_string(), header, props: props.clone(), view };
         let (tx, rx) = mpsc::channel();
         let (seq_tx, _) = watch::channel(snap.header.update_seq);
         let db = Arc::new(Db {
@@ -806,7 +855,8 @@ fn commit(db: &Db, mut batch: WriteBatch, header: Header) -> Result<()> {
     wo.set_sync(true);
     db.store.db.write_opt(batch, &wo).map_err(rerr)?;
     let seq = header.update_seq;
-    *db.state.write() = Snapshot { name: db.name.clone(), header, view: View::new(db.store.clone()) };
+    let props = db.state.read().props.clone();
+    *db.state.write() = Snapshot { name: db.name.clone(), header, props, view: View::new(db.store.clone()) };
     db.seq_tx.send_replace(seq);
     Ok(())
 }

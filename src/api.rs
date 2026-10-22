@@ -78,6 +78,10 @@ pub async fn db_request(req: Req) -> Result<Response> {
             let (d, k, n) = (format!("_design/{ddoc}"), kind.to_string(), iname.to_string());
             crate::mango::http_delete_index(&req, &db, &d, &k, &n).await
         }
+        ["_partition", p, rest @ ..] => {
+            let (p, rest): (String, Vec<String>) = (p.to_string(), rest.iter().map(|s| s.to_string()).collect());
+            partition_request(&req, &db, &p, &rest).await
+        }
         ["_design", ddoc, rest @ ..] => {
             let id = format!("_design/{ddoc}");
             match rest {
@@ -95,9 +99,17 @@ pub async fn db_request(req: Req) -> Result<Response> {
             let id = format!("_local/{lid}");
             doc_request(&req, &db, &id).await
         }
-        [s, ..] if s.starts_with('_') => Err(CouchError::bad_request(
-            "Only reserved document ids may start with underscore.",
-        )),
+        ["_local"] => Err(CouchError::bad_request("Invalid _local document id.")),
+        // Not a reserved id: there is no such document to read, and none
+        // may be written.
+        [s, ..] if s.starts_with('_') => match req.method {
+            Method::GET | Method::HEAD => Err(CouchError::not_found("missing")),
+            _ => Err(CouchError::new(
+                StatusCode::BAD_REQUEST,
+                "illegal_docid",
+                "Only reserved document ids may start with underscore.",
+            )),
+        },
         [docid] => {
             let id = docid.to_string();
             doc_request(&req, &db, &id).await
@@ -120,7 +132,18 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
             if req.q("q").map(|q| q != "1").unwrap_or(false) || req.q("n").map(|q| q != "1").unwrap_or(false) {
                 // Single node: accept and ignore sharding parameters.
             }
-            let db = req.server.create_db(name)?;
+            let props = match req.q("partitioned") {
+                None | Some("false") => json!({}),
+                Some("true") => {
+                    let sys = name.starts_with('_') || name.ends_with("/_users") || name.ends_with("/_replicator");
+                    if sys {
+                        return Err(CouchError::bad_request("Cannot partition a system database"));
+                    }
+                    json!({"partitioned": true})
+                }
+                Some(_) => return Err(CouchError::bad_request("Invalid `partitioned` parameter")),
+            };
+            let db = req.server.create_db_with(name, &props)?;
             if crate::auth::is_users_db(&req.server.config, name) {
                 crate::server::ensure_auth_ddoc(&db).await?;
             }
@@ -172,8 +195,18 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
         }
         if d.is_design() {
             *e = crate::auth::check_db_admin(user, &sec).err();
+            // Design documents must describe valid indexes (couch_mrview
+            // validate), including the partitioned option.
+            if e.is_none() && !d.deleted && !d.id.starts_with("_design/_") {
+                *e = crate::views::IndexDef::from_ddoc(&crate::js::doc_to_vdu_json(d), snap.partitioned()).err();
+            }
         } else if users_db {
             *e = crate::auth::before_users_doc_update(config, user, &sec, &mut d.body, &d.id).err();
+        }
+    }
+    if snap.partitioned() {
+        for d in &docs {
+            crate::doc::validate_partitioned_docid(&d.id)?;
         }
     }
     let ctx = user.json(&db.name);
@@ -791,6 +824,8 @@ pub struct QueryArgs {
     pub attachments: bool,
     pub att_encoding_info: bool,
     pub sorted: bool,
+    /// Set for queries within a partition (/db/_partition/P/...).
+    pub partition: Option<String>,
 }
 
 impl Default for QueryArgs {
@@ -815,6 +850,7 @@ impl Default for QueryArgs {
             attachments: false,
             att_encoding_info: false,
             sorted: true,
+            partition: None,
         }
     }
 }
@@ -960,6 +996,97 @@ async fn multi_query(req: &Req, db: &Arc<Db>, kind: AllDocsKind) -> Result<Respo
 
 fn key_str(v: &Value) -> Option<String> {
     v.as_str().map(String::from)
+}
+
+/// /db/_partition/P/...: the partition's info, _all_docs, views, _find
+/// and _explain.
+async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[String]) -> Result<Response> {
+    if !db.snapshot().partitioned() {
+        return Err(CouchError::bad_request("database is not partitioned"));
+    }
+    crate::doc::validate_partition(partition)?;
+    let r: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
+    match r.as_slice() {
+        [] => match req.method {
+            Method::GET | Method::HEAD => ok_json(db.snapshot().partition_info(partition)?),
+            _ => not_allowed("GET,HEAD"),
+        },
+        ["_all_docs"] => {
+            let mut args = QueryArgs::from_req(req)?;
+            match req.method {
+                Method::GET | Method::HEAD => {}
+                Method::POST => args = QueryArgs::from_obj(&req.json_obj_body()?, args)?,
+                _ => return not_allowed("GET,HEAD,POST"),
+            }
+            let snap = db.snapshot();
+            ok_json(blocking(|| run_partition_all_docs(&snap, &args, partition))?)
+        }
+        ["_design", ddoc, "_view", view] => {
+            let mut args = QueryArgs::from_req(req)?;
+            match req.method {
+                Method::GET | Method::HEAD => {}
+                Method::POST => args = QueryArgs::from_obj(&req.json_obj_body()?, args)?,
+                _ => return not_allowed("GET,POST,HEAD"),
+            }
+            args.partition = Some(partition.to_string());
+            ok_json(crate::views::view_json(req, db, &format!("_design/{ddoc}"), view, &args)?)
+        }
+        ["_design", ddoc, "_view", view, "queries"] => {
+            if req.method != Method::POST {
+                return not_allowed("POST");
+            }
+            let body = req.json_obj_body()?;
+            let queries = body
+                .get("queries")
+                .and_then(|q| q.as_array())
+                .cloned()
+                .ok_or_else(|| CouchError::bad_request("`queries` member must be an array"))?;
+            let base = QueryArgs::from_req(req)?;
+            let mut results = Vec::new();
+            for q in &queries {
+                let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
+                let mut args = QueryArgs::from_obj(obj, base.clone())?;
+                args.partition = Some(partition.to_string());
+                results.push(crate::views::view_json(req, db, &format!("_design/{ddoc}"), view, &args)?);
+            }
+            ok_json(json!({"results": results}))
+        }
+        ["_find"] => crate::mango::http_find_in(req, db, Some(partition)).await,
+        ["_explain"] => crate::mango::http_explain_in(req, db, Some(partition)).await,
+        _ => Err(CouchError::not_found("missing")),
+    }
+}
+
+/// _all_docs within one partition: ids from "P:" up to "P;". Like
+/// CouchDB, total_rows and offset still count the whole database.
+pub fn run_partition_all_docs(snap: &Snapshot, args: &QueryArgs, partition: &str) -> Result<Value> {
+    let (lo, hi) = (json!(format!("{partition}:")), json!(format!("{partition};")));
+    // Keys are clamped into the partition as CouchDB does, comparing by
+    // Erlang term order: ids as raw bytes, any non-string below them all.
+    let cmp = |x: &Value, y: &Value| match (x.as_str(), y.as_str()) {
+        (Some(x), Some(y)) => x.cmp(y),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    };
+    let mut a = args.clone();
+    if a.keys.is_none() {
+        let (first, last) = if a.descending { (&hi, &lo) } else { (&lo, &hi) };
+        let past = |k: &Value, bound: &Value| if a.descending { cmp(k, bound).is_gt() } else { cmp(k, bound).is_lt() };
+        a.start_key = Some(match a.start_key.take() {
+            Some(k) if !past(&k, first) => k,
+            _ => first.clone(),
+        });
+        match a.end_key.take() {
+            Some(k) if !past(last, &k) => a.end_key = Some(k),
+            _ => {
+                a.end_key = Some(last.clone());
+                a.inclusive_end = a.descending;
+            }
+        }
+    }
+    // As in CouchDB, keys= lookups aren't limited to the partition.
+    run_all_docs(snap, &a, AllDocsKind::All)
 }
 
 pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Result<Value> {
