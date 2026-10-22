@@ -163,8 +163,17 @@ code { font-family: var(--mono); font-size: 0.92em; }
   </section>
 
   <section>
+    <h2>Compaction</h2>
+    <p id="compact-text">Compacting the loaded database: copying the live documents and attachments into a new file and rebuilding its indexes, then swapping it in.</p>
+    <div class="figrow"><div class="figure" id="fig-compact-time"></div><div class="figure" id="fig-compact-rate"></div></div>
+    <div class="figrow"><div class="figure" id="fig-compact-ram"></div><div class="figure" id="fig-compact-disk"></div></div>
+    <div class="figure" id="fig-compact-sizes"></div>
+  </section>
+
+  <section>
     <h2>Disk</h2>
     <div class="figrow"><div class="figure" id="fig-disk-db"></div><div class="figure" id="fig-disk-idx"></div></div>
+    <div class="figure" id="fig-disk-ratio"></div>
   </section>
 
   <section>
@@ -386,7 +395,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
   const ds = srv.dataset_bytes;
   document.getElementById('intro').textContent =
     `Both servers ran on one machine, one after the other, against byte-identical data: ${bytes(ds)} in ${compact(srv.dataset_docs)} documents ` +
-    `sized from 100 bytes to 1 GB. Each was loaded, then measured for writes, reads, deletes, view indexing and queries, and replication.`;
+    `sized from 100 bytes to 1 GB, filled with generated English-like text. Each was loaded, then measured for writes, reads, deletes, view indexing and queries, and replication.`;
   const facts = document.getElementById('facts');
   const fact = (k, v) => { const s = h('span'); s.append(document.createTextNode(k + ' '), h('b', null, v)); facts.appendChild(s); };
   fact('Dataset', bytes(ds)); fact('Documents', compact(srv.dataset_docs));
@@ -416,6 +425,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
   addR('View key lookup (q/s)', g(E, 'view.queries.key_lookup_limit20.ops_per_sec'), g(S, 'view.queries.key_lookup_limit20.ops_per_sec'), false, v => compact(v) + '/s');
   addR('View reduce (q/s)', g(E, 'view.queries.group_level1_reduce.ops_per_sec'), g(S, 'view.queries.group_level1_reduce.ops_per_sec'), false, v => compact(v) + '/s');
   addR('Replication (time)', g(E, 'replicate.secs'), g(S, 'replicate.secs'), true, dur);
+  addR('Compaction (time)', g(E, 'compact.secs'), g(S, 'compact.secs'), true, dur);
   ratios('fig-summary', sumRows);
 
   const loadTxt = (n, d) => d && d.load ? `${n}: ${bytes(d.load.bytes)} in ${dur(d.load.secs)}` : null;
@@ -478,13 +488,43 @@ code { font-family: var(--mono); font-size: 0.92em; }
   bars('fig-view-q', Q.map(([k, l]) => ({ label: l, erlang: g(E, `view.queries.${k}.ops_per_sec`), rust: g(S, `view.queries.${k}.ops_per_sec`) })),
     { title: 'View queries', sub: 'queries/s · higher is better', unit: 'q/s' });
 
-  bars('fig-repl-time', [{ label: 'Full copy', erlang: g(E, 'replicate.secs'), rust: g(S, 'replicate.secs') }],
-    { title: 'Replication time', sub: 'minutes · lower is better', unit: 'min', better: 'lower', fmt: v => compact(v / 60) });
+  const mins = v => v == null ? null : v / 60;
+  bars('fig-repl-time', [{ label: 'Full copy', erlang: mins(g(E, 'replicate.secs')), rust: mins(g(S, 'replicate.secs')) }],
+    { title: 'Replication time', sub: 'minutes · lower is better', unit: 'min', better: 'lower' });
   bars('fig-repl-mb', [{ label: 'Throughput', erlang: g(E, 'replicate.mb_per_sec'), rust: g(S, 'replicate.mb_per_sec') }],
     { title: 'Replication throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
   bars('fig-repl-docs', [{ label: 'Documents', erlang: g(E, 'replicate.docs_per_sec'), rust: g(S, 'replicate.docs_per_sec') }],
     { title: 'Replication rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
 
+  bars('fig-compact-time', [{ label: 'Compaction', erlang: mins(g(E, 'compact.secs')), rust: mins(g(S, 'compact.secs')) }],
+    { title: 'Compaction time', sub: 'minutes · lower is better', unit: 'min', better: 'lower' });
+  bars('fig-compact-rate', [{ label: 'Live data', erlang: g(E, 'compact.live_mb_per_sec'), rust: g(S, 'compact.live_mb_per_sec') }],
+    { title: 'Compaction throughput', sub: 'MB/s of live data copied · higher is better', unit: 'MB/s' });
+  bars('fig-compact-ram', [{ label: 'Peak RAM', erlang: g(E, 'compact.resources.rss_peak_bytes'), rust: g(S, 'compact.resources.rss_peak_bytes') }],
+    { title: 'Peak memory during compaction', sub: 'server resident memory · lower is better', better: 'lower', fmt: bytes });
+  bars('fig-compact-disk', [{ label: 'Peak extra disk', erlang: g(E, 'compact.resources.disk_peak_extra_bytes'), rust: g(S, 'compact.resources.disk_peak_extra_bytes') }],
+    { title: 'Peak extra disk during compaction', sub: 'growth of the data directory over its starting size · lower is better', better: 'lower', fmt: bytes });
+  RENDERERS.push(() => {
+    const host = document.getElementById('fig-compact-sizes');
+    host.replaceChildren();
+    const head = h('div', 'fighead'); const t = h('div');
+    t.append(h('h3', null, 'Sizes and resources'), h('div', 'sub', 'live data is what compaction copies; peak RAM is the server process; peak extra disk is the most the data directory grew during compaction'));
+    head.append(t); host.appendChild(head);
+    const wrap = h('div', 'tablewrap'); const tb = h('table');
+    const tr = h('tr'); ['Server', 'File before', 'Live before', 'File after', 'Reclaimed', 'Time', 'Peak RAM', 'Peak extra disk'].forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+    for (const [src, name] of [[E, 'CouchDB (Erlang)'], [S, 'couchdb-rs']]) {
+      const m = g(src, 'compact'); if (!m) continue;
+      const row = h('tr');
+      [name, bytes(m.file_bytes_before), bytes(m.active_bytes_before), bytes(m.file_bytes_after), bytes(m.reclaimed_bytes), dur(m.secs), bytes(g(m, 'resources.rss_peak_bytes')), bytes(g(m, 'resources.disk_peak_extra_bytes'))]
+        .forEach(c => row.appendChild(h('td', null, c)));
+      tb.appendChild(row);
+    }
+    wrap.appendChild(tb); host.appendChild(wrap);
+  });
+
+  const ds2 = (E.server || S.server || {}).dataset_bytes;
+  bars('fig-disk-ratio', [{ label: 'Compression', erlang: ds2 && g(E, 'load.file_bytes_after') ? ds2 / g(E, 'load.file_bytes_after') : null, rust: ds2 && g(S, 'load.file_bytes_after') ? ds2 / g(S, 'load.file_bytes_after') : null }],
+    { title: 'Compression', sub: 'dataset size ÷ database file size after the load · higher is better', unit: '×', fmt: v => v.toFixed(2) + '×' });
   bars('fig-disk-db', [{ label: 'Database', erlang: g(E, 'load.file_bytes_after'), rust: g(S, 'load.file_bytes_after') }],
     { title: 'Database file', sub: 'after the load, no compaction · lower is better', better: 'lower', fmt: bytes });
   bars('fig-disk-idx', [{ label: 'View index', erlang: g(E, 'view.index_file_bytes'), rust: g(S, 'view.index_file_bytes') }],

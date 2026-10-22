@@ -457,7 +457,7 @@ fn stream_pieces(snap: Snapshot, pieces: Vec<Piece>) -> Body {
                         let r = tokio::task::block_in_place(|| -> std::io::Result<Vec<u8>> {
                             let mut buf = Vec::new();
                             for pos in group {
-                                buf.extend_from_slice(&snap.file.read_raw(*pos)?);
+                                buf.extend_from_slice(&snap.read_chunk(*pos)?);
                             }
                             Ok(buf)
                         });
@@ -694,6 +694,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                     md5: Md5::digest(&data).to_vec(),
                     encoding: None,
                     encoded_length: data.len() as u64,
+                    stored_length: 0,
                     data: AttData::Bytes(data),
                 });
             } else {

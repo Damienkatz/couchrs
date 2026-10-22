@@ -13,6 +13,7 @@ pub const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose:
 
 /// Value stored on each revision tree node.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(from = "RevValWire", into = "RevValWire")]
 pub enum RevVal {
     Missing,
     Avail(LeafVal),
@@ -23,8 +24,47 @@ pub struct LeafVal {
     pub deleted: bool,
     pub ptr: Pos,
     pub seq: u64,
-    /// Body size plus attachment sizes, for active/external accounting.
+    /// Inflated body plus attachment bytes (sizes.external).
     pub size: u64,
+    /// The same bytes as stored on disk, after LZ4 (sizes.active).
+    pub stored: u64,
+}
+
+/// On-disk form of RevVal. New values are written as `AvailV2`; `Avail`
+/// is the original layout without a stored size, still read from older
+/// files (where nothing was compressed beyond the body, so stored = size).
+#[derive(Serialize, Deserialize, Clone)]
+enum RevValWire {
+    Missing,
+    Avail(LeafValV1),
+    AvailV2(LeafVal),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct LeafValV1 {
+    deleted: bool,
+    ptr: Pos,
+    seq: u64,
+    size: u64,
+}
+
+impl From<RevValWire> for RevVal {
+    fn from(w: RevValWire) -> RevVal {
+        match w {
+            RevValWire::Missing => RevVal::Missing,
+            RevValWire::Avail(l) => RevVal::Avail(LeafVal { deleted: l.deleted, ptr: l.ptr, seq: l.seq, size: l.size, stored: l.size }),
+            RevValWire::AvailV2(l) => RevVal::Avail(l),
+        }
+    }
+}
+
+impl From<RevVal> for RevValWire {
+    fn from(v: RevVal) -> RevValWire {
+        match v {
+            RevVal::Missing => RevValWire::Missing,
+            RevVal::Avail(l) => RevValWire::AvailV2(l),
+        }
+    }
 }
 
 impl RevValue for RevVal {
@@ -128,6 +168,8 @@ pub struct AttInfo {
     pub encoding: Option<String>,
     pub encoded_length: u64,
     pub chunks: Vec<Pos>,
+    /// Bytes the chunks occupy on disk (after LZ4).
+    pub stored_length: u64,
 }
 
 impl AttInfo {
@@ -141,6 +183,56 @@ impl AttInfo {
 pub struct DiskBody {
     pub json: Vec<u8>,
     pub atts: Vec<AttInfo>,
+}
+
+/// Body layout written before attachment stored lengths existed.
+#[derive(Serialize, Deserialize)]
+pub struct DiskBodyV1 {
+    pub json: Vec<u8>,
+    pub atts: Vec<AttInfoV1>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AttInfoV1 {
+    pub name: String,
+    pub content_type: String,
+    pub revpos: u64,
+    pub length: u64,
+    pub md5: Vec<u8>,
+    pub encoding: Option<String>,
+    pub encoded_length: u64,
+    pub chunks: Vec<Pos>,
+}
+
+impl From<DiskBodyV1> for DiskBody {
+    fn from(b: DiskBodyV1) -> DiskBody {
+        DiskBody {
+            json: b.json,
+            atts: b
+                .atts
+                .into_iter()
+                .map(|a| AttInfo {
+                    // Format-1 chunks are raw, so stored equals encoded.
+                    stored_length: a.encoded_length,
+                    name: a.name,
+                    content_type: a.content_type,
+                    revpos: a.revpos,
+                    length: a.length,
+                    md5: a.md5,
+                    encoding: a.encoding,
+                    encoded_length: a.encoded_length,
+                    chunks: a.chunks,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl FullDocInfo {
+    /// Stored (deflated) bytes of this doc's leaf revisions.
+    pub fn leaf_stored(&self) -> u64 {
+        keytree::leafs(&self.tree).iter().filter_map(|l| l.val.leaf().map(|v| v.stored)).sum()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +257,8 @@ pub struct Att {
     pub md5: Vec<u8>,
     pub encoding: Option<String>,
     pub encoded_length: u64,
+    /// Stored (deflated) bytes once written; 0 until then.
+    pub stored_length: u64,
     pub data: AttData,
 }
 
@@ -178,6 +272,7 @@ impl Att {
             md5: i.md5.clone(),
             encoding: i.encoding.clone(),
             encoded_length: i.encoded_length,
+            stored_length: i.stored_length,
             data: AttData::Stored(i.chunks.clone()),
         }
     }
@@ -325,6 +420,7 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
                 md5,
                 encoded_length: a.get("encoded_length").and_then(|l| l.as_u64()).unwrap_or(length),
                 encoding,
+                stored_length: 0,
                 data: AttData::Stub,
             });
         } else if a.get("follows").and_then(|s| s.as_bool()) == Some(true) {
@@ -337,6 +433,7 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
                 md5,
                 encoded_length: a.get("encoded_length").and_then(|l| l.as_u64()).unwrap_or(length),
                 encoding,
+                stored_length: 0,
                 data: AttData::Follows,
             });
         } else if let Some(d) = a.get("data") {
@@ -354,6 +451,7 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
                 md5: Md5::digest(&bytes).to_vec(),
                 encoding: None,
                 encoded_length: bytes.len() as u64,
+                stored_length: 0,
                 data: AttData::Bytes(bytes::Bytes::from(bytes)),
             });
         } else {

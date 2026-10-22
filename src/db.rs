@@ -23,7 +23,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 use tokio::sync::{oneshot, watch};
 
-const DISK_VERSION: u32 = 1;
+/// Format 2 stores doc bodies LZ4-compressed (when that helps) and tags
+/// every attachment chunk with its encoding. Format 1 chunks are raw bytes;
+/// such files stay format 1 until compaction rewrites them.
+const DISK_VERSION: u32 = 2;
+const TAGGED_CHUNKS_SINCE: u32 = 2;
 const ATT_CHUNK: usize = 64 * 1024;
 const SEQ_PLACEHOLDER: u64 = u64::MAX;
 
@@ -130,6 +134,25 @@ pub struct Header {
     pub props: Vec<u8>,
 }
 
+impl Header {
+    fn prop_u64(&self, key: &str) -> Option<u64> {
+        serde_json::from_slice::<Value>(&self.props).ok()?.get(key)?.as_u64()
+    }
+    fn set_prop_u64(&mut self, key: &str, v: u64) {
+        let mut m: Map<String, Value> = serde_json::from_slice(&self.props).unwrap_or_default();
+        m.insert(key.into(), json!(v));
+        self.props = serde_json::to_vec(&m).unwrap();
+    }
+}
+
+/// Header property holding the stored (deflated) bytes of all live leaf
+/// revisions: the body part of sizes.active.
+const STORED_LIVE: &str = "stored_live";
+
+fn add_signed(base: u64, delta: i128) -> u64 {
+    (base as i128 + delta).max(0) as u64
+}
+
 // --------------------------------------------------------------- snapshot
 
 #[derive(Clone)]
@@ -190,20 +213,45 @@ impl Snapshot {
     }
 
     pub fn read_body(&self, ptr: Pos) -> Result<DiskBody> {
-        Ok(self.file.read_term(ptr)?)
+        let raw = self.file.read_raw(ptr)?;
+        if crate::file::is_current_value(&raw) {
+            Ok(crate::file::decode_value(&raw)?)
+        } else {
+            Ok(crate::file::decode_term::<DiskBodyV1>(&raw)?.into())
+        }
+    }
+
+    /// Stored (deflated) bytes of every live leaf revision.
+    pub fn stored_live(&self) -> u64 {
+        self.header.prop_u64(STORED_LIVE).unwrap_or(0)
+    }
+
+    /// True if this file tags (and may LZ4-compress) attachment chunks.
+    pub fn tagged_chunks(&self) -> bool {
+        self.header.version >= TAGGED_CHUNKS_SINCE
+    }
+
+    /// Read one attachment chunk, inflated.
+    pub fn read_chunk(&self, pos: Pos) -> Result<Vec<u8>> {
+        let stored = self.file.read_raw(pos)?;
+        Ok(if self.tagged_chunks() { crate::file::decode_chunk(stored)? } else { stored })
     }
 
     pub fn read_att(&self, a: &AttInfo) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(a.encoded_length as usize);
         for p in &a.chunks {
-            out.extend_from_slice(&self.file.read_raw(*p)?);
+            out.extend_from_slice(&self.read_chunk(*p)?);
         }
         Ok(out)
     }
 
+    /// `sizes.external` counts inflated (uncompressed) body and attachment
+    /// bytes. `sizes.active`, which compaction is judged by, counts what is
+    /// live as stored on disk: deflated bodies and attachments plus index
+    /// nodes. `sizes.file` is the file's length.
     pub fn info(&self, compacting: bool) -> Value {
         let red = self.ids.full_reduce().unwrap_or_default();
-        let active = red.size + self.ids.size() + self.seqs.size() + self.locals.size();
+        let active = self.stored_live() + self.ids.size() + self.seqs.size() + self.locals.size();
         json!({
             "db_name": self.name,
             "purge_seq": self.seq_str(self.header.purge_seq),
@@ -443,7 +491,7 @@ impl Db {
                 h
             }
         };
-        let snap = Snapshot {
+        let mut snap = Snapshot {
             name: name.to_string(),
             ids: Btree::new(file.clone(), header.id_root.clone(), Arc::new(IdSpec)),
             seqs: Btree::new(file.clone(), header.seq_root.clone(), Arc::new(SeqSpec)),
@@ -451,6 +499,16 @@ impl Db {
             file,
             header,
         };
+        if snap.header.prop_u64(STORED_LIVE).is_none() {
+            // Older file: total the stored size of live leaves once; it is
+            // persisted with the next commit and maintained from then on.
+            let mut total = 0u64;
+            snap.fold_docs(Dir::Fwd, &Range::default(), |fdi| {
+                total += fdi.leaf_stored();
+                Ok(true)
+            })?;
+            snap.header.set_prop_u64(STORED_LIVE, total);
+        }
         let (tx, rx) = mpsc::channel();
         let (seq_tx, _) = watch::channel(snap.header.update_seq);
         let db = Arc::new(Db {
@@ -529,10 +587,12 @@ impl Db {
         if !doc.atts.iter().any(|a| matches!(a.data, AttData::Bytes(_))) {
             return Ok(());
         }
-        let file = self.snapshot().file;
+        let snap = self.snapshot();
+        let file = snap.file.clone();
         for a in doc.atts.iter_mut() {
             if let AttData::Bytes(bytes) = &a.data {
-                let chunks = write_att_chunks(&file, bytes)?;
+                let (chunks, stored) = write_att_chunks(&file, bytes, snap.tagged_chunks())?;
+                a.stored_length = stored;
                 if a.md5.is_empty() || a.encoding.is_none() {
                     a.md5 = Md5::digest(bytes).to_vec();
                 }
@@ -573,6 +633,7 @@ impl Db {
         let _ = std::fs::remove_file(&tmp);
         let file = Arc::new(CouchFile::open(&tmp, true)?);
         let mut header = snap.header.clone();
+        header.version = DISK_VERSION;
         header.id_root = None;
         header.seq_root = None;
         header.local_root = None;
@@ -596,8 +657,10 @@ impl Db {
             crate::extsort::budget_bytes(),
             id_cmp,
         );
+        let mut stored_total = 0u64;
         snap.fold_changes(0, Dir::Fwd, |fdi| {
             let copied = copy_fdi(&snap, &file, fdi)?;
+            stored_total += copied.leaf_stored();
             let approx = 64 + copied.id.len() + 48 * keytree::leafs(&copied.tree).len();
             ids.push(
                 (copied.id.clone(), FdiVal { update_seq: copied.update_seq, deleted: copied.deleted, tree: copied.tree.clone() }),
@@ -619,6 +682,7 @@ impl Db {
             Ok(true)
         })?;
         new.locals = locals.finish()?;
+        new.header.set_prop_u64(STORED_LIVE, stored_total);
         commit_header(&mut new)?;
         let (reply, rx) = oneshot::channel();
         self.send(Msg::CompactDone(Box::new(new), tmp, reply))?;
@@ -634,17 +698,22 @@ impl Db {
 
 /// Copy docs changed since the bulk copy into a compaction target,
 /// replacing the entries copied earlier.
-fn copy_docs(src: &Snapshot, dst: &mut Snapshot, fdis: Vec<FullDocInfo>) -> Result<()> {
+/// Returns the change in stored live bytes.
+fn copy_docs(src: &Snapshot, dst: &mut Snapshot, fdis: Vec<FullDocInfo>) -> Result<i128> {
+    let mut delta = 0i128;
     if fdis.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut id_acts = Vec::new();
     let mut seq_acts = Vec::new();
     for fdi in fdis {
         if let Some(old) = dst.ids.lookup(&fdi.id)? {
             seq_acts.push(Action::Remove(old.update_seq));
+            let old = FullDocInfo { id: fdi.id.clone(), update_seq: old.update_seq, deleted: old.deleted, tree: old.tree };
+            delta -= old.leaf_stored() as i128;
         }
         let new = copy_fdi(src, &dst.file, &fdi)?;
+        delta += new.leaf_stored() as i128;
         id_acts.push(Action::Insert(
             new.id.clone(),
             FdiVal {
@@ -657,7 +726,7 @@ fn copy_docs(src: &Snapshot, dst: &mut Snapshot, fdis: Vec<FullDocInfo>) -> Resu
     }
     dst.ids = dst.ids.modify(id_acts)?;
     dst.seqs = dst.seqs.modify(seq_acts)?;
-    Ok(())
+    Ok(delta)
 }
 
 /// Copy a doc's leaf bodies (and their attachments) into `dst`. Non-leaf
@@ -666,7 +735,7 @@ fn copy_fdi(src: &Snapshot, dst: &CouchFile, fdi: &FullDocInfo) -> Result<FullDo
     let mut err = None;
     let tree = keytree::map_vals(&fdi.tree, &mut |_, _, v, is_leaf| match v {
         RevVal::Avail(l) if is_leaf => match copy_body(src, dst, l.ptr) {
-            Ok(ptr) => RevVal::Avail(LeafVal { ptr, ..l.clone() }),
+            Ok((ptr, stored)) => RevVal::Avail(LeafVal { ptr, stored, ..l.clone() }),
             Err(e) => {
                 err = Some(e);
                 RevVal::Missing
@@ -680,17 +749,27 @@ fn copy_fdi(src: &Snapshot, dst: &CouchFile, fdi: &FullDocInfo) -> Result<FullDo
     }
 }
 
-fn copy_body(src: &Snapshot, dst: &CouchFile, ptr: Pos) -> Result<Pos> {
+/// Compaction always writes format 2: chunks already stored tagged are
+/// copied as is (no recompression); format-1 raw chunks get encoded.
+/// Returns the new body position and its stored size with attachments.
+fn copy_body(src: &Snapshot, dst: &CouchFile, ptr: Pos) -> Result<(Pos, u64)> {
     let mut body = src.read_body(ptr)?;
     for a in body.atts.iter_mut() {
         let mut chunks = Vec::with_capacity(a.chunks.len());
+        let mut stored_len = 0u64;
         for p in &a.chunks {
-            let data = src.file.read_raw(*p)?;
-            chunks.push(dst.append_raw(&data)?.0);
+            let stored = src.file.read_raw(*p)?;
+            let out = if src.tagged_chunks() { stored } else { crate::file::encode_chunk(&stored) };
+            stored_len += out.len() as u64;
+            chunks.push(dst.append_raw(&out)?.0);
         }
         a.chunks = chunks;
+        a.stored_length = stored_len;
     }
-    Ok(dst.append_term(&body)?.0)
+    let att_stored: u64 = body.atts.iter().map(|a| a.stored_length).sum();
+    let encoded = crate::file::encode_value(&body);
+    let stored = encoded.len() as u64 + att_stored;
+    Ok((dst.append_raw(&encoded)?.0, stored))
 }
 
 fn commit_header(s: &mut Snapshot) -> Result<()> {
@@ -763,7 +842,8 @@ fn finish_compaction(db: &Db, cur: Snapshot, mut new: Snapshot, tmp: &FsPath) ->
         changed.push(fdi.clone());
         Ok(true)
     })?;
-    copy_docs(&cur, &mut new, changed)?;
+    let delta = copy_docs(&cur, &mut new, changed)?;
+    let stored = add_signed(new.header.prop_u64(STORED_LIVE).unwrap_or(0), delta);
     let mut locals = Vec::new();
     cur.locals.fold(Dir::Fwd, &Range::default(), |k, v| {
         locals.push(Action::Insert(k.clone(), v.clone()));
@@ -772,11 +852,13 @@ fn finish_compaction(db: &Db, cur: Snapshot, mut new: Snapshot, tmp: &FsPath) ->
     // Replace local docs wholesale; there are few of them.
     new.locals = Btree::new(new.file.clone(), None, Arc::new(LocalSpec)).modify(locals)?;
     new.header = Header {
+        version: DISK_VERSION,
         id_root: None,
         seq_root: None,
         local_root: None,
         ..cur.header.clone()
     };
+    new.header.set_prop_u64(STORED_LIVE, stored);
     commit_header(&mut new)?;
     std::fs::rename(tmp, &db.path)?;
     *db.state.write() = new;
@@ -821,6 +903,7 @@ fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<
     let mut fdis: HashMap<String, Option<FullDocInfo>> = HashMap::new();
     let mut locals: HashMap<String, Option<LocalDoc>> = HashMap::new();
     let mut original_seq: HashMap<String, Option<u64>> = HashMap::new();
+    let mut original_stored: HashMap<String, u64> = HashMap::new();
     let mut changed: Vec<String> = Vec::new();
     let mut local_changed: Vec<String> = Vec::new();
     let mut results = Vec::with_capacity(batch.len());
@@ -848,6 +931,7 @@ fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<
             if !fdis.contains_key(&doc.id) {
                 let f = snap.get_fdi(&doc.id)?;
                 original_seq.insert(doc.id.clone(), f.as_ref().map(|f| f.update_seq));
+                original_stored.insert(doc.id.clone(), f.as_ref().map(|f| f.leaf_stored()).unwrap_or(0));
                 fdis.insert(doc.id.clone(), f);
             }
             let slot = fdis.get_mut(&doc.id).unwrap();
@@ -873,8 +957,10 @@ fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<
     let mut seq = snap.header.update_seq;
     let mut id_acts = Vec::new();
     let mut seq_acts = Vec::new();
+    let mut stored_delta = 0i128;
     for id in changed {
         let mut fdi = fdis.remove(&id).unwrap().unwrap();
+        stored_delta += fdi.leaf_stored() as i128 - original_stored.get(&id).copied().unwrap_or(0) as i128;
         seq += 1;
         fdi.update_seq = seq;
         fdi.tree = keytree::map_vals(&fdi.tree, &mut |_, _, v, _| match v {
@@ -906,6 +992,8 @@ fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<
     new.seqs = new.seqs.modify(seq_acts)?;
     new.locals = new.locals.modify(local_acts)?;
     new.header.update_seq = seq;
+    let stored = add_signed(snap.stored_live(), stored_delta);
+    new.header.set_prop_u64(STORED_LIVE, stored);
     Ok((new, results))
 }
 
@@ -969,9 +1057,10 @@ fn prepare_atts(
                 encoding: a.encoding.clone(),
                 encoded_length: a.encoded_length,
                 chunks: chunks.clone(),
+                stored_length: a.stored_length,
             },
             AttData::Bytes(bytes) => {
-                let chunks = write_att_chunks(&snap.file, bytes)?;
+                let (chunks, stored_length) = write_att_chunks(&snap.file, bytes, snap.tagged_chunks())?;
                 let md5 = if a.md5.is_empty() || a.encoding.is_none() {
                     Md5::digest(bytes).to_vec()
                 } else {
@@ -986,6 +1075,7 @@ fn prepare_atts(
                     encoding: a.encoding.clone(),
                     encoded_length: bytes.len() as u64,
                     chunks,
+                    stored_length,
                 }
             }
             AttData::Follows => {
@@ -1000,14 +1090,25 @@ fn prepare_atts(
     Ok(out)
 }
 
-/// Append attachment data as 64 KiB chunks, 16 MiB per write.
-fn write_att_chunks(file: &CouchFile, bytes: &[u8]) -> Result<Vec<Pos>> {
+/// Append attachment data as 64 KiB chunks, 16 MiB per write. In tagged
+/// (format 2) files each chunk is LZ4-compressed when that shrinks it.
+/// Returns the chunk positions and the bytes they occupy as stored.
+fn write_att_chunks(file: &CouchFile, bytes: &[u8], tagged: bool) -> Result<(Vec<Pos>, u64)> {
     let mut chunks = Vec::with_capacity(bytes.len() / ATT_CHUNK + 1);
+    let mut stored = 0u64;
     let pieces: Vec<&[u8]> = bytes.chunks(ATT_CHUNK).collect();
     for group in pieces.chunks(256) {
-        chunks.extend(file.append_raw_many(group)?.into_iter().map(|(p, _)| p));
+        let written = if tagged {
+            let encoded: Vec<Vec<u8>> = group.iter().map(|c| crate::file::encode_chunk(c)).collect();
+            stored += encoded.iter().map(|e| e.len() as u64).sum::<u64>();
+            file.append_raw_many(&encoded)?
+        } else {
+            stored += group.iter().map(|c| c.len() as u64).sum::<u64>();
+            file.append_raw_many(group)?
+        };
+        chunks.extend(written.into_iter().map(|(p, _)| p));
     }
-    Ok(chunks)
+    Ok((chunks, stored))
 }
 
 fn att_file_moved() -> CouchError {
@@ -1020,15 +1121,16 @@ fn att_file_moved() -> CouchError {
 
 fn write_rev(snap: &Snapshot, doc: &Doc, atts: Vec<AttInfo>, body_json: Vec<u8>) -> Result<LeafVal> {
     let size = body_json.len() as u64 + atts.iter().map(|a| a.encoded_length).sum::<u64>();
-    let (ptr, _) = snap.file.append_term(&DiskBody {
-        json: body_json,
-        atts,
-    })?;
+    let att_stored: u64 = atts.iter().map(|a| a.stored_length).sum();
+    let encoded = crate::file::encode_value(&DiskBody { json: body_json, atts });
+    let stored = encoded.len() as u64 + att_stored;
+    let (ptr, _) = snap.file.append_raw(&encoded)?;
     Ok(LeafVal {
         deleted: doc.deleted,
         ptr,
         seq: SEQ_PLACEHOLDER,
         size,
+        stored,
     })
 }
 
@@ -1160,6 +1262,7 @@ fn update_replicated(
 
 fn do_purge(db: &Db, snap: Snapshot, req: Vec<(String, Vec<(u64, String)>)>) -> Result<Value> {
     let mut purged = Map::new();
+    let mut stored_delta = 0i128;
     let mut new = snap.clone();
     let mut seq = snap.header.update_seq;
     let mut id_acts = Vec::new();
@@ -1169,7 +1272,9 @@ fn do_purge(db: &Db, snap: Snapshot, req: Vec<(String, Vec<(u64, String)>)>) -> 
             purged.insert(id, json!([]));
             continue;
         };
+        let before = fdi.leaf_stored();
         let removed = keytree::remove_leafs(&mut fdi.tree, &revs);
+        stored_delta += fdi.leaf_stored() as i128 - before as i128;
         purged.insert(
             id.clone(),
             json!(removed.iter().map(|(p, r)| format!("{p}-{r}")).collect::<Vec<_>>()),
@@ -1199,6 +1304,8 @@ fn do_purge(db: &Db, snap: Snapshot, req: Vec<(String, Vec<(u64, String)>)>) -> 
     new.seqs = new.seqs.modify(seq_acts)?;
     new.header.update_seq = seq;
     new.header.purge_seq += 1;
+    let stored = add_signed(snap.stored_live(), stored_delta);
+    new.header.set_prop_u64(STORED_LIVE, stored);
     let purge_seq = new.header.purge_seq;
     commit_and_swap(db, new)?;
     Ok(json!({"purge_seq": purge_seq, "purged": purged}))

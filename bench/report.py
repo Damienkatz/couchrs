@@ -39,7 +39,14 @@ data = {
         "compaction (smoosh) disabled, since couchdb-rs has none. Both required admin credentials.",
         "Dataset: deterministic from a fixed seed, so both servers received identical documents and ids. "
         "Sizes are log-uniform within each power-of-ten band from 100 B to 1 GB, with the bands getting "
-        "1/4/10/15/20/25/25% of the volume. Attachment bytes are random, so neither server can compress them.",
+        "1/4/10/15/20/25/25% of the volume. Payloads and attachments are generated text (words drawn at random "
+        "from a fixed vocabulary), so they compress roughly the way real documents do.",
+        "Compression: couchdb-rs stores document bodies and attachment chunks LZ4-compressed (raw when that "
+        "doesn't help). CouchDB compresses bodies with snappy and, because the attachments are text/plain, "
+        "gzips attachments at its default level 8.",
+        "Sizes: compaction figures use deflated (as stored) bytes for both servers. couchdb-rs's sizes.external "
+        "counts uncompressed bytes; CouchDB's counts gzipped attachments, so the report compares file sizes and "
+        "the dataset's known uncompressed size instead.",
         "Operation tests use 16 concurrent clients for small docs, fewer for very large ones (8 at 10 MB, 4 at 100 MB, 2 at 1 GB).",
         "Replication used CouchDB's replicator with default settings for both servers, copying each server's "
         "database to a new database on that same server.",

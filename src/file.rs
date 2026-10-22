@@ -170,6 +170,11 @@ impl CouchFile {
         self.append_raw(&encode_term(term))
     }
 
+    /// Append a stored value (doc body), LZ4-compressed when that helps.
+    pub fn append_value<T: Serialize>(&self, value: &T) -> io::Result<(Pos, u64)> {
+        self.append_raw(&encode_value(value))
+    }
+
     pub fn read_term<T: DeserializeOwned>(&self, pos: Pos) -> io::Result<T> {
         decode_term(&self.read_raw(pos)?)
     }
@@ -249,6 +254,9 @@ fn read_at_most(f: &File, buf: &mut [u8], pos: u64) -> io::Result<usize> {
 
 const ENC_RAW: u8 = 0;
 const ENC_SNAPPY: u8 = 1;
+const ENC_LZ4: u8 = 2;
+/// Uncompressed, in the current value layout (vs ENC_RAW, the old one).
+const ENC_RAW2: u8 = 3;
 
 /// Serialize with bincode, snappy-compressing larger payloads.
 pub fn encode_term<T: Serialize>(term: &T) -> Vec<u8> {
@@ -269,6 +277,66 @@ pub fn encode_term<T: Serialize>(term: &T) -> Vec<u8> {
     out
 }
 
+/// Serialize a stored value (doc body) LZ4-compressed, or raw when LZ4
+/// doesn't make it smaller. Keys and B-tree nodes keep `encode_term`.
+/// Values are tagged ENC_LZ4/ENC_RAW2 so readers can tell them from
+/// values written in the previous layout (ENC_RAW/ENC_SNAPPY).
+pub fn encode_value<T: Serialize>(value: &T) -> Vec<u8> {
+    let raw = bincode::serialize(value).expect("serialize");
+    let mut out = tag_lz4_or_raw(&raw);
+    if out[0] == ENC_RAW {
+        out[0] = ENC_RAW2;
+    }
+    out
+}
+
+/// True if `data` was written by `encode_value` (current layout).
+pub fn is_current_value(data: &[u8]) -> bool {
+    matches!(data.first(), Some(&ENC_LZ4) | Some(&ENC_RAW2))
+}
+
+pub fn decode_value<T: DeserializeOwned>(data: &[u8]) -> io::Result<T> {
+    match data.split_first() {
+        Some((&ENC_LZ4, body)) => {
+            let raw = lz4_flex::block::decompress_size_prepended(body).map_err(|e| corrupt(e.to_string()))?;
+            bincode::deserialize(&raw).map_err(|e| corrupt(e.to_string()))
+        }
+        Some((&ENC_RAW2, body)) => bincode::deserialize(body).map_err(|e| corrupt(e.to_string())),
+        _ => Err(corrupt("not a current-layout value")),
+    }
+}
+
+fn tag_lz4_or_raw(raw: &[u8]) -> Vec<u8> {
+    if raw.len() > 64 {
+        let c = lz4_flex::block::compress_prepend_size(raw);
+        if c.len() < raw.len() {
+            let mut out = Vec::with_capacity(c.len() + 1);
+            out.push(ENC_LZ4);
+            out.extend_from_slice(&c);
+            return out;
+        }
+    }
+    let mut out = Vec::with_capacity(raw.len() + 1);
+    out.push(ENC_RAW);
+    out.extend_from_slice(raw);
+    out
+}
+
+/// Encode an attachment chunk for a format-2 file: tagged, LZ4 when that
+/// shrinks it.
+pub fn encode_chunk(data: &[u8]) -> Vec<u8> {
+    tag_lz4_or_raw(data)
+}
+
+/// Decode an attachment chunk stored by `encode_chunk`.
+pub fn decode_chunk(stored: Vec<u8>) -> io::Result<Vec<u8>> {
+    match stored.first() {
+        Some(&ENC_RAW) => Ok(stored[1..].to_vec()),
+        Some(&ENC_LZ4) => lz4_flex::block::decompress_size_prepended(&stored[1..]).map_err(|e| corrupt(e.to_string())),
+        _ => Err(corrupt("unknown chunk encoding")),
+    }
+}
+
 pub fn decode_term<T: DeserializeOwned>(data: &[u8]) -> io::Result<T> {
     let (tag, body) = data.split_first().ok_or_else(|| corrupt("empty term"))?;
     let res = match *tag {
@@ -287,6 +355,30 @@ pub fn decode_term<T: DeserializeOwned>(data: &[u8]) -> io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lz4_values_and_chunks_round_trip() {
+        let text = "the quick brown fox ".repeat(500);
+        let enc = encode_value(&text);
+        assert_eq!(enc[0], ENC_LZ4);
+        assert!(enc.len() < text.len() / 4);
+        assert!(is_current_value(&enc));
+        assert_eq!(decode_value::<String>(&enc).unwrap(), text);
+        let small = encode_value(&"hi".to_string());
+        assert_eq!(small[0], ENC_RAW2);
+        assert_eq!(decode_value::<String>(&small).unwrap(), "hi");
+        // Old-layout terms are not mistaken for current values.
+        assert!(!is_current_value(&encode_term(&text)));
+        // Incompressible data is stored raw rather than grown.
+        let mut x = 7u64;
+        let random: Vec<u8> = (0..65536).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+        let c = encode_chunk(&random);
+        assert_eq!((c[0], c.len()), (ENC_RAW, random.len() + 1));
+        assert_eq!(decode_chunk(c).unwrap(), random);
+        let c = encode_chunk(text.as_bytes());
+        assert_eq!(c[0], ENC_LZ4);
+        assert_eq!(decode_chunk(c).unwrap(), text.as_bytes());
+    }
 
     #[test]
     fn chunks_cross_blocks_and_header_recovers() {

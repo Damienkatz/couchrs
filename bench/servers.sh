@@ -42,8 +42,25 @@ case "${1:-}" in
       sleep 0.2
     done
     ;;
+  restart)
+    # Restart one server so it starts from a fresh process.
+    case "${2:-}" in
+      erlang)
+        pkill -f "$B/couchdb-erl" || true
+        while curl -sf -m 1 http://127.0.0.1:15984/_up >/dev/null; do sleep 0.2; done
+        (cd "$B/couchdb-erl" && nohup ./bin/couchdb < /dev/null > "$B/erl.log" 2>&1 &)
+        wait_up http://127.0.0.1:15984 ;;
+      rust)
+        pkill -f "couchdb-rs --data-dir $B/data-rs" || true
+        while curl -sf -m 1 http://127.0.0.1:25984/_up >/dev/null; do sleep 0.2; done
+        RUST_LOG=warn nohup "$RS_BIN" --data-dir "$B/data-rs" --bind 127.0.0.1:25984 \
+          --admin admin:bench < /dev/null > "$B/rs.log" 2>&1 &
+        wait_up http://127.0.0.1:25984 ;;
+      *) echo "usage: $0 restart erlang|rust" >&2; exit 2 ;;
+    esac
+    ;;
   *)
-    echo "usage: $0 start|stop" >&2
+    echo "usage: $0 start|stop|restart erlang|rust" >&2
     exit 2
     ;;
 esac

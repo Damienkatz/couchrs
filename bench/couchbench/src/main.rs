@@ -55,7 +55,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: couchbench --url http://user:pass@host:port --name NAME [--replicator URL]\n\
          \x20      [--db bench] [--total-gb 100] [--seed 42] [--out results.json]\n\
-         \x20      [--phases load,view,get,put,delete,replicate] [--keep-replica] [--ops-scale 1.0]"
+         \x20      [--phases load,view,get,put,delete,replicate,compact] [--keep-replica] [--ops-scale 1.0]"
     );
     std::process::exit(2)
 }
@@ -129,18 +129,55 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
-    fn fill(&mut self, buf: &mut [u8]) {
-        let mut chunks = buf.chunks_exact_mut(8);
-        for c in &mut chunks {
-            c.copy_from_slice(&self.next().to_le_bytes());
-        }
-        let rem = chunks.into_remainder();
-        let last = self.next().to_le_bytes();
-        rem.copy_from_slice(&last[..rem.len()]);
-    }
 }
 
-const ALNUM: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+/// Vocabulary for generated text. Words are drawn at random (seeded), so
+/// the content is deterministic but compresses like real prose rather than
+/// like random bytes.
+const WORDS: &[&str] = &[
+    "the", "of", "and", "to", "in", "is", "that", "for", "it", "as", "was", "with", "be", "by", "on", "not",
+    "he", "this", "are", "or", "his", "from", "at", "which", "but", "have", "an", "had", "they", "you", "were",
+    "their", "one", "all", "we", "can", "her", "has", "there", "been", "if", "more", "when", "will", "would",
+    "who", "so", "no", "other", "into", "time", "only", "some", "could", "new", "these", "two", "may", "first",
+    "then", "do", "any", "like", "my", "now", "over", "such", "our", "man", "me", "even", "most", "made", "after",
+    "also", "did", "many", "before", "must", "through", "back", "years", "where", "much", "your", "way", "well",
+    "down", "should", "because", "each", "just", "those", "people", "how", "too", "little", "state", "good",
+    "very", "make", "world", "still", "own", "see", "men", "work", "long", "get", "here", "between", "both",
+    "life", "being", "under", "never", "day", "same", "another", "know", "while", "last", "might", "us", "great",
+    "old", "year", "off", "come", "since", "against", "go", "came", "right", "used", "take", "three", "states",
+    "himself", "few", "house", "use", "during", "without", "again", "place", "american", "around", "however",
+    "home", "small", "found", "thought", "went", "say", "part", "once", "general", "high", "upon", "school",
+    "every", "does", "got", "united", "left", "number", "course", "war", "until", "always", "away", "something",
+    "fact", "though", "water", "less", "public", "put", "think", "almost", "hand", "enough", "far", "took", "head",
+    "yet", "government", "system", "better", "set", "told", "nothing", "night", "end", "why", "called", "eyes",
+    "find", "going", "look", "asked", "later", "knew", "point", "next", "program", "city", "business", "give",
+    "group", "toward", "young", "days", "let", "room", "president", "side", "social", "given", "present", "several",
+    "order", "national", "possible", "rather", "second", "face", "per", "among", "form", "important", "often",
+    "things", "looked", "early", "white", "case", "become", "large", "big", "need", "four", "within", "felt",
+    "children", "along", "saw", "best", "church", "ever", "least", "power", "development", "light", "thing",
+    "seemed", "family", "interest", "want", "members", "mind", "country", "area", "others", "although", "turned",
+    "done", "open", "service", "certain", "kind", "problem", "began", "different", "door", "thus", "help", "sense",
+    "means", "whole", "matter", "perhaps", "itself", "york", "times", "law", "human", "line", "above", "name",
+    "example", "action", "company", "hands", "local", "show", "whether", "five", "history", "gave", "today",
+    "either", "act", "feet", "across", "taken", "past", "quite", "anything", "seen", "having", "death", "week",
+];
+
+impl Rng {
+    /// Fill `buf` with space-separated words (ASCII, JSON-safe).
+    fn fill_text(&mut self, buf: &mut [u8]) {
+        let mut i = 0;
+        while i < buf.len() {
+            let w = WORDS[self.below(WORDS.len() as u64) as usize].as_bytes();
+            let n = w.len().min(buf.len() - i);
+            buf[i..i + n].copy_from_slice(&w[..n]);
+            i += n;
+            if i < buf.len() {
+                buf[i] = b' ';
+                i += 1;
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct DocSpec {
@@ -203,28 +240,25 @@ fn json_doc(spec: &DocSpec, seed: u64, with_id: bool, size: u64) -> Vec<u8> {
     ));
     let pad = size.saturating_sub(head.len() as u64 + 2) as usize;
     let mut payload = vec![0u8; pad];
-    rng.fill(&mut payload);
-    for b in payload.iter_mut() {
-        *b = ALNUM[(*b & 63) as usize];
-    }
+    rng.fill_text(&mut payload);
     let mut v = head.into_bytes();
     v.extend_from_slice(&payload);
     v.extend_from_slice(b"\"}");
     v
 }
 
-/// A streamed multipart/related body: doc JSON + one attachment of `size`
-/// random (incompressible) bytes. Returns (content-type, length, body).
+/// A streamed multipart/related body: doc JSON + one text/plain attachment
+/// of `size` bytes of generated text. Returns (content-type, length, body).
 fn multipart_doc(spec: &DocSpec, seed: u64) -> (String, u64, reqwest::Body) {
     let boundary = format!("bench{:016x}", splitmix(spec.idx ^ seed));
     let doc = json!({
         "band": spec.band,
         "group": spec.group(),
         "size": spec.size,
-        "_attachments": {"blob": {"follows": true, "content_type": "application/octet-stream", "length": spec.size}}
+        "_attachments": {"blob": {"follows": true, "content_type": "text/plain", "length": spec.size}}
     });
     let head = format!(
-        "--{boundary}\r\nContent-Type: application/json\r\n\r\n{doc}\r\n--{boundary}\r\nContent-Disposition: attachment; filename=\"blob\"\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        "--{boundary}\r\nContent-Type: application/json\r\n\r\n{doc}\r\n--{boundary}\r\nContent-Disposition: attachment; filename=\"blob\"\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
         spec.size
     );
     let tail = format!("\r\n--{boundary}--");
@@ -239,7 +273,7 @@ fn multipart_doc(spec: &DocSpec, seed: u64) -> (String, u64, reqwest::Body) {
             }
             let n = (total - sent).min(1 << 20) as usize;
             let mut buf = vec![0u8; n];
-            rng_local.fill(&mut buf);
+            rng_local.fill_text(&mut buf);
             Some((Ok::<Bytes, std::io::Error>(Bytes::from(buf)), sent + n as u64))
         }
     });
@@ -849,6 +883,53 @@ async fn phase_replicate(c: &Couch, a: &Args) -> Value {
     })
 }
 
+// ------------------------------------------------------------ compaction
+
+async fn db_sizes(c: &Couch, db: &str) -> (u64, u64, bool) {
+    let v = c.json(reqwest::Method::GET, &format!("/{db}"), None).await.unwrap().1;
+    (
+        v["sizes"]["file"].as_u64().unwrap_or(0),
+        v["sizes"]["active"].as_u64().unwrap_or(0),
+        v["compact_running"].as_bool().unwrap_or(false),
+    )
+}
+
+async fn phase_compact(c: &Couch, a: &Args) -> Value {
+    let db = &a.db;
+    let (file0, active0, _) = db_sizes(c, db).await;
+    eprintln!("  compact: {:.2} GB file, {:.2} GB live", file0 as f64 / 1e9, active0 as f64 / 1e9);
+    let t0 = Instant::now();
+    let (st, v) = c.json(reqwest::Method::POST, &format!("/{db}/_compact"), Some(json!({}))).await.unwrap();
+    assert!(st == 202, "compact request failed: {st} {v}");
+    // Wait until compaction has been seen running and then stopped (or never
+    // showed as running within a few seconds, for a very fast compaction).
+    let mut seen = false;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (_, _, running) = db_sizes(c, db).await;
+        seen |= running;
+        if !running && (seen || t0.elapsed() > Duration::from_secs(5)) {
+            break;
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let (file1, active1, _) = db_sizes(c, db).await;
+    eprintln!(
+        "  compact: {secs:.1}s -> {:.2} GB file, {:.2} GB live ({:.0} MB/s of live data)",
+        file1 as f64 / 1e9, active1 as f64 / 1e9, mb(active1) / secs
+    );
+    json!({
+        "secs": secs,
+        "file_bytes_before": file0,
+        "active_bytes_before": active0,
+        "file_bytes_after": file1,
+        "active_bytes_after": active1,
+        "reclaimed_bytes": file0.saturating_sub(file1),
+        "dead_bytes_after": file1.saturating_sub(active1),
+        "live_mb_per_sec": mb(active1) / secs,
+    })
+}
+
 // ------------------------------------------------------------------ main
 
 fn save(out: &str, name: &str, key: &str, val: Value) {
@@ -891,6 +972,7 @@ async fn main() {
             "put" => phase_put(&c, &a, created.clone()).await,
             "delete" => phase_delete(&c, &a, created.clone()).await,
             "replicate" => phase_replicate(&c, &a).await,
+            "compact" => phase_compact(&c, &a).await,
             other => {
                 eprintln!("unknown phase {other}");
                 continue;
