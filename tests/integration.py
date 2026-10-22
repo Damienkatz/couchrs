@@ -579,6 +579,60 @@ def concurrent_writers():
     assert w["_rev"].startswith("30-")
 
 
+@test
+def delete_and_recreate_while_in_use():
+    db = new_db()
+    stop = threading.Event()
+    bad = []
+
+    def check(what, s, b):
+        # Deleted underneath, a write may see 404 (or 409/412 racing the
+        # recreate), never a server error.
+        if s >= 500:
+            bad.append((what, s, b))
+
+    def writer(n):
+        i = 0
+        while not stop.is_set():
+            s, b, _ = req("PUT", f"/{db}/w{n}-{i}", {"n": n, "i": i})
+            check("put", s, b)
+            s, b, _ = req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": f"b{n}-{i}-{k}", "k": k} for k in range(20)]})
+            check("bulk_docs", s, b)
+            s, b, _ = req("GET", f"/{db}/w{n}-{i}")
+            check("get", s, b)
+            i += 1
+
+    def churner():
+        while not stop.is_set():
+            s, b, _ = req("DELETE", f"/{db}")
+            check("delete", s, b)
+            s, b, _ = req("PUT", f"/{db}")
+            check("create", s, b)
+
+    ts = [threading.Thread(target=writer, args=(n,)) for n in range(6)] + [threading.Thread(target=churner) for _ in range(2)]
+    [t.start() for t in ts]
+    time.sleep(4)
+    stop.set()
+    [t.join() for t in ts]
+    eq(bad[:3], [])
+    # A recreated database starts empty, independent of the old one.
+    req("DELETE", f"/{db}")
+    s, _, _ = req("PUT", f"/{db}")
+    eq(s, 201)
+    s, _, _ = req("PUT", f"/{db}/only", {"x": 1})
+    eq(s, 201)
+    _, info, _ = req("GET", f"/{db}")
+    eq(info["doc_count"], 1)
+    eq(int(info["update_seq"].split("-")[0]), 1)
+    s, _, _ = req("GET", f"/{db}/w0-0")
+    eq(s, 404)
+    s, dbs, _ = req("GET", "/_all_dbs")
+    eq(dbs.count(db), 1)
+    req("DELETE", f"/{db}")
+    s, dbs, _ = req("GET", "/_all_dbs")
+    eq(db in dbs, False)
+
+
 def main():
     failed = 0
     for t in TESTS:

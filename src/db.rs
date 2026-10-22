@@ -394,9 +394,80 @@ enum Msg {
     DropOldBodies { ids: Vec<String>, since: u64, limit: u64, reply: oneshot::Sender<Result<()>> },
 }
 
+// ------------------------------------------------------ directory layout
+//
+// A database directory (`{name}.rocks`) holds one RocksDB instance per
+// incarnation, in `g-<uuid>/`, and a LIVE file naming the current one.
+// Deleting a database removes LIVE and leaves the incarnation's files to
+// whoever still has it open; they are removed once it closes. So a
+// database recreated under the same name never shares files (or
+// RocksDB's lock) with the one it replaced, and requests still running
+// on the old one finish against intact files. Directories from before
+// this layout hold RocksDB's files directly; they stay live until a
+// DELETED marker appears.
+
+const LIVE_FILE: &str = "LIVE";
+const DELETED_MARKER: &str = "DELETED";
+
+/// Incarnation directories open in this process. Its lock also orders
+/// every layout change (create, delete, cleanup on close).
+static OPEN_GENS: Mutex<Vec<PathBuf>> = parking_lot::const_mutex(Vec::new());
+
+fn live_gen(dir: &FsPath) -> Option<PathBuf> {
+    if let Ok(g) = std::fs::read_to_string(dir.join(LIVE_FILE))
+        && !g.trim().is_empty()
+    {
+        return Some(dir.join(g.trim()));
+    }
+    (dir.join("CURRENT").exists() && !dir.join(DELETED_MARKER).exists()).then(|| dir.to_path_buf())
+}
+
+/// Whether `dir` holds a live (not deleted) database.
+pub fn exists(dir: &FsPath) -> bool {
+    live_gen(dir).is_some()
+}
+
+/// Remove an incarnation that is neither live nor open, then the
+/// database directory itself once nothing is left in it. Called with
+/// OPEN_GENS locked.
+fn remove_gen(dir: &FsPath, generation: &FsPath) {
+    if generation == dir {
+        // Old layout: RocksDB's files sit directly in `dir`, next to any
+        // newer incarnation's directory and LIVE file.
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.file_name() != LIVE_FILE && e.path().is_file() {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    } else {
+        let _ = std::fs::remove_dir_all(generation);
+    }
+    let empty = std::fs::read_dir(dir).map(|rd| rd.flatten().all(|e| e.file_name() == DELETED_MARKER)).unwrap_or(false);
+    if empty {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Remove incarnations left behind by a crash. Called with OPEN_GENS locked.
+fn remove_stale_gens(dir: &FsPath, open: &[PathBuf]) {
+    let live = live_gen(dir);
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if e.file_name().to_string_lossy().starts_with("g-") && Some(&p) != live.as_ref() && !open.contains(&p) {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+}
+
 pub struct Db {
     pub name: String,
+    /// The database directory; `generation` is this incarnation's RocksDB.
     pub path: PathBuf,
+    generation: PathBuf,
+    deleted: Arc<AtomicBool>,
     store: Arc<Store>,
     state: RwLock<Snapshot>,
     tx: Mutex<mpsc::Sender<Msg>>,
@@ -422,14 +493,34 @@ fn next_id_after(view: &View, cf: &str) -> Result<u64> {
 
 impl Db {
     pub fn open(path: &FsPath, name: &str, create: bool) -> Result<Arc<Db>> {
-        if create {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
+        let mut open = OPEN_GENS.lock();
+        let generation = if create {
+            if exists(path) {
+                return Err(CouchError::file_exists());
             }
-        } else if !path.exists() {
-            return Err(CouchError::not_found("Database does not exist."));
+            std::fs::create_dir_all(path)?;
+            path.join(format!("g-{}", uuid::Uuid::new_v4().simple()))
+        } else {
+            live_gen(path).ok_or_else(|| CouchError::not_found("Database does not exist."))?
+        };
+        let store = Store::open(&generation, CFS, create)?;
+        if create {
+            let tmp = path.join("LIVE.tmp");
+            std::fs::write(&tmp, generation.file_name().unwrap().as_encoded_bytes())?;
+            std::fs::rename(&tmp, path.join(LIVE_FILE))?;
         }
-        let store = Store::open(path, CFS, create)?;
+        remove_stale_gens(path, &open);
+        open.push(generation.clone());
+        drop(open);
+        let deleted = Arc::new(AtomicBool::new(false));
+        let (dir, g, del) = (path.to_path_buf(), generation.clone(), deleted.clone());
+        store.on_close(move || {
+            let mut open = OPEN_GENS.lock();
+            open.retain(|p| p != &g);
+            if del.load(AtomicOrdering::SeqCst) {
+                remove_gen(&dir, &g);
+            }
+        });
         let header: Header = match store.db.get_cf(&store.cf(CF_META), HEADER_KEY).map_err(rerr)? {
             Some(b) => dec(&b)?,
             None => {
@@ -461,6 +552,8 @@ impl Db {
         let db = Arc::new(Db {
             name: name.to_string(),
             path: path.to_path_buf(),
+            generation,
+            deleted,
             store,
             state: RwLock::new(snap),
             tx: Mutex::new(tx),
@@ -620,8 +713,18 @@ impl Db {
         Ok(())
     }
 
+    /// Delete this database: it stops being live at once, and its files
+    /// are removed when the last handle to this incarnation closes.
     pub fn delete_files(&self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let _open = OPEN_GENS.lock();
+        if live_gen(&self.path).as_ref() == Some(&self.generation) {
+            if self.generation == self.path {
+                let _ = std::fs::write(self.path.join(DELETED_MARKER), b"");
+            } else {
+                let _ = std::fs::remove_file(self.path.join(LIVE_FILE));
+            }
+        }
+        self.deleted.store(true, AtomicOrdering::SeqCst);
     }
 }
 

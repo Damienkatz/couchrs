@@ -37,6 +37,19 @@ pub fn cf_options(blob: bool) -> Options {
 pub struct Store {
     pub db: Rdb,
     pub path: PathBuf,
+    // Declared after `db`, so it runs once RocksDB has closed.
+    on_close: OnClose,
+}
+
+/// Runs a hook after the store's RocksDB instance has closed.
+struct OnClose(parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl Drop for OnClose {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.lock().take() {
+            f();
+        }
+    }
 }
 
 impl Store {
@@ -51,7 +64,12 @@ impl Store {
         let descs: Vec<ColumnFamilyDescriptor> =
             cfs.iter().map(|(n, blob)| ColumnFamilyDescriptor::new(*n, cf_options(*blob))).collect();
         let db = Rdb::open_cf_descriptors(&opts, path, descs).map_err(rerr)?;
-        Ok(Arc::new(Store { db, path: path.to_path_buf() }))
+        Ok(Arc::new(Store { db, path: path.to_path_buf(), on_close: OnClose(parking_lot::Mutex::new(None)) }))
+    }
+
+    /// Run `f` once the last handle is gone and RocksDB has closed.
+    pub fn on_close(&self, f: impl FnOnce() + Send + 'static) {
+        *self.on_close.0.lock() = Some(Box::new(f));
     }
 
     pub fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
