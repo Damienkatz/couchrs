@@ -156,6 +156,15 @@ code { font-family: var(--mono); font-size: 0.92em; }
     <div class="figrow"><div class="figure" id="fig-view-build"></div><div class="figure" id="fig-view-q"></div></div>
   </section>
 
+  <section id="scale-section" hidden>
+    <h2>Connection scaling</h2>
+    <p id="scale-text"></p>
+    <div class="figrow"><div class="figure" id="fig-scale-rps"></div><div class="figure" id="fig-scale-mem"></div></div>
+    <div class="figrow"><div class="figure" id="fig-scale-get"></div><div class="figure" id="fig-scale-put"></div></div>
+    <div class="figure" id="fig-scale-att"></div>
+    <div class="figure" id="fig-scale-table"></div>
+  </section>
+
   <section id="vc-section" hidden>
     <h2>View compaction</h2>
     <p id="vc-text">Incremental index updates followed by view compaction. 200,000 small documents are inserted, updated three times and then deleted, and the index is brought up to date after each round, so it ends with the rows it started with plus whatever dead space incremental updates leave. Then the index is compacted. CouchDB's background indexer updates its index while the churn is written, so its index update times are not shown.</p>
@@ -582,6 +591,43 @@ code { font-family: var(--mono); font-size: 0.92em; }
         const m = g(SRC[key], 'view_compact'); if (!m) continue;
         const r = h('tr');
         [name, bytes(m.file_bytes_start), bytes(m.file_bytes_before), bytes(m.active_bytes_before), bytes(m.file_bytes_after), bytes(m.reclaimed_bytes), dur(m.secs)]
+          .forEach(c => r.appendChild(h('td', null, c)));
+        tb.appendChild(r);
+      }
+      wrap.appendChild(tb); host.appendChild(wrap);
+    });
+  }
+
+  if (SERIES.some(s => g(SRC[s.key], 'scale.steps'))) {
+    document.getElementById('scale-section').hidden = false;
+    const sc = SERIES.map(s => g(SRC[s.key], 'scale')).find(Boolean);
+    document.getElementById('scale-text').textContent =
+      `Simulated hosts are added one at a time, each a separate loopback source address holding ${compact(sc.per_host)} keep-alive connections, ` +
+      `up to ${compact(sc.per_host * sc.steps.length)}. Every client runs a closed loop: it sends its next request as soon as the last one answers, ` +
+      `choosing evenly among GET of a random ${compact(sc.doc_bytes)}-byte document (from ${compact(sc.pool_docs)}), PUT of its own document, and GET of a random ${compact(sc.att_bytes)}-byte attachment. ` +
+      `After each host joins, the load settles for ${sc.warm_secs} s and is then measured for ${sc.measure_secs} s. The load generator runs on the same machine.`;
+    const counts = [...new Set(SERIES.flatMap(s => (g(SRC[s.key], 'scale.steps') || []).map(x => x.clients)))].sort((a, b) => a - b);
+    const at = (d, c) => (g(d, 'scale.steps') || []).find(x => x.clients === c);
+    const byClients = f => counts.map(c => row(compact(c), d => { const st = at(d, c); return st ? f(st) : null; }));
+    bars('fig-scale-rps', byClients(st => st.ops_per_sec), { title: 'Requests per second', sub: 'all three request types · higher is better', unit: 'req/s' });
+    bars('fig-scale-mem', byClients(st => st.server_footprint_bytes), { title: 'Server memory', sub: 'peak physical footprint while measuring · lower is better', better: 'lower', fmt: bytes });
+    const lat = (k, what) => [() => byClients(st => g(st, `ops.${k}.${PCT}`)), latOpts(what)];
+    bars('fig-scale-get', ...lat('get', 'GET document'));
+    bars('fig-scale-put', ...lat('put', 'PUT document'));
+    bars('fig-scale-att', ...lat('get_att', 'GET attachment'));
+    RENDERERS.push(() => {
+      const host = document.getElementById('fig-scale-table');
+      host.replaceChildren();
+      const head = h('div', 'fighead'); const t = h('div');
+      t.append(h('h3', null, 'Every step'), h('div', 'sub', 'errors are counted during the measured window; connect errors include retried connection attempts'));
+      head.append(t); host.appendChild(head);
+      const wrap = h('div', 'tablewrap'); const tb = h('table');
+      const tr = h('tr'); ['Server', 'Clients', 'Connected', 'req/s', 'GET p99', 'PUT p99', 'Attachment p99', 'HTTP errors', 'I/O errors', 'Timeouts', 'Connect errors', 'Memory', 'CPU cores'].forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+      const ms = v => v == null ? '–' : v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : v.toFixed(0);
+      for (const { key, name } of SERIES) for (const st of g(SRC[key], 'scale.steps') || []) {
+        const r = h('tr');
+        [name, compact(st.clients), compact(st.connected), compact(st.ops_per_sec), ms(st.ops.get.p99_ms), ms(st.ops.put.p99_ms), ms(st.ops.get_att.p99_ms),
+          compact(st.http_errors), compact(st.io_errors), compact(st.timeouts), compact(st.connect_errors), bytes(st.server_footprint_bytes), st.server_cpu_cores.toFixed(1)]
           .forEach(c => r.appendChild(h('td', null, c)));
         tb.appendChild(r);
       }

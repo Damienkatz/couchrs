@@ -91,6 +91,23 @@ if "hybrid" in results:
         "View compaction memory is macOS physical footprint (what Activity Monitor shows), sampled every 0.1 s; "
         "RSS on macOS keeps counting memory malloc has freed but the kernel has not yet reclaimed.",
     ]
+if any("scale" in v for v in results.values() if isinstance(v, dict)):
+    data["method"] += [
+        "Connection scaling (bench/couchbench couchscale): each simulated host is a loopback alias "
+        "(127.0.0.2-127.0.0.7), because macOS gives one source address only about 16K ephemeral ports. Every "
+        "client holds one keep-alive HTTP/1.1 connection. CouchDB's connection cap (mochiweb max, default "
+        "65,536) was raised to 200,000 and its Erlang port limit to 262,144 for this test.",
+        "Server memory in the scaling test is macOS physical footprint; CPU is the server's CPU time over the "
+        "measured window. The load generator shares the machine's 14 cores with the server.",
+        "Why couchdb-rs collapses above ~15K clients: every request runs its database work inside tokio's "
+        "block_in_place, and a PUT blocks there until its group commit is durable. Each blocked call hands its "
+        "worker's runtime to a thread from tokio's blocking pool, capped at 512; once that is exhausted, sampled "
+        "stacks show requests queued on the pool's spawn lock while the server's CPUs sit idle. Neither the "
+        "load generator (under 1 core) nor the storage engine was the limit.",
+        "CouchDB's step-1 I/O errors are connections it closed during that window, which clients reopened. "
+        "At 75K and 90K clients no CouchDB PUT succeeded, which accounts for its HTTP errors there; the test "
+        "did not record their status codes.",
+    ]
 html = open(os.path.join(here, "report_template.html")).read()
 payload = json.dumps(data).replace("</", "<\\/")
 open(dst, "w").write(html.replace("__DATA__", payload))
