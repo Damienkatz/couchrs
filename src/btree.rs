@@ -45,6 +45,41 @@ type NodeOf<S> = Node<<S as Spec>::K, <S as Spec>::V, <S as Spec>::R>;
 /// Small shared cache of decoded inner nodes, which are hot on every lookup.
 struct NodeCache<S: Spec> {
     map: Mutex<HashMap<Pos, Arc<NodeOf<S>>>>,
+    /// Stored bytes of the cached nodes.
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+const CACHE_MAX: usize = 4096;
+
+/// Entries and stored bytes across every tree's cache.
+static CACHE_SIZE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static CACHE_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+impl<S: Spec> NodeCache<S> {
+    fn forget(&self, entries: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        CACHE_SIZE.fetch_sub(entries as i64, Relaxed);
+        CACHE_BYTES.fetch_sub(self.bytes.swap(0, Relaxed) as i64, Relaxed);
+    }
+}
+
+impl<S: Spec> Drop for NodeCache<S> {
+    fn drop(&mut self) {
+        let n = self.map.get_mut().len();
+        self.forget(n);
+    }
+}
+
+/// The node caches, as _system reports CouchDB's bt_engine_cache.
+pub fn cache_info() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    serde_json::json!({
+        "hits": crate::stat!("couchdb.bt_engine_cache.hits").get(),
+        "misses": crate::stat!("couchdb.bt_engine_cache.misses").get(),
+        "full": crate::stat!("couchdb.bt_engine_cache.full").get(),
+        "size": CACHE_SIZE.load(Relaxed).max(0),
+        "memory": CACHE_BYTES.load(Relaxed).max(0),
+    })
 }
 
 pub struct Btree<S: Spec> {
@@ -110,6 +145,7 @@ impl<S: Spec> Btree<S> {
             spec,
             cache: Arc::new(NodeCache {
                 map: Mutex::new(HashMap::new()),
+                bytes: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -121,17 +157,27 @@ impl<S: Spec> Btree<S> {
     }
 
     fn read_node(&self, pos: Pos) -> io::Result<Arc<NodeOf<S>>> {
+        use std::sync::atomic::Ordering::Relaxed;
         if let Some(n) = self.cache.map.lock().get(&pos) {
+            crate::stat!("couchdb.bt_engine_cache.hits").inc();
             return Ok(n.clone());
         }
-        let n: NodeOf<S> = self.file.read_term(pos)?;
+        let raw = self.file.read_raw(pos)?;
+        let n: NodeOf<S> = crate::file::decode_term(&raw)?;
         let n = Arc::new(n);
         if matches!(*n, Node::Kp(_)) {
+            crate::stat!("couchdb.bt_engine_cache.misses").inc();
             let mut m = self.cache.map.lock();
-            if m.len() > 4096 {
+            if m.len() > CACHE_MAX {
+                crate::stat!("couchdb.bt_engine_cache.full").inc();
+                self.cache.forget(m.len());
                 m.clear();
             }
-            m.insert(pos, n.clone());
+            if m.insert(pos, n.clone()).is_none() {
+                CACHE_SIZE.fetch_add(1, Relaxed);
+                CACHE_BYTES.fetch_add(raw.len() as i64, Relaxed);
+                self.cache.bytes.fetch_add(raw.len() as u64, Relaxed);
+            }
         }
         Ok(n)
     }

@@ -21,6 +21,7 @@ pub fn pbkdf2_hex(prf: &str, password: &[u8], salt: &[u8], iterations: u32) -> O
             out.to_vec()
         }};
     }
+    crate::stat!("couchdb.password_hashing_slow").inc();
     // CouchDB derives a key as long as the PRF's digest.
     let key = match prf {
         "sha" => derive!(sha1::Sha1, 20),
@@ -70,6 +71,7 @@ pub fn verify_admin(stored: &str, password: &str) -> bool {
     }
     let key = (stored.to_string(), sha2::Sha256::digest(password.as_bytes()).into());
     if VERIFIED.lock().as_ref().is_some_and(|s| s.contains(&key)) {
+        crate::stat!("couchdb.password_hashing_fast").inc();
         return true;
     }
     let ok = check_hashed(stored, password);

@@ -574,6 +574,8 @@ pub struct Index {
     compact_running: std::sync::atomic::AtomicBool,
     /// How the last bulk build ran, reported in _info.
     last_build: Mutex<Option<Value>>,
+    /// The database's name, for _active_tasks.
+    db_name: String,
 }
 
 fn fresh_state(file: &Arc<CouchFile>, def: &IndexDef) -> IndexState {
@@ -627,6 +629,7 @@ impl Index {
             updater_running: std::sync::atomic::AtomicBool::new(false),
             compact_running: std::sync::atomic::AtomicBool::new(false),
             last_build: Mutex::new(None),
+            db_name: db.name.clone(),
         })
     }
 
@@ -660,6 +663,7 @@ impl Index {
             ..Default::default()
         };
         let doc = snap.winner_json(fdi, &opts)?;
+        crate::stat!("couchdb.mrview.map_doc").inc();
         let js_rows = match &self.def.js {
             Some(f) if self.def.views.iter().any(|v| matches!(v.map, MapKind::Js(_))) => Some(f.map(&doc)?),
             _ => None,
@@ -700,6 +704,7 @@ impl Index {
                 }
             }
         }
+        crate::stat!("couchdb.mrview.emits").add(out.iter().map(|r| r.len() as i64).sum());
         Ok(out)
     }
 
@@ -719,10 +724,21 @@ impl Index {
             return Ok(st);
         }
         self.updater_running.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Docs changed since the index's seq: all of them, for a new index.
+        let total = if st.seq == 0 { snap.header.doc_count + snap.header.del_count } else { snap.pending_after(st.seq) };
+        let task = crate::tasks::add(json!({
+            "type": "indexer",
+            "database": self.db_name,
+            "design_document": self.def.ddoc_id,
+            "indexer_pid": crate::tasks::new_pid(),
+            "progress": 0,
+            "changes_done": 0,
+            "total_changes": total,
+        }));
         let res = (|| -> Result<IndexState> {
             let empty = st.seq == 0 && st.ids.root.is_none() && st.views.iter().all(|v| v.root.is_none());
             if empty && bulk_enabled() {
-                self.bulk_build(&snap, &mut st)?;
+                self.bulk_build(&snap, &mut st, &task)?;
                 self.commit(&st)?;
                 *self.state.write() = st.clone();
                 return Ok(st);
@@ -731,17 +747,22 @@ impl Index {
             let mut err = None;
             snap.fold_changes(st.seq, Dir::Fwd, |fdi| {
                 batch.push(fdi.clone());
-                if batch.len() >= view_batch_docs()
-                    && let Err(e) = self.apply_batch(&snap, &mut st, std::mem::take(&mut batch)) {
+                if batch.len() >= view_batch_docs() {
+                    let n = batch.len() as u64;
+                    if let Err(e) = self.apply_batch(&snap, &mut st, std::mem::take(&mut batch)) {
                         err = Some(e);
                         return Ok(false);
                     }
+                    task.add_changes(n);
+                }
                 Ok(true)
             })?;
             if let Some(e) = err {
                 return Err(e);
             }
+            let n = batch.len() as u64;
             self.apply_batch(&snap, &mut st, batch)?;
+            task.add_changes(n);
             st.seq = snap.update_seq();
             self.commit(&st)?;
             *self.state.write() = st.clone();
@@ -785,7 +806,7 @@ impl Index {
     /// external sorters, then build each B-tree bottom-up from the sorted
     /// stream. Each node is written once, contiguously, with no lookups of
     /// old keys (there are none) and no copy-on-write rewrites.
-    fn bulk_build(&self, snap: &Snapshot, st: &mut IndexState) -> Result<()> {
+    fn bulk_build(&self, snap: &Snapshot, st: &mut IndexState, task: &crate::tasks::TaskHandle) -> Result<()> {
         type Cmp<T> = SortCmp<T>;
         let budget = crate::extsort::budget_bytes();
         let scratch = |name: &str| self.path.with_extension(format!("{name}.sort"));
@@ -869,6 +890,7 @@ impl Index {
                 match got {
                     Ok(Ok(mapped)) => {
                         let t_work = Instant::now();
+                        task.add_changes(mapped.len() as u64);
                         if let Err(e) = feed_sorters(mapped, &mut view_sorters, &mut id_sorter) {
                             err = Some(e.into());
                             break;
@@ -886,6 +908,9 @@ impl Index {
                 if done && alive.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                     // Drain anything already sent, then finish.
                     while let Ok(r) = res_rx.try_recv() {
+                        if let Ok(m) = &r {
+                            task.add_changes(m.len() as u64);
+                        }
                         match r.and_then(|m| Ok(feed_sorters(m, &mut view_sorters, &mut id_sorter)?)) {
                             Ok(()) => {}
                             Err(e) => {
@@ -1027,18 +1052,42 @@ impl Index {
         let mut ns = fresh_state(&nf, &self.def);
         ns.seq = st.seq;
         ns.purge_seq = st.purge_seq;
+        // Every doc id entry and view row is copied once.
+        let total = st.ids.full_reduce().unwrap_or(0) + st.views.iter().map(|v| v.full_reduce().map(|r| r.count).unwrap_or(0)).sum::<u64>();
+        let task = crate::tasks::add(json!({
+            "type": "view_compaction",
+            "database": self.db_name,
+            "design_document": self.def.ddoc_id,
+            "progress": 0,
+            "changes_done": 0,
+            "total_changes": total,
+        }));
+        task.update(json!({"phase": "ids", "view": null}));
         let mut b = ns.ids.bulk_builder();
+        let mut n = 0u64;
         st.ids.fold(Dir::Fwd, &Range::default(), |k, v| {
             b.push(k.clone(), v.clone())?;
+            n += 1;
+            if n % 10_000 == 0 {
+                task.add_changes(10_000);
+            }
             Ok(true)
         })?;
+        task.add_changes(n % 10_000);
         ns.ids = b.finish()?;
         for (i, v) in st.views.iter().enumerate() {
+            task.update(json!({"phase": "view", "view": i}));
             let mut b = ns.views[i].bulk_builder();
+            let mut n = 0u64;
             v.fold(Dir::Fwd, &Range::default(), |k, val| {
                 b.push(k.clone(), val.clone())?;
+                n += 1;
+                if n % 10_000 == 0 {
+                    task.add_changes(10_000);
+                }
                 Ok(true)
             })?;
+            task.add_changes(n % 10_000);
             ns.views[i] = b.finish()?;
         }
         *self.file.write() = nf;
@@ -1145,6 +1194,7 @@ fn row_doc(snap: &Snapshot, id: &str, value: &Value, opts: &DocOpts) -> Result<V
             w
         }
     };
+    crate::db::count_reads(snap, 1);
     snap.doc_json(&fdi, &ri, opts)
 }
 
@@ -1401,6 +1451,7 @@ pub async fn http_view(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Re
         }
         _ => return not_allowed("GET,POST,HEAD"),
     }
+    crate::stat!("couchdb.httpd.view_reads").inc();
     ok_json(view_json(req, db, ddoc_id, view, &args)?)
 }
 

@@ -742,6 +742,7 @@ fn choose_index(snap: &Snapshot, q: &FindQuery) -> Result<(MangoIndex, Option<St
         if let Some(i) = found.iter().find(|i| usable(i, q, &required)) {
             return Ok(((*i).clone(), None));
         }
+        crate::stat!("mango.query_invalid_index").inc();
         let warn = format!("{ddoc} was not used because it does not contain a valid index for this query.");
         // Fall through to automatic selection with a warning.
         let (i, w) = auto_index(&all, q, &required)?;
@@ -1052,8 +1053,27 @@ fn run_find(req_server: &Req, db: &Arc<Db>, q: &FindQuery) -> Result<Value> {
             .unwrap_or_else(|| "nil".into()),
     };
     let mut out = json!({"docs": docs, "bookmark": bookmark});
-    if let Some(w) = warning {
-        out["warning"] = json!(w);
+    if idx.kind == "special" {
+        crate::stat!("mango.unindexed_queries").inc();
+    }
+    crate::stat!("mango.keys_examined").add(stats.keys as i64);
+    crate::stat!("mango.docs_examined").add(stats.docs as i64);
+    crate::stat!("mango.evaluate_selector").add(stats.docs as i64);
+    crate::stat!("mango.results_returned").add(stats.returned as i64);
+    crate::stat!("mango.query_time").observe(crate::stats::ms_since(t0));
+    crate::db::count_reads(&snap, stats.docs);
+    // Many docs examined per result: an index would serve better.
+    let ratio = if stats.returned == 0 { stats.docs as f64 } else { stats.docs as f64 / stats.returned as f64 };
+    let threshold = req_server.server.config.get_int("mango", "index_scan_warning_threshold", 10);
+    let scan_warning = if threshold > 0 && ratio > threshold as f64 {
+        crate::stat!("mango.too_many_docs_scanned").inc();
+        Some("The number of documents examined is high in proportion to the number of results returned. Consider adding a more specific index to improve this.")
+    } else {
+        None
+    };
+    let warnings: Vec<&str> = warning.as_deref().into_iter().chain(scan_warning).collect();
+    if !warnings.is_empty() {
+        out["warning"] = json!(warnings.join("\n"));
     }
     if q.execution_stats {
         out["execution_stats"] = json!({

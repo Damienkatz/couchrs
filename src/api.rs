@@ -126,7 +126,10 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
     match req.method {
         Method::GET | Method::HEAD => {
             let db = req.server.open_db(name)?;
-            ok_json(db.info())
+            let t = std::time::Instant::now();
+            let info = db.info();
+            crate::stat!("couchdb.dbinfo").observe(crate::stats::ms_since(t));
+            ok_json(info)
         }
         Method::PUT => {
             if req.q("q").map(|q| q != "1").unwrap_or(false) || req.q("n").map(|q| q != "1").unwrap_or(false) {
@@ -361,6 +364,7 @@ fn get_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     }
     // Inlined attachment bodies can be large; the doc alone is a point read.
     let mut v = if opts.attachments { blocking(|| snap.doc_json(&fdi, &rev, &opts))? } else { snap.doc_json(&fdi, &rev, &opts)? };
+    crate::db::count_reads(&snap, 1);
     if crate::auth::is_users_db(&req.server.config, &db.name) {
         v = crate::auth::after_users_doc_read(&req.server.config, &req.auth.user, &snap.security(), id, v)?;
     }
@@ -378,7 +382,10 @@ pub fn open_revs(
     let mut out = Vec::new();
     for r in resolve_open_revs(snap, id, spec, latest)? {
         match r {
-            Ok((fdi, ri)) => out.push(json!({"ok": snap.doc_json(&fdi, &ri, opts)?})),
+            Ok((fdi, ri)) => {
+                crate::db::count_reads(snap, 1);
+                out.push(json!({"ok": snap.doc_json(&fdi, &ri, opts)?}))
+            }
             Err(missing) => out.push(json!({"missing": missing})),
         }
     }
@@ -475,6 +482,7 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
             }
         };
         let doc = blocking(|| snap.doc_json(&fdi, &ri, &opts))?;
+        crate::db::count_reads(&snap, 1);
         let follows: Vec<String> = doc
             .get("_attachments")
             .and_then(|a| a.as_object())
@@ -1007,6 +1015,13 @@ async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[Str
     crate::doc::validate_partition(partition)?;
     let r: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
     match r.as_slice() {
+        ["_all_docs", ..] => crate::stat!("couchdb.httpd.partition_all_docs_requests").inc(),
+        ["_design", _, "_view", ..] => crate::stat!("couchdb.httpd.partition_view_requests").inc(),
+        ["_find", ..] => crate::stat!("couchdb.httpd.partition_find_requests").inc(),
+        ["_explain", ..] => crate::stat!("couchdb.httpd.partition_explain_requests").inc(),
+        _ => {}
+    }
+    match r.as_slice() {
         [] => match req.method {
             Method::GET | Method::HEAD => ok_json(db.snapshot().partition_info(partition)?),
             _ => not_allowed("GET,HEAD"),
@@ -1141,6 +1156,7 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
                         let mut row = json!({"id": id, "key": id, "value": {"rev": w.rev()}});
                         if args.include_docs {
                             row["doc"] = snap.doc_json(&fdi, &w, &opts)?;
+                            crate::db::count_reads(snap, 1);
                         }
                         rows.push(row);
                     }
@@ -1190,6 +1206,7 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
             let mut row = json!({"id": fdi.id, "key": fdi.id, "value": {"rev": w.rev()}});
             if args.include_docs {
                 row["doc"] = snap.doc_json(&fdi, &w, &opts)?;
+                crate::db::count_reads(snap, 1);
             }
             rows.push(row);
             Ok(rows.len() < limit)
@@ -1208,11 +1225,13 @@ async fn bulk_docs(req: &Req, db: &Arc<Db>) -> Result<Response> {
     if req.method != Method::POST {
         return not_allowed("POST");
     }
+    crate::stat!("couchdb.httpd.bulk_requests").inc();
     let body = req.json_obj_body()?;
     let docs = body
         .get("docs")
         .and_then(|d| d.as_array())
         .ok_or_else(|| CouchError::bad_request("POST body must include `docs` parameter."))?;
+    crate::stat!("couchdb.httpd.bulk_docs").observe(docs.len() as f64);
     let new_edits = body.get("new_edits").and_then(|v| v.as_bool()).unwrap_or(true);
     let mut parsed = Vec::with_capacity(docs.len());
     for d in docs {
@@ -1250,6 +1269,7 @@ async fn bulk_get(req: &Req, db: &Arc<Db>) -> Result<Response> {
     if req.method != Method::POST {
         return not_allowed("POST");
     }
+    crate::stat!("couchdb.httpd.bulk_requests").inc();
     let body = req.json_obj_body()?;
     let docs = body
         .get("docs")
@@ -1409,6 +1429,7 @@ async fn purge(req: &Req, db: &Arc<Db>) -> Result<Response> {
     if req.method != Method::POST {
         return not_allowed("POST");
     }
+    crate::stat!("couchdb.httpd.purge_requests").inc();
     let body = req.json_obj_body()?;
     let mut list = Vec::new();
     for (id, revs) in body {
@@ -1419,6 +1440,9 @@ async fn purge(req: &Req, db: &Arc<Db>) -> Result<Response> {
         }
         list.push((id, rs));
     }
+    let n = list.len() as i64;
+    crate::stat!("couchdb.document_purges.total").add(n);
     let r = db.purge(list).await?;
+    crate::stat!("couchdb.document_purges.success").add(n);
     Ok(json_response(StatusCode::CREATED, &r))
 }

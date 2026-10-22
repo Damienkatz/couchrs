@@ -41,6 +41,12 @@ pub struct Store {
     on_close: OnClose,
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        crate::stat!("couchdb.open_os_files").dec();
+    }
+}
+
 /// Runs a hook after the store's RocksDB instance has closed.
 struct OnClose(parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>);
 
@@ -64,6 +70,7 @@ impl Store {
         let descs: Vec<ColumnFamilyDescriptor> =
             cfs.iter().map(|(n, blob)| ColumnFamilyDescriptor::new(*n, cf_options(*blob))).collect();
         let db = Rdb::open_cf_descriptors(&opts, path, descs).map_err(rerr)?;
+        crate::stat!("couchdb.open_os_files").inc();
         Ok(Arc::new(Store { db, path: path.to_path_buf(), on_close: OnClose(parking_lot::Mutex::new(None)) }))
     }
 

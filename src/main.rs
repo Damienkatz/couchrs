@@ -19,6 +19,9 @@ pub mod passwords;
 pub mod rewrite;
 pub mod rstore;
 pub mod server;
+pub mod stats;
+pub mod system;
+pub mod tasks;
 pub mod views;
 
 use std::path::PathBuf;
@@ -36,11 +39,28 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
+/// Counts each message logged, by level (couch_log's stats).
+struct LogStats;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogStats {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let m = match *event.metadata().level() {
+            tracing::Level::ERROR => stat!("couch_log.level.error"),
+            tracing::Level::WARN => stat!("couch_log.level.warning"),
+            tracing::Level::INFO => stat!("couch_log.level.info"),
+            _ => stat!("couch_log.level.debug"),
+        };
+        m.inc();
+    }
+}
+
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with(tracing_subscriber::fmt::layer())
+        .with(LogStats)
         .init();
     let mut data_dir = std::env::var("COUCHDB_DATA_DIR").unwrap_or_else(|_| "./data".into());
     let mut bind = std::env::var("COUCHDB_BIND").ok();

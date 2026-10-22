@@ -1203,6 +1203,145 @@ def delete_and_recreate_while_in_use():
     eq(db in dbs, False)
 
 
+@test
+def stats_system_and_active_tasks():
+    n = "/_node/_local"
+    def stat(path):
+        return req("GET", f"{n}/_stats/{path}")[1]
+
+    # _stats: every metric is {value, type, desc}, nested by its path.
+    s, b, _ = req("GET", f"{n}/_stats")
+    eq(s, 200)
+    for group in ("couchdb", "couch_log", "couch_replicator", "mango", "fsync", "ddoc_cache"):
+        assert group in b, group
+    eq(stat("couchdb/httpd_request_methods/GET")["desc"], "number of HTTP GET requests")
+    eq(stat("couchdb/httpd/requests")["type"], "counter")
+    eq(stat("couchdb/query_server/process_count")["type"], "gauge")
+    eq(stat("couchdb/httpd_status_codes/404")["desc"], "number of HTTP 404 Not Found responses")
+    hist = stat("couchdb/request_time")
+    eq((hist["type"], hist["desc"]), ("histogram", "length of a request inside CouchDB without MochiWeb"))
+    eq(list(hist["value"].keys()), ["n", "min", "max", "arithmetic_mean", "geometric_mean", "harmonic_mean", "median",
+                                    "variance", "standard_deviation", "skewness", "kurtosis", "percentile", "histogram"])
+    eq([p[0] for p in hist["value"]["percentile"]], [50, 75, 90, 95, 99, 999])
+    eq(hist["value"]["histogram"], [[0, 0]])
+    eq(stat("couchdb/nope"), None)
+    assert isinstance(stat("couchdb/httpd/requests/value"), int)
+    eq(req("POST", f"{n}/_stats", {})[:2], (405, {"error": "method_not_allowed", "reason": "Only GET allowed"}))
+    eq(req("GET", "/_node/nonode/_stats")[:2], (404, {"error": "not_found", "reason": "no such node: nonode"}))
+    # Metrics need _admin or _metrics (anonymous users are admins in
+    # admin party).
+    if "_admin" not in req("GET", "/_session", headers=ANON)[1]["userCtx"]["roles"]:
+        metrics_only = {"error": "unauthorized", "reason": "You are not a server admin or read-only metrics user"}
+        for p in ("_stats", "_system", "_prometheus"):
+            eq(req("GET", f"{n}/{p}", headers=ANON)[:2], (401, metrics_only))
+
+    # Counters move with requests and documents.
+    db = new_db()
+    try:
+        before = {k: stat(k)["value"] for k in ("couchdb/httpd_request_methods/GET", "couchdb/httpd_status_codes/404",
+                                                 "couchdb/document_inserts", "couchdb/database_writes",
+                                                 "couchdb/database_reads", "couchdb/httpd/bulk_requests")}
+        eq(req("PUT", f"/{db}/a", {"v": 1})[0], 201)
+        eq(req("GET", f"/{db}/a")[0], 200)
+        eq(req("GET", f"/{db}/missing")[0], 404)
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": "b"}, {"_id": "c"}]})[0], 201)
+        after = {k: stat(k)["value"] for k in before}
+        assert after["couchdb/httpd_request_methods/GET"] >= before["couchdb/httpd_request_methods/GET"] + 2, (before, after)
+        assert after["couchdb/httpd_status_codes/404"] >= before["couchdb/httpd_status_codes/404"] + 1, (before, after)
+        assert after["couchdb/document_inserts"] >= before["couchdb/document_inserts"] + 3, (before, after)
+        assert after["couchdb/database_writes"] >= before["couchdb/database_writes"] + 2, (before, after)
+        assert after["couchdb/database_reads"] >= before["couchdb/database_reads"] + 1, (before, after)
+        assert after["couchdb/httpd/bulk_requests"] >= before["couchdb/httpd/bulk_requests"] + 1, (before, after)
+        assert stat("couchdb/request_time")["value"]["n"] > 0
+
+        # _system: the node's process figures.
+        s, b, _ = req("GET", f"{n}/_system")
+        eq(s, 200)
+        for k in ("uptime", "memory", "run_queue", "run_queue_dirty_cpu", "ets_table_count", "context_switches",
+                  "reductions", "garbage_collection_count", "words_reclaimed", "io_input", "io_output",
+                  "os_proc_count", "stale_proc_count", "process_count", "process_limit", "message_queues",
+                  "internal_replication_jobs", "distribution", "distribution_events"):
+            assert k in b, k
+        eq(sorted(b["memory"]), sorted(["other", "atom", "atom_used", "processes", "processes_used", "binary", "code", "ets"]))
+        assert b["io_input"] > 0 and b["io_output"] > 0, b
+        assert isinstance(b["message_queues"]["couch_file"], dict), b["message_queues"]
+        eq(req("POST", f"{n}/_system", {})[0], 405)
+
+        # _prometheus: the same metrics as text.
+        s, text, h = req("GET", f"{n}/_prometheus", raw=True)
+        eq((s, h["Content-Type"]), (200, "text/plain; version=2.0"))
+        text = text.decode()
+        for line in ("# TYPE couchdb_httpd_requests_total counter", "# TYPE couchdb_request_time_seconds summary",
+                     "# HELP couchdb_httpd_status_codes number of HTTP responses by status code",
+                     "# TYPE couchdb_open_databases gauge", "# TYPE couchdb_uptime_seconds counter",
+                     "# HELP couchdb_auth_cache_requests_total number of authentication cache requests"):
+            assert line in text.split("\n"), line
+        assert 'couchdb_httpd_request_methods{method="GET"} ' in text
+        assert 'couchdb_httpd_status_codes{code="200"} ' in text
+        assert 'couchdb_request_time_seconds{quantile="0.5"} ' in text
+        assert 'couchdb_couch_log_requests_total{level="alert"} ' in text
+        assert 'couchdb_rexi_streams_timeout_total{stage="init_stream"} 0' in text
+
+        s, b, _ = req("GET", f"{n}/_versions")
+        eq((s, sorted(b["javascript_engine"]), "name" in b["collation_driver"]), (200, ["name"], True))
+
+        # _active_tasks: an index build in progress.
+        eq(req("POST", "/_active_tasks", {})[:2], (405, {"error": "method_not_allowed", "reason": "Only GET,HEAD allowed"}))
+        for i in range(0, 30000, 5000):
+            eq(req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": f"d{j:06d}", "n": j} for j in range(i, i + 5000)]})[0], 201)
+        eq(req("PUT", f"/{db}/_design/slow", {"views": {"v": {
+            "map": "function(d){ var s = 0; for (var i = 0; i < 20000; i++) { s += i; } emit(d.n, s); }"}}})[0], 201)
+        t = threading.Thread(target=lambda: req("GET", f"/{db}/_design/slow/_view/v?limit=1"))
+        t.start()
+        seen = None
+        deadline = time.time() + 60
+        while time.time() < deadline and t.is_alive():
+            tasks = [x for x in req("GET", "/_active_tasks")[1] if x.get("type") == "indexer" and db in x.get("database", "")]
+            if tasks:
+                seen = tasks[0]
+                break
+            time.sleep(0.01)
+        t.join()
+        assert seen, "no indexer task seen"
+        eq(list(seen)[:3], ["node", "pid", "process_status"])
+        eq(list(seen)[3:], sorted(list(seen)[3:]))
+        eq(sorted(seen), sorted(["node", "pid", "process_status", "changes_done", "database", "design_document",
+                                 "indexer_pid", "progress", "started_on", "total_changes", "type", "updated_on"]))
+        eq((seen["design_document"], seen["total_changes"] >= 30003), ("_design/slow", True))
+        assert 0 <= seen["progress"] <= 100 and seen["started_on"] <= seen["updated_on"], seen
+        assert seen["pid"].startswith("<0.") and seen["indexer_pid"].startswith("<0."), seen
+        for _ in range(100):
+            if not [x for x in req("GET", "/_active_tasks")[1] if db in x.get("database", "")]:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("indexer task still listed after the build")
+    finally:
+        req("DELETE", f"/{db}")
+
+    # Unknown _paths: creating one is a bad name, anything else 404s.
+    eq(req("GET", "/_nosuch")[:2], (404, {"error": "not_found", "reason": "Database does not exist."}))
+    eq(req("PUT", "/_nosuch")[0:2], (400, {"error": "illegal_database_name",
+        "reason": "Name: '_nosuch'. Only lowercase characters (a-z), digits (0-9), and any of the characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."}))
+
+    # _restart runs the server again in place (couchdb-rs only here, to
+    # leave a shared CouchDB alone).
+    if req("GET", "/")[1].get("vendor", {}).get("name") == "couchdb-rs":
+        up = req("GET", f"{n}/_system")[1]["uptime"]
+        time.sleep(1.1)
+        eq(req("GET", f"{n}/_restart")[:2], (405, {"error": "method_not_allowed", "reason": "Only POST allowed"}))
+        eq(req("POST", f"{n}/_restart", {})[:2], (200, {"ok": True}))
+        time.sleep(0.5)
+        for _ in range(100):
+            try:
+                if req("GET", "/_up")[0] == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        assert req("GET", f"{n}/_system")[1]["uptime"] <= up, "uptime did not restart"
+
+
 def main():
     failed = 0
     for t in TESTS:

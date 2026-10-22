@@ -511,6 +511,28 @@ pub struct Db {
     next_ptr: AtomicU64,
     /// Per-database extension state (view indexes), keyed by signature.
     pub ext: Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
+    /// Messages waiting for the writer.
+    queued: Arc<AtomicU64>,
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        crate::stat!("couchdb.open_databases").dec();
+    }
+}
+
+/// Whether a database is one CouchDB keeps out of its read and write
+/// counts (couch_server's sys_db option): users and replicator databases.
+pub fn is_system_db(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    matches!(base, "_users" | "_replicator") || name == "_global_changes"
+}
+
+/// Count `n` documents read on a client's behalf (database_reads).
+pub fn count_reads(snap: &Snapshot, n: u64) {
+    if n > 0 && !is_system_db(&snap.name) {
+        crate::stat!("couchdb.database_reads").add(n as i64);
+    }
 }
 
 /// Highest big-endian id in a column family, plus one.
@@ -609,6 +631,7 @@ impl Db {
         let snap = Snapshot { name: name.to_string(), header, props: props.clone(), view };
         let (tx, rx) = mpsc::channel();
         let (seq_tx, _) = watch::channel(snap.header.update_seq);
+        let queued = Arc::new(AtomicU64::new(0));
         let db = Arc::new(Db {
             name: name.to_string(),
             path: path.to_path_buf(),
@@ -621,11 +644,13 @@ impl Db {
             compacting: AtomicBool::new(false),
             next_ptr: AtomicU64::new(next_ptr),
             ext: Mutex::new(HashMap::new()),
+            queued: queued.clone(),
         });
+        crate::stat!("couchdb.open_databases").inc();
         let weak = Arc::downgrade(&db);
         std::thread::Builder::new()
             .name(format!("db-writer:{name}"))
-            .spawn(move || writer_loop(weak, rx))
+            .spawn(move || writer_loop(weak, rx, queued))
             .map_err(|e| CouchError::internal(e.to_string()))?;
         Ok(db)
     }
@@ -643,13 +668,28 @@ impl Db {
     }
 
     fn send(&self, m: Msg) -> Result<()> {
-        self.tx.lock().send(m).map_err(|_| CouchError::internal("database writer stopped"))
+        self.queued.fetch_add(1, AtomicOrdering::Relaxed);
+        self.tx.lock().send(m).map_err(|_| {
+            self.queued.fetch_sub(1, AtomicOrdering::Relaxed);
+            CouchError::internal("database writer stopped")
+        })
+    }
+
+    /// Messages waiting for the writer.
+    pub fn queue_len(&self) -> u64 {
+        self.queued.load(AtomicOrdering::Relaxed)
     }
 
     pub async fn update_docs(&self, docs: Vec<Doc>, new_edits: bool) -> Result<Vec<UpdateResult>> {
+        if !is_system_db(&self.name) {
+            crate::stat!("couchdb.database_writes").inc();
+        }
         let (reply, rx) = oneshot::channel();
         self.send(Msg::Update { docs, new_edits, reply })?;
-        rx.await.map_err(|_| CouchError::internal("update failed"))
+        let t = std::time::Instant::now();
+        let r = rx.await.map_err(|_| CouchError::internal("update failed"));
+        crate::stat!("couchdb.collect_results_time").observe(crate::stats::ms_since(t));
+        r
     }
 
     pub async fn update_doc(&self, doc: Doc) -> Result<String> {
@@ -731,7 +771,22 @@ impl Db {
         let mut live_bodies: Vec<u64> = Vec::new();
         let mut live_chunks: Vec<u64> = Vec::new();
         let mut with_old: Vec<String> = Vec::new();
+        // Phases: document_copy walks every doc (as CouchDB's copy does)
+        // marking what is live, then sweep and store_compaction reclaim.
+        let task = crate::tasks::add(json!({
+            "type": "database_compaction",
+            "database": self.name,
+            "phase": "document_copy",
+            "progress": 0,
+            "changes_done": 0,
+            "total_changes": snap.header.doc_count + snap.header.del_count,
+        }));
+        let mut n = 0u64;
         snap.fold_docs(Dir::Fwd, &Range::default(), |fdi| {
+            n += 1;
+            if n % 1000 == 0 {
+                task.add_changes(1000);
+            }
             let mut has_old = false;
             keytree::map_vals(&fdi.tree, &mut |_, _, v, is_leaf| {
                 if let RevVal::Avail(l) = v {
@@ -754,9 +809,11 @@ impl Db {
             }
             Ok(true)
         })?;
+        task.add_changes(n % 1000);
         live_bodies.sort_unstable();
         live_chunks.sort_unstable();
         live_chunks.dedup();
+        task.update(json!({"phase": "sweep", "progress": 0, "changes_done": 0, "total_changes": 0}));
 
         let (reply, rx) = oneshot::channel();
         self.send(Msg::DropOldBodies { ids: with_old, since: snap.update_seq(), limit, reply })?;
@@ -764,11 +821,13 @@ impl Db {
 
         sweep(&self.store, CF_BODY, &live_bodies, limit)?;
         sweep(&self.store, CF_ATT, &live_chunks, limit)?;
+        task.update(json!({"phase": "store_compaction", "total_changes": CFS.len()}));
 
         let mut co = rocksdb::CompactOptions::default();
         co.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
         for (cf, _) in CFS {
             self.store.db.compact_range_cf_opt(&self.store.cf(cf), None::<&[u8]>, None::<&[u8]>, &co);
+            task.add_changes(1);
         }
         Ok(())
     }
@@ -823,7 +882,7 @@ fn sweep(store: &Store, cf: &str, live: &[u64], limit: u64) -> Result<()> {
     Ok(())
 }
 
-fn writer_loop(weak: Weak<Db>, rx: mpsc::Receiver<Msg>) {
+fn writer_loop(weak: Weak<Db>, rx: mpsc::Receiver<Msg>, queued: Arc<AtomicU64>) {
     while let Ok(first) = rx.recv() {
         let Some(db) = weak.upgrade() else { return };
         let mut pending = vec![first];
@@ -833,6 +892,7 @@ fn writer_loop(weak: Weak<Db>, rx: mpsc::Receiver<Msg>) {
                 break;
             }
         }
+        queued.fetch_sub(pending.len() as u64, AtomicOrdering::Relaxed);
         let mut updates = Vec::new();
         for m in pending {
             match m {
@@ -853,7 +913,12 @@ fn commit(db: &Db, mut batch: WriteBatch, header: Header) -> Result<()> {
     batch.put_cf(&db.store.cf(CF_META), HEADER_KEY, enc(&header));
     let mut wo = WriteOptions::default();
     wo.set_sync(true);
+    // A synced write is RocksDB's fsync of its log.
+    let t = std::time::Instant::now();
     db.store.db.write_opt(batch, &wo).map_err(rerr)?;
+    crate::stat!("fsync.time").observe(crate::stats::ms_since(t));
+    crate::stat!("fsync.count").inc();
+    crate::stat!("couchdb.commits").inc();
     let seq = header.update_seq;
     let props = db.state.read().props.clone();
     *db.state.write() = Snapshot { name: db.name.clone(), header, props, view: View::new(db.store.clone()) };
@@ -925,10 +990,23 @@ fn flush_updates(db: &Db, batch: UpdateBatch) {
     if batch.is_empty() {
         return;
     }
+    // Requests after the first were coalesced into this commit.
+    for (_, new_edits, _) in batch.iter().skip(1) {
+        if *new_edits {
+            crate::stat!("couchdb.coalesced_updates.interactive").inc();
+        } else {
+            crate::stat!("couchdb.coalesced_updates.replicated").inc();
+        }
+    }
     let snap = db.snapshot();
     match apply_updates(db, &snap, &batch) {
-        Ok((wb, header, results)) => {
+        Ok((wb, header, results, counts)) => {
             let ok = commit(db, wb, header);
+            if ok.is_ok() {
+                crate::stat!("couchdb.document_inserts").add(counts.inserts as i64);
+                crate::stat!("couchdb.document_writes").add(counts.writes as i64);
+                crate::stat!("couchdb.local_document_writes").add(counts.local_writes as i64);
+            }
             for ((_, _, reply), res) in batch.into_iter().zip(results) {
                 let res = match &ok {
                     Ok(()) => res,
@@ -967,7 +1045,17 @@ struct Writes<'a> {
     pending_bodies: HashMap<u64, DiskBody>,
 }
 
-fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<(WriteBatch, Header, Vec<Vec<UpdateResult>>)> {
+/// Documents an update batch wrote: new ones, all, and local ones.
+#[derive(Default)]
+struct WriteCounts {
+    inserts: u64,
+    writes: u64,
+    local_writes: u64,
+}
+
+type Applied = (WriteBatch, Header, Vec<Vec<UpdateResult>>, WriteCounts);
+
+fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<Applied> {
     let mut w = Writes { db, batch: WriteBatch::default(), pending_bodies: HashMap::new() };
     let mut fdis: HashMap<String, Option<FullDocInfo>> = HashMap::new();
     let mut originals: HashMap<String, Option<FullDocInfo>> = HashMap::new();
@@ -1018,7 +1106,9 @@ fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<(Write
 
     let mut header = snap.header.clone();
     let mut seq = header.update_seq;
+    let mut counts = WriteCounts { local_writes: local_changed.len() as u64, ..Default::default() };
     for id in changed {
+        counts.writes += 1;
         let mut fdi = fdis.remove(&id).unwrap().unwrap();
         seq += 1;
         fdi.update_seq = seq;
@@ -1028,8 +1118,9 @@ fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<(Write
         });
         fdi.deleted = fdi.winner().deleted;
         let old = originals.get(&id).cloned().flatten();
-        if let Some(o) = &old {
-            w.batch.delete_cf(&db.store.cf(CF_SEQ), be(o.update_seq));
+        match &old {
+            Some(o) => w.batch.delete_cf(&db.store.cf(CF_SEQ), be(o.update_seq)),
+            None => counts.inserts += 1,
         }
         count_doc(&mut header, old.as_ref(), -1);
         count_doc(&mut header, Some(&fdi), 1);
@@ -1043,7 +1134,7 @@ fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<(Write
         }
     }
     header.update_seq = seq;
-    Ok((w.batch, header, results))
+    Ok((w.batch, header, results, counts))
 }
 
 fn update_local(slot: &mut Option<LocalDoc>, doc: &Doc) -> UpdateResult {

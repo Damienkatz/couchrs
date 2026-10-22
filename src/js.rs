@@ -324,6 +324,29 @@ thread_local! {
     static ENGINES: RefCell<HashMap<u64, Rc<Engine>>> = RefCell::new(HashMap::new());
 }
 
+impl Drop for Engine {
+    fn drop(&mut self) {
+        crate::stat!("couchdb.query_server.process_exits").inc();
+        crate::stat!("couchdb.query_server.process_count").adjust(-1);
+    }
+}
+
+/// One call of a kind, and the microseconds it took (bump_time_stat/2).
+fn bump_time_stat(kind: &str, t: Instant) {
+    let us = t.elapsed().as_micros() as i64;
+    let (calls, time) = match kind {
+        "spawn_proc" => (crate::stat!("couchdb.query_server.calls.spawn_proc"), crate::stat!("couchdb.query_server.time.spawn_proc")),
+        "map" => (crate::stat!("couchdb.query_server.calls.map"), crate::stat!("couchdb.query_server.time.map")),
+        "reduce" => (crate::stat!("couchdb.query_server.calls.reduce"), crate::stat!("couchdb.query_server.time.reduce")),
+        "ddoc_vdu" => (crate::stat!("couchdb.query_server.calls.ddoc_vdu"), crate::stat!("couchdb.query_server.time.ddoc_vdu")),
+        "ddoc_filter" => (crate::stat!("couchdb.query_server.calls.ddoc_filter"), crate::stat!("couchdb.query_server.time.ddoc_filter")),
+        "ddoc_other" => (crate::stat!("couchdb.query_server.calls.ddoc_other"), crate::stat!("couchdb.query_server.time.ddoc_other")),
+        _ => (crate::stat!("couchdb.query_server.calls.other"), crate::stat!("couchdb.query_server.time.other")),
+    };
+    calls.inc();
+    time.add(us);
+}
+
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn js_err(ctx: &rquickjs::Ctx, e: rquickjs::Error) -> CouchError {
@@ -370,9 +393,11 @@ impl JsFuns {
     }
 
     fn engine(&self) -> Result<Rc<Engine>> {
+        crate::stat!("couchdb.query_server.acquired_processes").inc();
         if let Some(e) = ENGINES.with(|m| m.borrow().get(&self.key).cloned()) {
             return Ok(e);
         }
+        let t = Instant::now();
         let rt = Runtime::new().map_err(|e| CouchError::internal(e.to_string()))?;
         rt.set_memory_limit(512 << 20);
         let deadline: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
@@ -392,6 +417,9 @@ impl JsFuns {
             ctx,
             deadline,
         });
+        crate::stat!("couchdb.query_server.process_starts").inc();
+        crate::stat!("couchdb.query_server.process_count").adjust(1);
+        bump_time_stat("spawn_proc", t);
         ENGINES.with(|m| {
             let mut m = m.borrow_mut();
             if m.len() > 64 {
@@ -404,6 +432,27 @@ impl JsFuns {
 
     /// Call a prelude entry point that returns a JSON string.
     fn call(&self, name: &str, args: CallArgs) -> Result<Value> {
+        let t = Instant::now();
+        let r = self.call_inner(name, args);
+        crate::stat!("couchdb.query_server.process_prompts").inc();
+        if r.is_err() {
+            crate::stat!("couchdb.query_server.process_errors").inc();
+        }
+        bump_time_stat(
+            match name {
+                "__map" => "map",
+                "__reduce" => "reduce",
+                "__validate" => "ddoc_vdu",
+                "__filter" => "ddoc_filter",
+                "__show" | "__list" | "__update" | "__rewrite" => "ddoc_other",
+                _ => "other",
+            },
+            t,
+        );
+        r
+    }
+
+    fn call_inner(&self, name: &str, args: CallArgs) -> Result<Value> {
         let eng = self.engine()?;
         eng.deadline.set(Some(Instant::now() + TIMEOUT));
         let out = eng.ctx.with(|c| -> Result<String> {
@@ -650,6 +699,7 @@ pub fn validate_docs(
             None => Value::Null,
         };
         let new = doc_to_vdu_json(d);
+        let t = Instant::now();
         for fi in 0..n {
             let r = funs.validate(fi, &new, &old, &user_ctx, &sec)?;
             if r.get("ok").is_some() {
@@ -670,9 +720,11 @@ pub fn validate_docs(
                     r.get("reason").and_then(|e| e.as_str()).unwrap_or("").to_string(),
                 )
             };
+            crate::stat!("couchdb.query_server.vdu_rejects").inc();
             out[i] = Some(err);
             break;
         }
+        crate::stat!("couchdb.query_server.vdu_process_time").observe(crate::stats::ms_since(t));
     }
     Ok(out)
 }
@@ -811,7 +863,10 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
             let id = if docid.is_empty() { None } else { Some(docid.join("/")) };
             let doc = match &id {
                 Some(i) => match snap.get_fdi(i)? {
-                    Some(f) if !f.deleted => snap.winner_json(&f, &DocOpts::default())?,
+                    Some(f) if !f.deleted => {
+                        crate::db::count_reads(&snap, 1);
+                        snap.winner_json(&f, &DocOpts::default())?
+                    }
                     _ => Value::Null,
                 },
                 None => Value::Null,
@@ -826,7 +881,10 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
             let id = if docid.is_empty() { None } else { Some(docid.join("/")) };
             let doc = match &id {
                 Some(i) => match snap.get_fdi(i)? {
-                    Some(f) if !f.deleted => snap.winner_json(&f, &DocOpts::default())?,
+                    Some(f) if !f.deleted => {
+                        crate::db::count_reads(&snap, 1);
+                        snap.winner_json(&f, &DocOpts::default())?
+                    }
                     _ => Value::Null,
                 },
                 None => Value::Null,

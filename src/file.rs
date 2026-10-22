@@ -56,6 +56,12 @@ fn add_prefixes(pos: u64, data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+impl Drop for CouchFile {
+    fn drop(&mut self) {
+        crate::stat!("couchdb.open_os_files").dec();
+    }
+}
+
 impl CouchFile {
     pub fn open(path: &Path, create: bool) -> io::Result<CouchFile> {
         let file = OpenOptions::new()
@@ -66,6 +72,7 @@ impl CouchFile {
             .open(path)?;
         let eof = file.metadata()?.len();
         static NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        crate::stat!("couchdb.open_os_files").inc();
         Ok(CouchFile {
             generation: NEXT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             path: path.to_path_buf(),
@@ -219,6 +226,14 @@ impl CouchFile {
     }
 
     pub fn sync(&self) -> io::Result<()> {
+        let t = std::time::Instant::now();
+        let r = self.sync_inner();
+        crate::stat!("fsync.time").observe(crate::stats::ms_since(t));
+        crate::stat!("fsync.count").inc();
+        r
+    }
+
+    fn sync_inner(&self) -> io::Result<()> {
         if FULL_FSYNC.load(std::sync::atomic::Ordering::Relaxed) {
             // On macOS this is F_FULLFSYNC, which also flushes the drive cache.
             return self.file.sync_data();

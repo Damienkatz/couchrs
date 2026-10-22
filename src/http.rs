@@ -130,6 +130,32 @@ fn decode(seg: &str) -> String {
 }
 
 pub async fn handle(State(server): State<Arc<Server>>, req: Request) -> Response {
+    let t0 = std::time::Instant::now();
+    count_method(req.method());
+    let resp = handle_req(server, req).await;
+    if let Some(m) = crate::stats::find(&format!("couchdb.httpd_status_codes.{}", resp.status().as_u16())) {
+        m.inc();
+    }
+    crate::stat!("couchdb.request_time").observe(crate::stats::ms_since(t0));
+    crate::stat!("couchdb.httpd.requests").inc();
+    resp
+}
+
+fn count_method(m: &Method) {
+    let stat = match *m {
+        Method::GET => crate::stat!("couchdb.httpd_request_methods.GET"),
+        Method::PUT => crate::stat!("couchdb.httpd_request_methods.PUT"),
+        Method::POST => crate::stat!("couchdb.httpd_request_methods.POST"),
+        Method::DELETE => crate::stat!("couchdb.httpd_request_methods.DELETE"),
+        Method::HEAD => crate::stat!("couchdb.httpd_request_methods.HEAD"),
+        Method::OPTIONS => crate::stat!("couchdb.httpd_request_methods.OPTIONS"),
+        _ if m.as_str() == "COPY" => crate::stat!("couchdb.httpd_request_methods.COPY"),
+        _ => return,
+    };
+    stat.inc();
+}
+
+async fn handle_req(server: Arc<Server>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let raw_path = parts.uri.path().to_string();
     let path: Vec<String> = raw_path
@@ -230,12 +256,15 @@ async fn route(req: Req) -> Result<Response> {
         Some("_up") => ok_json(json!({"status": "ok", "seeds": {}})),
         Some("_session") => session(&req),
         Some("_utils") => crate::fauxton::serve(&req),
-        Some("_active_tasks") => {
-            if !req.auth.user.is_server_admin() {
-                return Err(CouchError::unauthorized("You are not a server admin."));
+        Some("_active_tasks") => match req.method {
+            Method::GET | Method::HEAD => {
+                if !req.auth.user.is_server_admin() {
+                    return Err(CouchError::unauthorized("You are not a server admin."));
+                }
+                ok_json(json!(crate::tasks::all()))
             }
-            ok_json(json!([]))
-        }
+            _ => not_allowed("GET,HEAD"),
+        },
         Some("_membership") => ok_json(json!({
             "all_nodes": ["couchdb@127.0.0.1"], "cluster_nodes": ["couchdb@127.0.0.1"]
         })),
@@ -257,12 +286,17 @@ async fn route(req: Req) -> Result<Response> {
             )),
         },
         Some("favicon.ico") => Err(CouchError::not_found("missing")),
+        // Creating one is a bad name; anything else finds no database.
         Some(s) if s.starts_with('_') && !matches!(s, "_users" | "_replicator" | "_global_changes") => {
-            Err(CouchError::new(
-                StatusCode::BAD_REQUEST,
-                "illegal_database_name",
-                format!("Name: '{s}'. Only lowercase characters (a-z), digits (0-9), and any of the characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."),
-            ))
+            if req.method == Method::PUT && req.path.len() == 1 {
+                Err(CouchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_database_name",
+                    format!("Name: '{s}'. Only lowercase characters (a-z), digits (0-9), and any of the characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."),
+                ))
+            } else {
+                Err(CouchError::not_found("Database does not exist."))
+            }
         }
         Some(_) => crate::api::db_request(req).await,
     }
@@ -424,13 +458,52 @@ fn node(req: &Req) -> Result<Response> {
         return Err(CouchError::not_found(format!("no such node: {name}")));
     }
     let rest: Vec<&str> = req.path.iter().skip(2).map(|s| s.as_str()).collect();
+    let get = matches!(req.method, Method::GET | Method::HEAD);
     match rest.as_slice() {
         [] => ok_json(json!({"name": NODE_NAME})),
         ["_config", ..] => node_config(req, &rest[1..]),
-        ["_stats", ..] => ok_json(json!({})),
-        ["_system"] => ok_json(json!({"uptime": 0})),
+        ["_stats", path @ ..] if get => ok_json(crate::stats::extract_path(crate::stats::fetch_json(), path)),
+        ["_system"] if get => ok_json(crate::system::system_json(&req.server)),
+        ["_prometheus"] if get => Ok(prometheus_response(&req.server)),
+        ["_versions"] if get => ok_json(crate::system::versions()),
+        ["_stats", ..] | ["_system"] | ["_prometheus"] | ["_versions"] => not_allowed("GET"),
+        ["_restart"] if req.method == Method::POST => {
+            restart();
+            ok_json(json!({"ok": true}))
+        }
+        ["_restart"] => not_allowed("POST"),
         _ => Err(CouchError::not_found("missing")),
     }
+}
+
+fn prometheus_response(server: &Server) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; version=2.0")
+        .body(Body::from(crate::system::prometheus(server)))
+        .unwrap()
+}
+
+/// Restart in place, as init:restart does: once the reply is out, run
+/// this binary again with the same arguments, in this process. Writes
+/// are durable when acknowledged, so nothing acknowledged is lost.
+fn restart() {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        tracing::info!("restarting");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec();
+                    tracing::error!("restart failed: {err}");
+                }
+                Err(e) => tracing::error!("restart failed: {e}"),
+            }
+        }
+        std::process::exit(1);
+    });
 }
 
 /// The _config API: the whole config, a section, or one value, which can
@@ -496,15 +569,39 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
                 .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
                 .expose_headers([header::ETAG, header::CONTENT_TYPE]),
         );
-    let addr = server.config.get_or("chttpd", "bind_address", "127.0.0.1");
-    let port = server.config.get_or("chttpd", "port", "5984");
-    let bind = if addr.contains(':') { format!("[{addr}]:{port}") } else { format!("{addr}:{port}") };
+    let bind = bind_addr(&server, "chttpd", "5984");
     if let Err(e) = server.ensure_system_dbs().await {
         tracing::error!("could not set up system databases: {}", e.reason);
     }
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("couchdb-rs listening on http://{bind}");
-    axum::serve(listener, app).await
+    crate::system::mark_start();
+    if server.config.get_bool("prometheus", "additional_port", false) {
+        let pbind = bind_addr(&server, "prometheus", "17986");
+        let l = tokio::net::TcpListener::bind(&pbind).await?;
+        tracing::info!("prometheus metrics on http://{pbind}/_node/_local/_prometheus");
+        let papp = axum::Router::new().fallback(prometheus_port).with_state(server.clone());
+        tokio::spawn(async move { axum::serve(crate::system::CountingListener(l), papp).await });
+    }
+    axum::serve(crate::system::CountingListener(listener), app).await
+}
+
+/// A section's bind_address and port as a socket address (IPv6 bracketed).
+fn bind_addr(server: &Server, section: &str, default_port: &str) -> String {
+    let addr = server.config.get_or(section, "bind_address", "127.0.0.1");
+    let port = server.config.get_or(section, "port", default_port);
+    if addr.contains(':') { format!("[{addr}]:{port}") } else { format!("{addr}:{port}") }
+}
+
+/// The [prometheus] additional_port: /_node/{node}/_prometheus without
+/// authentication, and nothing else (couch_prometheus_http).
+async fn prometheus_port(State(server): State<Arc<Server>>, req: Request) -> Response {
+    let parts: Vec<&str> = req.uri().path().split('/').filter(|s| !s.is_empty()).collect();
+    match parts.as_slice() {
+        ["_node", node, "_prometheus"] if *node == "_local" || *node == NODE_NAME => prometheus_response(&server),
+        ["_node", node, "_prometheus"] => CouchError::not_found(format!("no such node: {node}")).into_response(),
+        _ => json_response(StatusCode::NOT_FOUND, &json!({"error": "not_found", "reason": ""})),
+    }
 }
 
 pub fn empty(status: StatusCode) -> Response {

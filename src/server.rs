@@ -21,6 +21,7 @@ pub struct Server {
 impl Server {
     pub fn new(data_dir: PathBuf, config: Arc<Config>) -> Result<Arc<Server>> {
         std::fs::create_dir_all(&data_dir)?;
+        crate::stats::init(config.clone());
         let uuid = prepare_config(&data_dir, &config)?;
         let (tx, _) = tokio::sync::broadcast::channel(256);
         Ok(Arc::new(Server {
@@ -78,7 +79,9 @@ impl Server {
         if !is_valid_db_name(name) {
             return Err(CouchError::not_found("Database does not exist."));
         }
+        let t = std::time::Instant::now();
         let db = Db::open(&self.db_path(name), name, false)?;
+        crate::stat!("couchdb.db_open_time").observe(crate::stats::ms_since(t));
         dbs.insert(name.to_string(), db.clone());
         Ok(db)
     }
@@ -96,6 +99,11 @@ impl Server {
         let _ = std::fs::remove_dir_all(self.index_dir(name));
         let _ = self.db_events.send((name.to_string(), "deleted"));
         Ok(())
+    }
+
+    /// Each open database's writer queue length.
+    pub fn writer_queues(&self) -> Vec<u64> {
+        self.dbs.lock().values().map(|d| d.queue_len()).collect()
     }
 
     pub fn all_dbs(&self) -> Vec<String> {

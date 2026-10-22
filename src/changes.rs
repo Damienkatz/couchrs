@@ -189,6 +189,7 @@ fn change_row(snap: &Snapshot, fdi: &FullDocInfo, args: &ChangesArgs) -> Result<
     }
     if args.include_docs {
         row["doc"] = snap.doc_json(fdi, &leafs[0], &args.doc_opts)?;
+        crate::db::count_reads(snap, 1);
     }
     Ok(row)
 }
@@ -227,6 +228,23 @@ fn pending(snap: &Snapshot, last: u64) -> u64 {
     snap.pending_after(last)
 }
 
+/// A client waiting on a longpoll, continuous or eventsource feed, counted
+/// while it is (clients_requesting_changes).
+struct FeedClient;
+
+impl FeedClient {
+    fn new() -> FeedClient {
+        crate::stat!("couchdb.httpd.clients_requesting_changes").inc();
+        FeedClient
+    }
+}
+
+impl Drop for FeedClient {
+    fn drop(&mut self) {
+        crate::stat!("couchdb.httpd.clients_requesting_changes").dec();
+    }
+}
+
 pub async fn changes(req: Req, db: Arc<Db>) -> Result<Response> {
     if req.method != Method::GET && req.method != Method::POST && req.method != Method::HEAD {
         return not_allowed("GET,POST,HEAD");
@@ -250,6 +268,7 @@ pub async fn changes(req: Req, db: Arc<Db>) -> Result<Response> {
             ))
         }
         "longpoll" => {
+            let _client = FeedClient::new();
             let mut rx = db.subscribe();
             let deadline = tokio::time::Instant::now() + Duration::from_millis(args.timeout);
             loop {
@@ -277,7 +296,7 @@ pub async fn changes(req: Req, db: Arc<Db>) -> Result<Response> {
         }
         _ => {
             let eventsource = args.feed == "eventsource";
-            let stream = continuous_stream(db, args, eventsource);
+            let stream = continuous_stream(db, args, eventsource, FeedClient::new());
             let ct = if eventsource { "text/event-stream" } else { "application/json" };
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -293,8 +312,10 @@ fn continuous_stream(
     db: Arc<Db>,
     mut args: ChangesArgs,
     eventsource: bool,
+    client: FeedClient,
 ) -> impl futures::Stream<Item = std::result::Result<Bytes, Infallible>> {
     async_stream::stream! {
+        let _client = client;
         let mut rx = db.subscribe();
         let mut since = args.since;
         let mut remaining = args.limit;
