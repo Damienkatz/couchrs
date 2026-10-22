@@ -16,6 +16,7 @@ use crate::http::{Req, json_response, not_allowed, ok_json};
 use crate::js::JsFuns;
 use crate::extsort::Sorter;
 use crate::mango::Selector;
+use crate::server::Server;
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use base64::Engine;
@@ -769,6 +770,9 @@ impl Index {
             Ok(st)
         })();
         self.updater_running.store(false, std::sync::atomic::Ordering::Relaxed);
+        if res.is_ok() {
+            crate::db::notify(&self.db_name, crate::db::DbEvent::IndexCommit(self.def.ddoc_id.clone()));
+        }
         res
     }
 
@@ -1112,7 +1116,11 @@ pub fn get_index(db: &Arc<Db>, ddoc: &Value, index_dir: PathBuf) -> Result<Arc<I
 }
 
 pub fn index_dir(req: &Req, db: &Db) -> PathBuf {
-    req.server.index_dir(&db.name).join("mrview")
+    index_dir_of(&req.server, &db.name)
+}
+
+pub fn index_dir_of(server: &Server, db_name: &str) -> PathBuf {
+    server.index_dir(db_name).join("mrview")
 }
 
 // ------------------------------------------------------------- querying
@@ -1511,8 +1519,12 @@ pub fn http_view_cleanup(req: &Req, db: &Arc<Db>) -> Result<Response> {
     if req.method != Method::POST {
         return not_allowed("POST");
     }
-    let snap = db.snapshot();
-    let mut live = std::collections::HashSet::new();
+    cleanup_index_files(&req.server, db)?;
+    Ok(json_response(StatusCode::ACCEPTED, &json!({"ok": true})))
+}
+
+/// The ids of a database's live design docs.
+pub fn design_doc_ids(snap: &Snapshot) -> Result<Vec<String>> {
     let range = Range {
         start: Some("_design/".to_string()),
         end: Some("_design0".to_string()),
@@ -1525,13 +1537,20 @@ pub fn http_view_cleanup(req: &Req, db: &Arc<Db>) -> Result<Response> {
         }
         Ok(true)
     })?;
-    for id in ddocs {
+    Ok(ddocs)
+}
+
+/// Remove index files no design doc uses any more.
+pub fn cleanup_index_files(server: &Server, db: &Arc<Db>) -> Result<()> {
+    let snap = db.snapshot();
+    let mut live = std::collections::HashSet::new();
+    for id in design_doc_ids(&snap)? {
         if let Ok(d) = crate::changes::load_ddoc(&snap, &id)
             && let Ok(def) = IndexDef::from_ddoc(&d, snap.partitioned()) {
                 live.insert(def.sig);
             }
     }
-    let dir = index_dir(req, db);
+    let dir = index_dir_of(server, &db.name);
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
@@ -1542,7 +1561,7 @@ pub fn http_view_cleanup(req: &Req, db: &Arc<Db>) -> Result<Response> {
                 }
         }
     }
-    Ok(json_response(StatusCode::ACCEPTED, &json!({"ok": true})))
+    Ok(())
 }
 
 /// Indexes keyed by ddoc id, used by mango to list and pick indexes.

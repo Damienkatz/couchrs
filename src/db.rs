@@ -426,6 +426,8 @@ enum Msg {
     /// Compaction: forget bodies of non-leaf revisions (ptr < limit) for
     /// these docs and any doc changed after `since`.
     DropOldBodies { ids: Vec<String>, since: u64, limit: u64, reply: oneshot::Sender<Result<()>> },
+    /// Publish a new snapshot of the same state.
+    Refresh(oneshot::Sender<()>),
 }
 
 // ------------------------------------------------------ directory layout
@@ -513,12 +515,39 @@ pub struct Db {
     pub ext: Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
     /// Messages waiting for the writer.
     queued: Arc<AtomicU64>,
+    /// The update seq the last compaction (since opening) started from.
+    compacted_seq: AtomicU64,
 }
 
 impl Drop for Db {
     fn drop(&mut self) {
         crate::stat!("couchdb.open_databases").dec();
     }
+}
+
+/// What happened to a database (couch_event's events).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DbEvent {
+    Created,
+    Deleted,
+    /// Documents changed.
+    Updated,
+    /// _local documents changed.
+    LocalUpdated,
+    /// A design document changed.
+    DdocUpdated,
+    /// A view index committed, by design doc id.
+    IndexCommit(String),
+}
+
+/// Every database's events, for whoever listens (_db_updates, smoosh, ken).
+pub fn events() -> &'static tokio::sync::broadcast::Sender<(String, DbEvent)> {
+    static EVENTS: std::sync::OnceLock<tokio::sync::broadcast::Sender<(String, DbEvent)>> = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| tokio::sync::broadcast::channel(4096).0)
+}
+
+pub fn notify(db: &str, ev: DbEvent) {
+    let _ = events().send((db.to_string(), ev));
 }
 
 /// Whether a database is one CouchDB keeps out of its read and write
@@ -645,6 +674,7 @@ impl Db {
             next_ptr: AtomicU64::new(next_ptr),
             ext: Mutex::new(HashMap::new()),
             queued: queued.clone(),
+            compacted_seq: AtomicU64::new(u64::MAX),
         });
         crate::stat!("couchdb.open_databases").inc();
         let weak = Arc::downgrade(&db);
@@ -751,12 +781,36 @@ impl Db {
         }
         let db = self.clone();
         std::thread::spawn(move || {
-            if let Err(e) = db.compact_blocking() {
+            if let Err(e) = db.run_compaction() {
                 tracing::error!("compaction of {} failed: {}", db.name, e.reason);
             }
-            db.compacting.store(false, AtomicOrdering::SeqCst);
         });
         Ok(())
+    }
+
+    /// Compact now, on this thread; if a compaction is already running,
+    /// wait for it instead.
+    pub fn compact_and_wait(&self) -> Result<()> {
+        if self.compacting.swap(true, AtomicOrdering::SeqCst) {
+            while self.is_compacting() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            return Ok(());
+        }
+        self.run_compaction()
+    }
+
+    /// Compact, with `compacting` already claimed; releases it.
+    fn run_compaction(&self) -> Result<()> {
+        self.compacted_seq.store(self.snapshot().update_seq(), AtomicOrdering::Relaxed);
+        let r = self.compact_blocking();
+        self.compacting.store(false, AtomicOrdering::SeqCst);
+        r
+    }
+
+    /// The update seq the last compaction started from, if any.
+    pub fn compacted_seq(&self) -> Option<u64> {
+        Some(self.compacted_seq.load(AtomicOrdering::Relaxed)).filter(|&s| s != u64::MAX)
     }
 
     /// Compaction for the RocksDB engine:
@@ -821,6 +875,12 @@ impl Db {
 
         sweep(&self.store, CF_BODY, &live_bodies, limit)?;
         sweep(&self.store, CF_ATT, &live_chunks, limit)?;
+        // RocksDB keeps what any snapshot older than the sweep can see,
+        // so let go of ours and have readers move to a new one first.
+        drop(snap);
+        let (reply, rx) = oneshot::channel();
+        self.send(Msg::Refresh(reply))?;
+        rx.blocking_recv().map_err(|_| CouchError::internal("compaction failed"))?;
         task.update(json!({"phase": "store_compaction", "total_changes": CFS.len()}));
 
         let mut co = rocksdb::CompactOptions::default();
@@ -948,6 +1008,10 @@ fn handle_other(db: &Db, m: Msg) {
         Msg::DropOldBodies { ids, since, limit, reply } => {
             let _ = reply.send(drop_old_bodies(db, snap, ids, since, limit));
         }
+        Msg::Refresh(reply) => {
+            *db.state.write() = Snapshot { view: View::new(db.store.clone()), ..snap };
+            let _ = reply.send(());
+        }
     }
 }
 
@@ -1006,6 +1070,15 @@ fn flush_updates(db: &Db, batch: UpdateBatch) {
                 crate::stat!("couchdb.document_inserts").add(counts.inserts as i64);
                 crate::stat!("couchdb.document_writes").add(counts.writes as i64);
                 crate::stat!("couchdb.local_document_writes").add(counts.local_writes as i64);
+                if counts.writes > 0 {
+                    notify(&db.name, DbEvent::Updated);
+                }
+                if counts.ddocs > 0 {
+                    notify(&db.name, DbEvent::DdocUpdated);
+                }
+                if counts.local_writes > 0 {
+                    notify(&db.name, DbEvent::LocalUpdated);
+                }
             }
             for ((_, _, reply), res) in batch.into_iter().zip(results) {
                 let res = match &ok {
@@ -1045,11 +1118,13 @@ struct Writes<'a> {
     pending_bodies: HashMap<u64, DiskBody>,
 }
 
-/// Documents an update batch wrote: new ones, all, and local ones.
+/// Documents an update batch wrote: new ones, all, design docs, and
+/// local ones.
 #[derive(Default)]
 struct WriteCounts {
     inserts: u64,
     writes: u64,
+    ddocs: u64,
     local_writes: u64,
 }
 
@@ -1109,6 +1184,9 @@ fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<Applie
     let mut counts = WriteCounts { local_writes: local_changed.len() as u64, ..Default::default() };
     for id in changed {
         counts.writes += 1;
+        if id.starts_with("_design/") {
+            counts.ddocs += 1;
+        }
         let mut fdi = fdis.remove(&id).unwrap().unwrap();
         seq += 1;
         fdi.update_seq = seq;

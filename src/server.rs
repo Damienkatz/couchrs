@@ -14,8 +14,6 @@ pub struct Server {
     pub config: Arc<Config>,
     pub uuid: String,
     dbs: Mutex<HashMap<String, Arc<Db>>>,
-    /// Bumped whenever databases are created or deleted.
-    pub db_events: tokio::sync::broadcast::Sender<(String, &'static str)>,
 }
 
 impl Server {
@@ -23,13 +21,11 @@ impl Server {
         std::fs::create_dir_all(&data_dir)?;
         crate::stats::init(config.clone());
         let uuid = prepare_config(&data_dir, &config)?;
-        let (tx, _) = tokio::sync::broadcast::channel(256);
         Ok(Arc::new(Server {
             data_dir,
             config,
             uuid,
             dbs: Mutex::new(HashMap::new()),
-            db_events: tx,
         }))
     }
 
@@ -67,7 +63,7 @@ impl Server {
         }
         let db = Db::create(&path, name, &crate::auth::default_security(&self.config), props)?;
         dbs.insert(name.to_string(), db.clone());
-        let _ = self.db_events.send((name.to_string(), "created"));
+        crate::db::notify(name, crate::db::DbEvent::Created);
         Ok(db)
     }
 
@@ -97,7 +93,7 @@ impl Server {
         };
         db.delete_files();
         let _ = std::fs::remove_dir_all(self.index_dir(name));
-        let _ = self.db_events.send((name.to_string(), "deleted"));
+        crate::db::notify(name, crate::db::DbEvent::Deleted);
         Ok(())
     }
 

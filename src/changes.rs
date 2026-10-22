@@ -391,23 +391,33 @@ fn continuous_stream(
 pub async fn db_updates(req: Req) -> Result<Response> {
     let feed = req.q("feed").unwrap_or("normal").to_string();
     let timeout = Duration::from_millis(req.q_u64("timeout")?.unwrap_or(60_000));
-    let mut rx = req.server.db_events.subscribe();
+    let mut rx = crate::db::events().subscribe();
+    // Database creations and deletions.
+    async fn next(rx: &mut tokio::sync::broadcast::Receiver<(String, crate::db::DbEvent)>) -> Option<(String, &'static str)> {
+        loop {
+            match rx.recv().await {
+                Ok((db, crate::db::DbEvent::Created)) => return Some((db, "created")),
+                Ok((db, crate::db::DbEvent::Deleted)) => return Some((db, "deleted")),
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
     if feed == "normal" {
         return Ok(json_response(StatusCode::OK, &json!({"results": [], "last_seq": "0"})));
     }
     if feed == "longpoll" {
-        let r = tokio::time::timeout(timeout, rx.recv()).await;
+        let r = tokio::time::timeout(timeout, next(&mut rx)).await;
         let results = match r {
-            Ok(Ok((db, kind))) => vec![json!({"db_name": db, "type": kind, "seq": "0"})],
+            Ok(Some((db, kind))) => vec![json!({"db_name": db, "type": kind, "seq": "0"})],
             _ => vec![],
         };
         return Ok(json_response(StatusCode::OK, &json!({"results": results, "last_seq": "0"})));
     }
     let stream = async_stream::stream! {
         loop {
-            match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Ok((db, kind))) => yield Ok::<_, Infallible>(Bytes::from(format!("{}\n", json!({"db_name": db, "type": kind, "seq": "0"})))),
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            match tokio::time::timeout(timeout, next(&mut rx)).await {
+                Ok(Some((db, kind))) => yield Ok::<_, Infallible>(Bytes::from(format!("{}\n", json!({"db_name": db, "type": kind, "seq": "0"})))),
                 _ => break,
             }
         }

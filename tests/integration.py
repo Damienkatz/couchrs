@@ -1342,6 +1342,83 @@ def stats_system_and_active_tasks():
         assert req("GET", f"{n}/_system")[1]["uptime"] <= up, "uptime did not restart"
 
 
+@test
+def background_indexing_and_auto_compaction():
+    import os
+    n = "/_node/_local"
+    # smoosh's channels, as _smoosh/status reports them.
+    s, b, _ = req("GET", f"{n}/_smoosh/status")
+    eq(s, 200)
+    for ch in ("index_cleanup", "ratio_dbs", "ratio_views", "slack_dbs", "slack_views", "upgrade_dbs", "upgrade_views"):
+        c = b["channels"][ch]
+        eq((sorted(c), sorted(c["waiting"])), (["active", "starting", "waiting"], ["max", "min", "size"]), ch)
+    eq(req("POST", f"{n}/_smoosh/status", {})[:2], (405, {"error": "method_not_allowed", "reason": "Only GET allowed"}))
+
+    db = new_db()
+    try:
+        def db_seq():
+            return int(str(req("GET", f"/{db}")[1]["update_seq"]).split("-")[0])
+
+        def index_seq(ddoc):
+            return req("GET", f"/{db}/_design/{ddoc}/_info")[1]["view_index"]["update_seq"]
+
+        # ken: views are built in the background, without a query, unless
+        # the design doc turns that off.
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": f"d{i:05d}", "n": i, "pad": os.urandom(1000).hex()}
+                                                       for i in range(1500)]})[0], 201)
+        eq(req("PUT", f"/{db}/_design/auto", {"views": {"v": {"map": "function(d){ emit(d.n, null); }"}}})[0], 201)
+        eq(req("PUT", f"/{db}/_design/manual", {"autoupdate": False,
+                                                "views": {"v": {"map": "function(d){ emit(d._id, 1); }"}}})[0], 201)
+        deadline = time.time() + 60
+        while time.time() < deadline and index_seq("auto") < 1501:
+            time.sleep(0.2)
+        assert index_seq("auto") >= 1501, (index_seq("auto"), db_seq())
+        eq(index_seq("manual"), 0)
+
+        # smoosh: a database mostly old revisions is compacted by itself,
+        # here by a channel of the test's own. Channels are asked in name
+        # order, so it goes first, and only databases that change while it
+        # exists can reach it. It starts compacting after smoosh's wait.
+        c, np = "/_node/_local/_config", {"X-Couch-Persist": "false"}
+        eq(req("PUT", f"{c}/smoosh.parity_dbs/priority", "ratio", headers=np)[0], 200)
+        eq(req("PUT", f"{c}/smoosh.parity_dbs/concurrency", "1", headers=np)[0], 200)
+        old_channels = req("GET", f"{c}/smoosh/db_channels")
+        eq(req("PUT", f"{c}/smoosh/db_channels", "parity_dbs", headers=np)[0], 200)
+        try:
+            _auto_compaction(db)
+        finally:
+            if old_channels[0] == 200:
+                req("PUT", f"{c}/smoosh/db_channels", old_channels[1], headers=np)
+            else:
+                req("DELETE", f"{c}/smoosh/db_channels", headers=np)
+            for k in ("priority", "concurrency"):
+                req("DELETE", f"{c}/smoosh.parity_dbs/{k}", headers=np)
+        s, b, _ = req("GET", f"{n}/_smoosh/status")
+        assert "parity_dbs" not in b["channels"], b
+    finally:
+        req("DELETE", f"/{db}")
+
+
+def _auto_compaction(db):
+    import os
+    for k in range(3):
+        rows = req("GET", f"/{db}/_all_docs?include_docs=true&startkey=%22d%22&endkey=%22e%22")[1]["rows"]
+        docs = [dict(r["doc"], k=k, pad=os.urandom(1000).hex()) for r in rows]
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": docs})[0], 201)
+    before = req("GET", f"/{db}")[1]["sizes"]
+    assert before["file"] > 2 * before["active"], before
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        sizes = req("GET", f"/{db}")[1]["sizes"]
+        if sizes["file"] < before["file"] / 2:
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError(f"not compacted: {before} -> {sizes}")
+    eq(len(req("GET", f"/{db}/_all_docs?include_docs=true&limit=5")[1]["rows"]), 5)
+    eq(req("GET", f"/{db}/d00007")[1]["k"], 2)
+
+
 def main():
     failed = 0
     for t in TESTS:

@@ -245,6 +245,7 @@ pub fn system_prom(server: &Server) -> Vec<String> {
         to_prom("ioq_interactive_requests", "gauge", "IOQ interactive queue requests", plain(0)),
         to_prom("ioq_background_requests", "gauge", "IOQ background queue requests", plain(0)),
         to_prom("ioq_total_requests", "gauge", "IOQ total active requests", plain(0)),
+        crate::smoosh::prometheus(),
     ]
     .concat()
 }

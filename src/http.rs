@@ -466,7 +466,8 @@ fn node(req: &Req) -> Result<Response> {
         ["_system"] if get => ok_json(crate::system::system_json(&req.server)),
         ["_prometheus"] if get => Ok(prometheus_response(&req.server)),
         ["_versions"] if get => ok_json(crate::system::versions()),
-        ["_stats", ..] | ["_system"] | ["_prometheus"] | ["_versions"] => not_allowed("GET"),
+        ["_smoosh", "status"] if get => ok_json(crate::smoosh::status()),
+        ["_stats", ..] | ["_system"] | ["_prometheus"] | ["_versions"] | ["_smoosh", "status"] => not_allowed("GET"),
         ["_restart"] if req.method == Method::POST => {
             restart();
             ok_json(json!({"ok": true}))
@@ -573,6 +574,8 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
     if let Err(e) = server.ensure_system_dbs().await {
         tracing::error!("could not set up system databases: {}", e.reason);
     }
+    crate::smoosh::start(&server);
+    crate::ken::start(&server);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("couchdb-rs listening on http://{bind}");
     crate::system::mark_start();
