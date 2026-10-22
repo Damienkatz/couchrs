@@ -27,11 +27,16 @@ pub struct TaskHandle(Arc<Task>);
 
 /// Register a task with these properties (an object).
 pub fn add(props: Value) -> TaskHandle {
+    add_with_pid(props, new_pid())
+}
+
+/// Register a task under a given pid (a job's, say).
+pub fn add_with_pid(props: Value, pid: String) -> TaskHandle {
     let now = json!(crate::http::now_secs());
     let mut map: BTreeMap<String, Value> = props.as_object().cloned().unwrap_or_default().into_iter().collect();
     map.insert("started_on".into(), now.clone());
     map.insert("updated_on".into(), now);
-    let task = Arc::new(Task { pid: new_pid(), props: Mutex::new(map) });
+    let task = Arc::new(Task { pid, props: Mutex::new(map) });
     TASKS.lock().push(task.clone());
     TaskHandle(task)
 }

@@ -200,10 +200,10 @@ pub fn cookie_header(config: &Config, value: &str, secure: bool) -> String {
     s
 }
 
-/// RFC 1123 date, as cookies' Expires wants it.
-fn httpdate(secs: u64) -> String {
+/// UTC calendar fields: (year, month, day, hour, minute, second, weekday
+/// name).
+pub fn civil(secs: u64) -> (i64, usize, i64, u64, u64, u64, &'static str) {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let days = secs / 86400;
     let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -216,16 +216,27 @@ fn httpdate(secs: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + if mo <= 2 { 1 } else { 0 };
-    format!(
-        "{}, {:02}-{}-{} {:02}:{:02}:{:02} GMT",
-        DAYS[(days % 7) as usize],
-        d,
-        MONTHS[(mo - 1) as usize],
-        y,
-        h,
-        m,
-        s
-    )
+    (y, mo as usize, d, h, m, s, DAYS[(days % 7) as usize])
+}
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// RFC 1123 date, as cookies' Expires wants it.
+fn httpdate(secs: u64) -> String {
+    let (y, mo, d, h, m, s, wd) = civil(secs);
+    format!("{wd}, {d:02}-{}-{y} {h:02}:{m:02}:{s:02} GMT", MONTHS[mo - 1])
+}
+
+/// RFC 1123 date as httpd_util:rfc1123_date/1 writes it.
+pub fn rfc1123(secs: u64) -> String {
+    let (y, mo, d, h, m, s, wd) = civil(secs);
+    format!("{wd}, {d:02} {} {y} {h:02}:{m:02}:{s:02} GMT", MONTHS[mo - 1])
+}
+
+/// ISO 8601 UTC, to the second (couch_replicator_utils:iso8601/1).
+pub fn iso8601(secs: u64) -> String {
+    let (y, mo, d, h, m, s, _) = civil(secs);
+    format!("{y}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

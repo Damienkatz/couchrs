@@ -407,6 +407,11 @@ pub fn from_json(v: Value) -> Result<Doc> {
             "_attachments" => doc.atts = parse_atts(&v)?,
             // Accepted on input and ignored, like CouchDB.
             "_revs_info" | "_conflicts" | "_deleted_conflicts" | "_local_seq" => {}
+            // Kept in the body: replication docs' state, and per-doc access.
+            "_replication_state" | "_replication_state_time" | "_replication_state_reason" | "_replication_id"
+            | "_replication_stats" | "_access" => {
+                doc.body.insert(k, v);
+            }
             other => {
                 return Err(CouchError::doc_validation(format!(
                     "Bad special document member: {other}"
@@ -535,25 +540,39 @@ pub struct DocOpts {
     pub follows: bool,
 }
 
-pub fn att_stub_json(a: &AttInfo, opts: &DocOpts, data: Option<Vec<u8>>) -> Value {
+/// How an attachment appears in a doc's JSON.
+pub enum AttBody {
+    Stub,
+    /// Its bytes follow in a multipart part.
+    Follows,
+    Data(Vec<u8>),
+}
+
+/// An attachment's JSON, in couch_att:to_json/4's order: inline data
+/// carries no length.
+pub fn att_json(a: &AttInfo, opts: &DocOpts, body: AttBody) -> Value {
     let mut m = Map::new();
     m.insert("content_type".into(), json!(a.content_type));
     m.insert("revpos".into(), json!(a.revpos));
     m.insert("digest".into(), json!(a.digest()));
-    m.insert("length".into(), json!(a.length));
+    match body {
+        AttBody::Stub => {
+            m.insert("length".into(), json!(a.length));
+            m.insert("stub".into(), json!(true));
+        }
+        AttBody::Follows => {
+            m.insert("length".into(), json!(a.length));
+            m.insert("follows".into(), json!(true));
+        }
+        AttBody::Data(d) => {
+            m.insert("data".into(), json!(B64.encode(d)));
+        }
+    }
     if opts.att_encoding_info
         && let Some(e) = &a.encoding {
             m.insert("encoding".into(), json!(e));
             m.insert("encoded_length".into(), json!(a.encoded_length));
         }
-    match data {
-        Some(d) => {
-            m.insert("data".into(), json!(B64.encode(d)));
-        }
-        None => {
-            m.insert("stub".into(), json!(true));
-        }
-    }
     Value::Object(m)
 }
 

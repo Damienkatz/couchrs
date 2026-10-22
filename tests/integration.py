@@ -2,10 +2,12 @@
 """End-to-end checks of CouchDB API behaviour against a running server.
 
 usage: python3 tests/integration.py [http://127.0.0.1:5984]
-Stdlib only. Each test uses a fresh database.
+Stdlib only. Each test uses a fresh database. COUCHDB_CREDS=user:pass
+sends those credentials with every request (for a server with admins).
 """
 import base64
 import json
+import os
 import sys
 import threading
 import time
@@ -16,11 +18,22 @@ import urllib.request
 import uuid
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:5984"
+CREDS = os.environ.get("COUCHDB_CREDS")
+
+
+def db_url(name):
+    """A database's URL, with the credentials in it, for replications."""
+    if not CREDS:
+        return f"{BASE}/{name}"
+    scheme, rest = BASE.split("://", 1)
+    return f"{scheme}://{CREDS}@{rest}/{name}"
 
 
 def req(method, path, body=None, headers=None, raw=False):
     data = None
     hdrs = {"Accept": "application/json"}
+    if CREDS:
+        hdrs["Authorization"] = "Basic " + base64.b64encode(CREDS.encode()).decode()
     if headers:
         hdrs.update(headers)
     if body is not None:
@@ -1417,6 +1430,178 @@ def _auto_compaction(db):
         raise AssertionError(f"not compacted: {before} -> {sizes}")
     eq(len(req("GET", f"/{db}/_all_docs?include_docs=true&limit=5")[1]["rows"]), 5)
     eq(req("GET", f"/{db}/d00007")[1]["k"], 2)
+
+
+def _wait(fn, secs=90, step=0.25):
+    """fn() until it returns something true, or None after secs."""
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        v = fn()
+        if v:
+            return v
+        time.sleep(step)
+    return None
+
+
+def _rep_fixture(src):
+    """Docs replication must carry: plain, attachments, a deletion, a
+    conflict, a design doc, a history, and a _local doc it must not."""
+    eq(req("POST", f"/{src}/_bulk_docs", {"docs": [{"_id": f"d{i:02d}", "n": i} for i in range(20)]})[0], 201)
+    blob = bytes(range(256)) * 200
+    eq(req("PUT", f"/{src}/att", {"_attachments": {
+        "b.bin": {"content_type": "application/octet-stream", "data": base64.b64encode(blob).decode()},
+        "t.txt": {"content_type": "text/plain", "data": base64.b64encode(b"hi").decode()}}})[0], 201)
+    rev = req("PUT", f"/{src}/gone", {"a": 1})[1]["rev"]
+    eq(req("DELETE", f"/{src}/gone?rev={rev}")[0], 200)
+    eq(req("POST", f"/{src}/_bulk_docs", {"new_edits": False, "docs": [
+        {"_id": "conf", "_rev": "2-aaa", "_revisions": {"start": 2, "ids": ["aaa", "root"]}, "v": "a"},
+        {"_id": "conf", "_rev": "2-bbb", "_revisions": {"start": 2, "ids": ["bbb", "root"]}, "v": "b"}]})[0], 201)
+    eq(req("PUT", f"/{src}/_design/f", {"filters": {"even": "function(doc, req) { return doc.n % 2 == 0; }"}})[0], 201)
+    rev = req("PUT", f"/{src}/upd", {"v": 1})[1]["rev"]
+    eq(req("PUT", f"/{src}/upd", {"v": 2, "_rev": rev})[0], 201)
+    eq(req("PUT", f"/{src}/_local/l", {"x": 1})[0], 201)
+
+
+def _db_state(db):
+    """Every doc with its history, conflicts and attachments, and the
+    deleted ids."""
+    out = {}
+    for row in req("GET", f"/{db}/_all_docs")[1]["rows"]:
+        doc_id = urllib.parse.quote(row["id"], safe="/")
+        out[row["id"]] = req("GET", f"/{db}/{doc_id}?revs=true&conflicts=true&attachments=true")[1]
+    deleted = sorted(r["id"] for r in req("GET", f"/{db}/_changes?style=all_docs")[1]["results"] if r.get("deleted"))
+    return out, deleted
+
+
+@test
+def replication():
+    src, tgt, cont = new_db(), "r" + uuid.uuid4().hex[:12], "r" + uuid.uuid4().hex[:12]
+    try:
+        _rep_fixture(src)
+        # One-shot, local names: everything arrives, checkpointed.
+        s, b, _ = req("POST", "/_replicate", {"source": src, "target": tgt, "create_target": True})
+        eq((s, b["ok"], b["replication_id_version"]), (200, True, 4), b)
+        h = b["history"][0]
+        eq((h["docs_written"], h["doc_write_failures"], h["missing_found"]), (26, 0, 26), h)
+        assert b["session_id"] == h["session_id"] and b["source_last_seq"] == h["recorded_seq"], b
+        eq(_db_state(tgt), _db_state(src))
+        eq(req("GET", f"/{tgt}/_local/l")[0], 404)
+        # Again: nothing new, the same checkpoint.
+        s, b2, _ = req("POST", "/_replicate", {"source": src, "target": tgt})
+        eq((s, b2["no_changes"], b2["session_id"]), (200, True, b["session_id"]))
+        # Filtered, doc_ids and selector replications.
+        def replicated(extra):
+            t = "r" + uuid.uuid4().hex[:12]
+            try:
+                s, b, _ = req("POST", "/_replicate", dict({"source": src, "target": t, "create_target": True}, **extra))
+                eq(s, 200, b)
+                return [r["id"] for r in req("GET", f"/{t}/_all_docs")[1]["rows"]]
+            finally:
+                req("DELETE", f"/{t}")
+        eq(replicated({"filter": "f/even"}), [f"d{i:02d}" for i in range(0, 20, 2)])
+        eq(replicated({"doc_ids": ["d03", "att"]}), ["att", "d03"])
+        eq(replicated({"selector": {"n": {"$gte": 18}}}), ["d18", "d19"])
+
+        # Continuous: a job, a task, and new changes follow.
+        s, b, _ = req("POST", "/_replicate", {"source": src, "target": cont, "create_target": True, "continuous": True})
+        eq(s, 202, b)
+        rep_id = b["_local_id"]
+        assert b["ok"] is True and rep_id.endswith("+continuous+create_target"), b
+        job = _wait(lambda: [j for j in req("GET", "/_scheduler/jobs")[1]["jobs"] if j["id"] == rep_id])
+        assert job, "no job"
+        eq(sorted(job[0]), sorted(["database", "id", "pid", "source", "target", "user", "doc_id", "info", "history", "node", "start_time"]))
+        eq((job[0]["database"], job[0]["doc_id"], job[0]["source"].endswith(f"/{src}/")), (None, None, True))
+        eq(req("GET", f"/_scheduler/jobs/{rep_id}")[1]["id"], rep_id)
+        eq(req("PUT", f"/{src}/late", {"x": 1})[0], 201)
+        assert _wait(lambda: req("GET", f"/{cont}/late")[0] == 200), "continuous replication missed a change"
+        task = _wait(lambda: [t for t in req("GET", "/_active_tasks")[1] if t.get("replication_id") == rep_id])
+        assert task, "no replication task"
+        for k in ("continuous", "docs_written", "source_seq", "through_seq", "checkpointed_source_seq", "changes_pending",
+                  "revisions_checked", "missing_revisions_found", "docs_read", "doc_write_failures", "checkpoint_interval"):
+            assert k in task[0], (k, task[0])
+        eq((task[0]["type"], task[0]["continuous"]), ("replication", True))
+        eq(req("POST", "/_replicate", {"replication_id": rep_id, "cancel": True})[:2], (200, {"ok": True, "_local_id": rep_id}))
+        eq(req("POST", "/_replicate", {"replication_id": rep_id, "cancel": True})[:2], (404, {"error": "not_found", "reason": "missing"}))
+
+        # Errors.
+        missing = "r" + uuid.uuid4().hex[:12]
+        s, b, _ = req("POST", "/_replicate", {"source": src, "target": missing})
+        assert s == 500 and b["error"] == "db_not_found" and b["reason"].startswith("could not open http") \
+            and b["reason"].endswith(f"/{missing}/"), (s, b)
+        eq(req("POST", "/_replicate", {})[:2], (500, {"error": "error", "reason": "Missing replicator database"}))
+        eq(req("POST", "/_replicate", {"source": src, "target": tgt, "continuous": "yes"})[:2],
+           (400, {"error": "bad_request", "reason": "parameter `continuous` must be a boolean"}))
+        eq(req("POST", "/_replicate", {"source": src, "target": tgt, "doc_ids": ["a"], "filter": "f/even"})[:2],
+           (400, {"error": "bad_request", "reason": "`doc_ids`,`filter`,`selector` are mutually exclusive"}))
+        eq(req("POST", "/_replicate", {"source": src, "target": tgt, "filter": "nofilter"})[:2],
+           (500, {"error": "error", "reason": "Invalid filter. Must match `ddocname/filtername`."}))
+        s, b, _ = req("POST", "/_replicate", {"source": src, "target": tgt, "filter": "nope/f"})
+        assert s == 404 and b["error"] == "not_found" and b["reason"].startswith("Couldn't open document `_design/nope` from source database `http"), (s, b)
+        eq(req("GET", "/_replicate")[:2], (400, {"error": "bad_request", "reason": "Missing request body"}))
+        eq(req("POST", "/_replicate", b"{}", headers={"Content-Type": "text/plain"})[:2],
+           (415, {"error": "bad_content_type", "reason": "Content-Type must be application/json"}))
+        eq(req("GET", "/_scheduler/jobs/nope")[:2], (404, {"error": "not_found", "reason": "missing"}))
+        eq(req("GET", "/_scheduler/nope")[:2], (404, {"error": "not found"}))
+        eq(req("POST", "/_scheduler/jobs", {})[:2], (405, {"error": "method_not_allowed", "reason": "Only GET,HEAD allowed"}))
+        eq(req("GET", "/_scheduler/jobs?limit=x")[:2], (400, {"error": "query_parse_error", "reason": "limit must be an integer"}))
+    finally:
+        for d in (src, tgt, cont):
+            req("DELETE", f"/{d}")
+
+
+@test
+def replicator_database():
+    src, tgt, cont = new_db(), "r" + uuid.uuid4().hex[:12], "r" + uuid.uuid4().hex[:12]
+    one, run = "one_" + uuid.uuid4().hex[:8], "run_" + uuid.uuid4().hex[:8]
+    try:
+        eq(req("POST", f"/{src}/_bulk_docs", {"docs": [{"_id": f"d{i}"} for i in range(3)]})[0], 201)
+        # Docs are checked as they are written.
+        bad = {"source": db_url(src), "target": db_url(tgt)}
+        eq(req("PUT", f"/_replicator/bad_{one}", dict(bad, continuous="yes"))[:2],
+           (403, {"error": "forbidden", "reason": '{throw,{bad_request,<<"parameter `continuous` must be a boolean">>}}'}))
+        eq(req("PUT", f"/_replicator/bad_{one}", {"source": src, "target": db_url(tgt)})[:2],
+           (403, {"error": "forbidden", "reason": "local_endpoints_not_supported"}))
+        eq(req("PUT", f"/_replicator/bad_{one}", {"target": db_url(tgt)})[:2],
+           (403, {"error": "forbidden", "reason": "Missing replicator database"}))
+        eq(req("GET", "/_scheduler/docs?states=bogus")[:2], (400, {"error": "query_parse_error",
+           "reason": "States must be one or more of [initializing,error,running,pending,crashing,completed,failed]"}))
+
+        # A one-shot doc runs and is marked completed, with its stats.
+        eq(req("PUT", f"/_replicator/{one}", {"source": db_url(src), "target": db_url(tgt), "create_target": True})[0], 201)
+        doc = _wait(lambda: (lambda d: d if d.get("_replication_state") == "completed" else None)(req("GET", f"/_replicator/{one}")[1]))
+        assert doc, req("GET", f"/_replicator/{one}")[1]
+        assert "owner" in doc and "_replication_state_time" in doc, doc
+        stats = doc["_replication_stats"]
+        eq((stats["docs_written"], stats["doc_write_failures"], "start_time" in stats), (3, 0, True))
+        eq(req("GET", f"/{tgt}")[1]["doc_count"], 3)
+        info = req("GET", f"/_scheduler/docs/_replicator/{one}")[1]
+        eq((info["doc_id"], info["database"], info["state"], info["id"], info["error_count"]), (one, "_replicator", "completed", None, 0))
+        assert info["source"].endswith(f"/{src}/") and "@" not in info["source"], info
+        eq(info["info"]["docs_written"], 3)
+        assert "start_time" not in info["info"], info
+
+        # A continuous doc runs until the doc goes.
+        eq(req("PUT", f"/_replicator/{run}", {"source": db_url(src), "target": db_url(cont), "create_target": True, "continuous": True})[0], 201)
+        info = _wait(lambda: (lambda i: i if i.get("state") == "running" else None)(req("GET", f"/_scheduler/docs/_replicator/{run}")[1]))
+        assert info, req("GET", f"/_scheduler/docs/_replicator/{run}")[1]
+        assert info["id"].endswith("+continuous+create_target") and info["node"], info
+        for k in ("source_proxy", "target_proxy", "start_time", "last_updated", "info"):
+            assert k in info, (k, info)
+        docs = req("GET", "/_scheduler/docs?states=running")[1]["docs"]
+        assert any(d["doc_id"] == run for d in docs) and not any(d["doc_id"] == one for d in docs), docs
+        jobs = [j for j in req("GET", "/_scheduler/jobs")[1]["jobs"] if j["doc_id"] == run]
+        eq((len(jobs), jobs[0]["database"]), (1, "_replicator"))
+        rev = req("GET", f"/_replicator/{run}")[1]["_rev"]
+        eq(req("DELETE", f"/_replicator/{run}?rev={rev}")[0], 200)
+        assert _wait(lambda: not [j for j in req("GET", "/_scheduler/jobs")[1]["jobs"] if j["doc_id"] == run]), "job outlived its doc"
+        eq(req("GET", f"/_scheduler/docs/_replicator/{run}")[:2], (404, {"error": "not_found", "reason": "missing"}))
+    finally:
+        for d in (one, run):
+            s, b, _ = req("GET", f"/_replicator/{d}")
+            if s == 200:
+                req("DELETE", f"/_replicator/{d}?rev={b['_rev']}")
+        for d in (src, tgt, cont):
+            req("DELETE", f"/{d}")
 
 
 def main():

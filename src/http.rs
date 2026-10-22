@@ -269,12 +269,8 @@ async fn route(req: Req) -> Result<Response> {
             "all_nodes": ["couchdb@127.0.0.1"], "cluster_nodes": ["couchdb@127.0.0.1"]
         })),
         Some("_node") => node(&req),
-        Some("_replicate") => Err(CouchError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "not_implemented",
-            "The replicator is not part of this server; replicate with an external CouchDB or PouchDB.",
-        )),
-        Some("_scheduler") => ok_json(json!({"total_rows": 0, "offset": 0, "docs": [], "jobs": []})),
+        Some("_replicate") => crate::replicator::http_replicate(&req).await,
+        Some("_scheduler") => crate::replicator::http_scheduler(&req),
         Some("_db_updates") => crate::changes::db_updates(req).await,
         // Fauxton's setup page asks this; couchdb-rs is always one node.
         Some("_cluster_setup") => match req.method {
@@ -576,6 +572,7 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
     }
     crate::smoosh::start(&server);
     crate::ken::start(&server);
+    crate::replicator::start(&server);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("couchdb-rs listening on http://{bind}");
     crate::system::mark_start();

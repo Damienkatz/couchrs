@@ -191,6 +191,7 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
     let user = &req.auth.user;
     let config = &req.server.config;
     let users_db = crate::auth::is_users_db(config, &db.name);
+    let replicator_db = crate::replicator::docs::is_replicator_db(&db.name);
     let mut early: Vec<Option<CouchError>> = vec![None; docs.len()];
     for (d, e) in docs.iter_mut().zip(early.iter_mut()) {
         if d.is_local() {
@@ -205,6 +206,8 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
             }
         } else if users_db {
             *e = crate::auth::before_users_doc_update(config, user, &sec, &mut d.body, &d.id).err();
+        } else if replicator_db {
+            *e = crate::replicator::docs::before_doc_update(&req.server, user, &sec, d, !new_edits).err();
         }
     }
     if snap.partitioned() {
@@ -365,6 +368,9 @@ fn get_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     // Inlined attachment bodies can be large; the doc alone is a point read.
     let mut v = if opts.attachments { blocking(|| snap.doc_json(&fdi, &rev, &opts))? } else { snap.doc_json(&fdi, &rev, &opts)? };
     crate::db::count_reads(&snap, 1);
+    if crate::replicator::docs::is_replicator_db(&db.name) {
+        v = crate::replicator::docs::after_doc_read(&req.auth.user, &snap.security(), v);
+    }
     if crate::auth::is_users_db(&req.server.config, &db.name) {
         v = crate::auth::after_users_doc_read(&req.server.config, &req.auth.user, &snap.security(), id, v)?;
     }

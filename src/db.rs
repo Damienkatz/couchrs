@@ -287,15 +287,10 @@ impl Snapshot {
                     Some(sp) => a.revpos > sp,
                     None => opts.attachments,
                 };
-                let stub = if want && opts.follows {
-                    let mut j = att_stub_json(a, opts, None);
-                    let o = j.as_object_mut().unwrap();
-                    o.remove("stub");
-                    o.insert("follows".into(), json!(true));
-                    j
-                } else {
-                    let data = if want { Some(self.read_att(a)?) } else { None };
-                    att_stub_json(a, opts, data)
+                let stub = match (want, opts.follows) {
+                    (true, true) => att_json(a, opts, AttBody::Follows),
+                    (true, false) => att_json(a, opts, AttBody::Data(self.read_att(a)?)),
+                    (false, _) => att_json(a, opts, AttBody::Stub),
                 };
                 atts.insert(a.name.clone(), stub);
             }

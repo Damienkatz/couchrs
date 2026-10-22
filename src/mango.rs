@@ -817,7 +817,7 @@ fn explain_json(db: &str, idx: &MangoIndex, q: &FindQuery, range: &Value) -> Val
         "dbname": db,
         "index": idx.to_json(),
         "partitioned": q.partition.is_some(),
-        "selector": q.selector.raw,
+        "selector": normalize_selector(&q.selector.raw).unwrap_or_else(|_| q.selector.raw.clone()),
         "opts": {
             "use_index": q.use_index.as_ref().map(|(d, n)| match n { Some(n) => json!([d, n]), None => json!([d]) }).unwrap_or(json!([])),
             "bookmark": "nil",
@@ -1150,5 +1150,152 @@ mod tests {
         assert!(m(json!({"age": {"$mod": [7, 2]}}), d.clone()));
         assert!(m(json!({"name": {"$beginsWith": "Bo"}}), d.clone()));
         assert!(m(json!({"$nor": [{"name": "Al"}]}), d));
+    }
+}
+
+// ------------------------------------------------- selector normalization
+
+fn sel_error(error: &str, reason: String) -> CouchError {
+    CouchError::new(StatusCode::BAD_REQUEST, error, reason)
+}
+
+fn bad_arg(op: &str, arg: &Value) -> CouchError {
+    sel_error("bad_arg", format!("Bad argument for operator {op}: {arg}"))
+}
+
+/// The single member of a one-member object.
+fn single(v: &Value) -> Option<(&str, &Value)> {
+    match v.as_object() {
+        Some(o) if o.len() == 1 => o.iter().next().map(|(k, v)| (k.as_str(), v)),
+        _ => None,
+    }
+}
+
+fn one(k: &str, v: Value) -> Value {
+    let mut m = Map::new();
+    m.insert(k.to_string(), v);
+    Value::Object(m)
+}
+
+fn each(args: &[Value], f: impl Fn(&Value) -> Result<Value>) -> Result<Value> {
+    Ok(Value::Array(args.iter().map(f).collect::<Result<Vec<_>>>()?))
+}
+
+/// mango_selector:normalize/1: operators checked, implicit $eq and $and
+/// made explicit, nested fields joined into paths, and $not and $nor
+/// pushed inward.
+pub fn normalize_selector(v: &Value) -> Result<Value> {
+    if v.as_object().is_some_and(|o| o.is_empty()) {
+        return Ok(v.clone());
+    }
+    let s = norm_negations(&norm_fields(&norm_ops(v)?, "")?)?;
+    if s.as_object().is_some_and(|o| o.contains_key("")) {
+        return Err(sel_error("invalid_selector", "One or more conditions is missing a field name.".into()));
+    }
+    Ok(s)
+}
+
+fn norm_ops(v: &Value) -> Result<Value> {
+    if let Some(o) = v.as_object()
+        && o.len() >= 2
+    {
+        return Ok(one("$and", Value::Array(o.iter().map(|(k, v)| norm_ops(&one(k, v.clone()))).collect::<Result<Vec<_>>>()?)));
+    }
+    let Some((k, arg)) = single(v) else { return Ok(one("$eq", v.clone())) };
+    Ok(match (k, arg) {
+        ("$and" | "$or" | "$nor", Value::Array(a)) => one(k, each(a, norm_ops)?),
+        ("$not" | "$elemMatch" | "$allMatch" | "$keyMapMatch", Value::Object(_)) => one(k, norm_ops(arg)?),
+        ("$in" | "$nin" | "$all", Value::Array(_)) => v.clone(),
+        ("$exists", Value::Bool(_)) | ("$type", Value::String(_)) | ("$beginsWith", Value::String(_)) => v.clone(),
+        ("$mod", Value::Array(a)) if a.len() == 2 && a.iter().all(|x| x.is_i64() || x.is_u64()) => v.clone(),
+        ("$regex", Value::String(r)) => match regex::Regex::new(r) {
+            Ok(_) => v.clone(),
+            Err(_) => return Err(bad_arg(k, arg)),
+        },
+        ("$size", Value::Number(n)) if n.is_u64() => v.clone(),
+        ("$text", Value::String(_) | Value::Number(_) | Value::Bool(_)) => one("$default", one("$text", arg.clone())),
+        ("$default" | "$lt" | "$lte" | "$eq" | "$ne" | "$gte" | "$gt", _) => v.clone(),
+        ("$where" | "$geoWithin" | "$geoIntersects" | "$near" | "$nearSphere", _) => {
+            return Err(sel_error("not_supported", format!("Unsupported operator: {k}")));
+        }
+        (
+            "$and" | "$or" | "$nor" | "$not" | "$elemMatch" | "$allMatch" | "$keyMapMatch" | "$in" | "$nin" | "$all" | "$exists"
+            | "$type" | "$beginsWith" | "$mod" | "$regex" | "$size" | "$text",
+            _,
+        ) => return Err(bad_arg(k, arg)),
+        (op, _) if op.starts_with('$') => return Err(sel_error("invalid_operator", format!("Invalid operator: {op}"))),
+        (field, cond) => one(field, norm_ops(cond)?),
+    })
+}
+
+fn norm_fields(v: &Value, path: &str) -> Result<Value> {
+    let bad = || sel_error("bad_field", format!("Invalid field normalization on selector: {v}"));
+    if v.as_object().is_some_and(|o| o.is_empty()) {
+        return Ok(if path.is_empty() { v.clone() } else { one(path, v.clone()) });
+    }
+    let Some((k, arg)) = single(v) else { return Err(bad()) };
+    Ok(match k {
+        "$and" | "$or" | "$nor" => one(k, each(arg.as_array().map(Vec::as_slice).unwrap_or(&[]), |a| norm_fields(a, path))?),
+        "$not" => one(k, norm_fields(arg, path)?),
+        "$elemMatch" | "$allMatch" | "$keyMapMatch" => one(path, one(k, norm_fields(arg, "")?)),
+        "$default" if path.is_empty() && single(arg).is_some_and(|(t, _)| t == "$text") => v.clone(),
+        "$default" => return Err(bad()),
+        op if op.starts_with('$') => one(path, v.clone()),
+        field if path.is_empty() => norm_fields(arg, field)?,
+        field => norm_fields(arg, &format!("{path}.{field}"))?,
+    })
+}
+
+fn norm_negations(v: &Value) -> Result<Value> {
+    let Some((k, arg)) = single(v) else { return Ok(v.clone()) };
+    let list = || arg.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    Ok(match k {
+        "$not" => negate(arg)?,
+        "$nor" => one("$and", each(list(), negate)?),
+        "$and" | "$or" => one(k, each(list(), norm_negations)?),
+        "$elemMatch" | "$allMatch" | "$keyMapMatch" => one(k, norm_negations(arg)?),
+        _ => v.clone(),
+    })
+}
+
+fn negate(v: &Value) -> Result<Value> {
+    let Some((k, arg)) = single(v) else { return Ok(one("$not", v.clone())) };
+    let list = || arg.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    Ok(match k {
+        "$not" => norm_negations(arg)?,
+        "$nor" => one("$or", each(list(), norm_negations)?),
+        "$and" => one("$or", each(list(), negate)?),
+        "$or" => one("$and", each(list(), negate)?),
+        "$default" => return Err(bad_arg("$not", v)),
+        "$lt" => one("$gte", arg.clone()),
+        "$lte" => one("$gt", arg.clone()),
+        "$eq" => one("$ne", arg.clone()),
+        "$ne" => one("$eq", arg.clone()),
+        "$gte" => one("$lt", arg.clone()),
+        "$gt" => one("$lte", arg.clone()),
+        "$in" => one("$nin", arg.clone()),
+        "$nin" => one("$in", arg.clone()),
+        "$exists" => one("$exists", Value::Bool(!arg.as_bool().unwrap_or(false))),
+        op if op.starts_with('$') => one("$not", v.clone()),
+        field => one(field, negate(arg)?),
+    })
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_like_couchdb() {
+        let n = |v: Value| normalize_selector(&v).unwrap();
+        assert_eq!(n(json!({"a": 1})), json!({"a": {"$eq": 1}}));
+        assert_eq!(n(json!({"a": {"b": 2}})), json!({"a.b": {"$eq": 2}}));
+        assert_eq!(n(json!({"a": 1, "b": {"$gt": 2}})), json!({"$and": [{"a": {"$eq": 1}}, {"b": {"$gt": 2}}]}));
+        assert_eq!(n(json!({"$not": {"a": {"$lt": 3}}})), json!({"a": {"$gte": 3}}));
+        assert_eq!(n(json!({"$nor": [{"a": 1}]})), json!({"$and": [{"a": {"$ne": 1}}]}));
+        assert_eq!(n(json!({"a": {"$elemMatch": {"b": 1}}})), json!({"a": {"$elemMatch": {"b": {"$eq": 1}}}}));
+        assert_eq!(n(json!({})), json!({}));
+        assert_eq!(normalize_selector(&json!({"a": {"$where": 1}})).unwrap_err().reason, "Unsupported operator: $where");
+        assert_eq!(normalize_selector(&json!({"a": {"$bogus": 1}})).unwrap_err().reason, "Invalid operator: $bogus");
     }
 }
