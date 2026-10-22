@@ -361,7 +361,7 @@ fn session(req: &Req) -> Result<Response> {
             if req.q("basic") == Some("true") && user.name.is_none() && !user.is_server_admin() {
                 return Err(CouchError::unauthorized("Authentication required."));
             }
-            let mut info = json!({"authentication_handlers": ["cookie", "default"]});
+            let mut info = json!({"authentication_handlers": crate::auth::handlers(config)});
             if let Some(m) = req.auth.method {
                 info["authenticated"] = json!(m);
             }

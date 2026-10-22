@@ -688,6 +688,107 @@ def _users_and_security(x, ADMIN):
                 r("DELETE", f"/_users/org.couchdb.user:{name}?rev={d['_rev']}")
 
 
+def _b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _jwt(header, claims, sign):
+    msg = _b64url(json.dumps(header).encode()) + "." + _b64url(json.dumps(claims).encode())
+    return msg + "." + _b64url(sign(msg.encode()))
+
+
+@test
+def proxy_and_jwt_auth():
+    import hashlib, hmac as hmac_mod
+    c = "/_node/_local/_config"
+    x = uuid.uuid4().hex[:8]
+    sa, sapw = f"sa_{x}", f"pw_{x}"
+    ADMIN = basic(sa, sapw)
+    nopersist = {"X-Couch-Persist": "false"}
+    eq(req("PUT", f"{c}/admins/{sa}", sapw)[0], 200)
+    changed = []
+
+    def setc(sec, key, val):
+        eq(req("PUT", f"{c}/{sec}/{key}", val, headers={**ADMIN, **nopersist})[0], 200, (sec, key))
+        changed.append((sec, key))
+
+    try:
+        for _ in range(50):
+            if req("GET", "/_session", headers=ADMIN)[1].get("userCtx", {}).get("name") == sa:
+                break
+            time.sleep(0.1)
+        setc("chttpd", "authentication_handlers", "{chttpd_auth, proxy_authentication_handler}, "
+             "{chttpd_auth, jwt_authentication_handler}, {chttpd_auth, cookie_authentication_handler}, "
+             "{chttpd_auth, default_authentication_handler}")
+        time.sleep(0.5)
+
+        def session(headers):
+            s, b, _ = req("GET", "/_session", headers={"Authorization": "", **headers})
+            return s, b
+
+        # Proxy authentication, without and then with the shared secret.
+        s, b = session({"X-Auth-CouchDB-UserName": f"px_{x}", "X-Auth-CouchDB-Roles": "r1, r2"})
+        eq((s, b["userCtx"], b["info"]["authenticated"]), (200, {"name": f"px_{x}", "roles": ["r1", "r2"]}, "proxy"))
+        eq(b["info"]["authentication_handlers"], ["proxy", "jwt", "cookie", "default"])
+        setc("chttpd_auth", "proxy_use_secret", "true")
+        secret = req("GET", f"{c}/chttpd_auth/secret", headers=ADMIN)[1]
+        token = hmac_mod.new(secret.encode(), f"px_{x}".encode(), hashlib.sha256).hexdigest()
+        eq(session({"X-Auth-CouchDB-UserName": f"px_{x}", "X-Auth-CouchDB-Token": token})[1]["userCtx"]["name"], f"px_{x}")
+        eq(session({"X-Auth-CouchDB-UserName": f"px_{x}", "X-Auth-CouchDB-Token": "00" * 32})[1]["userCtx"]["name"], None)
+
+        # JWT with an HMAC key.
+        key = b"jwt-secret-" + x.encode()
+        setc("jwt_keys", "hmac:_default", base64.b64encode(key).decode())
+        hs = lambda m: hmac_mod.new(key, m, hashlib.sha256).digest()
+        now = int(time.time())
+        good = _jwt({"alg": "HS256", "typ": "JWT"}, {"sub": f"jw_{x}", "exp": now + 60, "_couchdb.roles": ["a", "b"]}, hs)
+        s, b = session({"Authorization": "Bearer " + good})
+        eq((s, b["userCtx"], b["info"]["authenticated"]), (200, {"name": f"jw_{x}", "roles": ["a", "b"]}, "jwt"))
+        expired = _jwt({"alg": "HS256"}, {"sub": "j", "exp": now - 10}, hs)
+        eq(session({"Authorization": "Bearer " + expired}), (401, {"error": "unauthorized", "reason": "exp not in future"}))
+        badsig = _jwt({"alg": "HS256"}, {"sub": "j", "exp": now + 60}, lambda m: b"x" * 32)
+        eq(session({"Authorization": "Bearer " + badsig}), (400, {"error": "bad_request", "reason": "Bad HMAC in authentication token"}))
+        nosub = _jwt({"alg": "HS256"}, {"exp": now + 60}, hs)
+        eq(session({"Authorization": "Bearer " + nosub}), (401, {"error": "unauthorized", "reason": "Token missing sub claim."}))
+        unknown = _jwt({"alg": "HS256", "kid": "nokey"}, {"sub": "j", "exp": now + 60}, hs)
+        eq(session({"Authorization": "Bearer " + unknown}), (400, {"error": "bad_request", "reason": "Unknown kid"}))
+        eq(session({"Authorization": "Bearer a.b"}), (400, {"error": "bad_request", "reason": "Malformed authentication token"}))
+
+        # RSA and EC keys.
+        try:
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+            from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        except ImportError:
+            return
+
+        def pem(pub):
+            p = pub.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+            return p.decode().replace("\n", "\\n")
+
+        rk = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        setc("jwt_keys", "rsa:rk", pem(rk.public_key()))
+        rs = _jwt({"alg": "RS256", "kid": "rk"}, {"sub": f"rs_{x}", "exp": now + 60},
+                  lambda m: rk.sign(m, padding.PKCS1v15(), hashes.SHA256()))
+        eq(session({"Authorization": "Bearer " + rs})[1]["userCtx"]["name"], f"rs_{x}")
+        for alg, curve, h, size in [("ES256", ec.SECP256R1(), hashes.SHA256(), 32), ("ES512", ec.SECP521R1(), hashes.SHA512(), 66)]:
+            k = ec.generate_private_key(curve)
+            setc("jwt_keys", f"ec:{alg}", pem(k.public_key()))
+
+            def es(m, k=k, h=h, size=size):
+                r, s_ = decode_dss_signature(k.sign(m, ec.ECDSA(h)))
+                return r.to_bytes(size, "big") + s_.to_bytes(size, "big")
+
+            t = _jwt({"alg": alg, "kid": alg}, {"sub": f"{alg}_{x}", "exp": now + 60}, es)
+            eq(session({"Authorization": "Bearer " + t})[1]["userCtx"]["name"], f"{alg}_{x}", alg)
+            wrong = _jwt({"alg": alg, "kid": alg}, {"sub": "j", "exp": now + 60}, lambda m: b"\x01" * (2 * size))
+            eq(session({"Authorization": "Bearer " + wrong}), (400, {"error": "bad_request", "reason": "Bad signature in authentication token"}), alg)
+    finally:
+        for sec, key in reversed(changed):
+            req("DELETE", f"{c}/{sec}/{key}", headers={**ADMIN, **nopersist})
+        req("DELETE", f"{c}/admins/{sa}", headers=ADMIN)
+
+
 @test
 def show_content_negotiation():
     db = new_db()

@@ -12,6 +12,7 @@ pub mod fauxton;
 pub mod file;
 pub mod http;
 pub mod js;
+pub mod jwt;
 pub mod keytree;
 pub mod mango;
 pub mod passwords;

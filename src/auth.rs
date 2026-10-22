@@ -296,15 +296,82 @@ fn basic_auth(server: &Server, headers: &HeaderMap) -> Result<Option<Auth>> {
     }
 }
 
-/// Authenticate a request (chttpd's cookie, then default handler).
+/// The configured authentication handlers, in order: [chttpd]
+/// authentication_handlers names cookie, default (Basic), proxy and jwt,
+/// in the short form or as {chttpd_auth, NAME_authentication_handler}.
+pub fn handlers(config: &Config) -> Vec<&'static str> {
+    let spec = config.get_or("chttpd", "authentication_handlers", "cookie, default");
+    let re = regex::Regex::new(r"\b(cookie|default|proxy|jwt)(_authentication_handler)?\b").expect("regex");
+    let mut out: Vec<&'static str> = Vec::new();
+    for m in re.captures_iter(&spec) {
+        let h = match &m[1] {
+            "cookie" => "cookie",
+            "default" => "default",
+            "proxy" => "proxy",
+            _ => "jwt",
+        };
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+/// Proxy authentication: a trusted proxy names the user and roles in
+/// headers ([chttpd_auth] x_auth_username, x_auth_roles), and with
+/// proxy_use_secret proves itself with x_auth_token, the hex HMAC of the
+/// name keyed by the server secret.
+fn proxy_auth(server: &Server, headers: &HeaderMap) -> Option<Auth> {
+    let c = &server.config;
+    let header = |key: &str, default: &str| {
+        let name = c.get_or("chttpd_auth", key, default);
+        headers.get(name.as_str()).and_then(|v| v.to_str().ok()).map(String::from)
+    };
+    let name = header("x_auth_username", "X-Auth-CouchDB-UserName")?;
+    let roles = header("x_auth_roles", "X-Auth-CouchDB-Roles")
+        .map(|r| r.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    if c.get_bool("chttpd_auth", "proxy_use_secret", false) {
+        let secret = secret(server)?;
+        let token = hex::decode(header("x_auth_token", "X-Auth-CouchDB-Token")?).ok()?;
+        let ok = hash_algorithms(c)
+            .iter()
+            .any(|alg| crate::passwords::ct_eq(&hmac(alg, secret.as_bytes(), name.as_bytes()), &token));
+        if !ok {
+            return None;
+        }
+    }
+    Some(Auth { user: UserCtx { name: Some(name), roles }, method: Some("proxy"), renew: None })
+}
+
+fn jwt_auth(server: &Server, headers: &HeaderMap) -> Result<Option<Auth>> {
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+    else {
+        return Ok(None);
+    };
+    let user = crate::jwt::authenticate(&server.config, token)?;
+    Ok(Some(Auth { user, method: Some("jwt"), renew: None }))
+}
+
+/// Authenticate a request with the configured handlers, in order; the
+/// first that recognizes the request decides it.
 pub fn authenticate(server: &Server, headers: &HeaderMap, path: &[String]) -> Result<Auth> {
-    if let Some(a) = cookie_auth(server, headers)? {
-        return Ok(a);
+    let hs = handlers(&server.config);
+    for h in &hs {
+        let found = match *h {
+            "cookie" => cookie_auth(server, headers)?,
+            "default" => basic_auth(server, headers)?,
+            "proxy" => proxy_auth(server, headers),
+            _ => jwt_auth(server, headers)?,
+        };
+        if let Some(a) = found {
+            return Ok(a);
+        }
     }
-    if let Some(a) = basic_auth(server, headers)? {
-        return Ok(a);
-    }
-    if server.config.section("admins").is_empty() {
+    if hs.contains(&"default") && server.config.section("admins").is_empty() {
         // Admin party: everyone is a server admin.
         return Ok(Auth { user: UserCtx::admin(), method: None, renew: None });
     }

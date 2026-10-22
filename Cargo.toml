@@ -17,11 +17,13 @@ hmac = "0.13.0"
 http-body-util = "0.1.5"
 icu_collator = "2.3.1"
 include_dir = "0.7.4"
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 libc = "0.2.191"
 lz4_flex = "0.14.0"
 md-5 = "0.11.0"
 mime = "0.3.17"
 multer = "3.1.0"
+p521 = { version = "0.14.0", features = ["ecdsa", "pem"] }
 parking_lot = "0.12.5"
 pbkdf2 = "0.13.0"
 percent-encoding = "2.3.2"
