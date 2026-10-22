@@ -500,6 +500,65 @@ def show_and_update_functions():
     eq(body, b"n=2")
 
 
+@test
+def show_content_negotiation():
+    db = new_db()
+    req("PUT", f"/{db}/_design/fn", {
+        "shows": {
+            "fmt": """function(doc, req) {
+                provides('json', function() { return JSON.stringify({name: doc.name}); });
+                provides('html', function() { return '<b>' + doc.name + '</b>'; });
+                registerType('vcard', 'text/vcard');
+                provides('vcard', function() { return 'FN:' + doc.name; });
+            }""",
+            "typed": """function(doc, req) {
+                return {body: 'plain', headers: {'Content-Type': 'text/plain'}};
+            }""",
+            "hdr": "function(doc, req) { return {json: {accept: req.headers.Accept || null}}; }",
+        },
+    })
+    req("PUT", f"/{db}/x", {"name": "X"})
+    path = f"/{db}/_design/fn/_show/fmt/x"
+
+    def get(p, accept=None):
+        s, body, h = req("GET", p, headers={"Accept": accept} if accept else {"Accept": ""}, raw=True)
+        return s, body, h.get_all("Content-Type") or []
+
+    # Accept picks the provider; each gets its registered type.
+    s, body, ct = get(path, "application/json")
+    eq((s, json.loads(body), ct), (200, {"name": "X"}, ["application/json"]))
+    s, body, ct = get(path, "text/html")
+    eq((s, body, ct), (200, b"<b>X</b>", ["text/html; charset=utf-8"]))
+    s, body, ct = get(path, "text/vcard")
+    eq((s, body, ct), (200, b"FN:X", ["text/vcard"]))
+    # Quality values and wildcards, as browsers send them.
+    s, body, _ = get(path, "text/html;q=0.5, application/json;q=0.9")
+    eq(json.loads(body), {"name": "X"})
+    s, body, _ = get(path, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+    eq(body, b"<b>X</b>")
+    # */* and no Accept header take the first provider (CouchDB labels the
+    # */* case with the last matching type, text/x-json, so only the body
+    # is compared).
+    s, body, _ = get(path, "*/*")
+    eq(json.loads(body), {"name": "X"})
+    s, body, _ = get(path)
+    eq(json.loads(body), {"name": "X"})
+    # ?format= overrides Accept.
+    s, body, ct = get(path + "?format=html", "application/json")
+    eq((body, ct), (b"<b>X</b>", ["text/html; charset=utf-8"]))
+    # Nothing acceptable: 406.
+    s, body, _ = get(path, "image/png")
+    eq(s, 406)
+    eq(json.loads(body)["error"], "not_acceptable")
+
+    # A show's own Content-Type replaces the default instead of adding to it.
+    s, body, ct = get(f"/{db}/_design/fn/_show/typed/x")
+    eq((body, ct), (b"plain", ["text/plain"]))
+    # Header names reach the function as clients write them.
+    s, body, _ = get(f"/{db}/_design/fn/_show/hdr/x", "text/csv")
+    eq(json.loads(body), {"accept": "text/csv"})
+
+
 def replicate(src, tgt):
     """Minimal CouchDB replication protocol, as couch_replicator does it."""
     rep_id = f"_local/rep-{src}-{tgt}"

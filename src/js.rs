@@ -32,7 +32,100 @@ var __log = [];
 function sum(a) { var r = 0; for (var i = 0; i < a.length; i++) r += a[i]; return r; }
 function toJSON(o) { return JSON.stringify(o); }
 function isArray(o) { return Array.isArray(o); }
-function provides() {} function registerType() {} function start() {} function send() {}
+function start() {} function send() {}
+// Content negotiation for show functions, as in CouchDB's render.js and
+// mimeparse.js: registerType(key, mime...) names a format, provides(key,
+// fun) offers one, and __runProvides picks by ?format=, then Accept.
+var __mimesByKey = {}, __keysByMime = {}, __providers = null;
+function registerType() {
+  var key = arguments[0], mimes = [];
+  for (var i = 1; i < arguments.length; i++) mimes.push(arguments[i]);
+  __mimesByKey[key] = mimes;
+  for (var j = 0; j < mimes.length; j++) __keysByMime[mimes[j]] = key;
+}
+registerType("all", "*/*");
+registerType("text", "text/plain; charset=utf-8", "txt");
+registerType("html", "text/html; charset=utf-8");
+registerType("xhtml", "application/xhtml+xml", "xhtml");
+registerType("xml", "application/xml", "text/xml", "application/x-xml");
+registerType("js", "text/javascript", "application/javascript", "application/x-javascript");
+registerType("css", "text/css");
+registerType("ics", "text/calendar");
+registerType("csv", "text/csv");
+registerType("rss", "application/rss+xml");
+registerType("atom", "application/atom+xml");
+registerType("yaml", "application/x-yaml", "text/yaml");
+registerType("multipart_form", "multipart/form-data");
+registerType("url_encoded_form", "application/x-www-form-urlencoded");
+registerType("json", "application/json", "text/x-json");
+function provides(type, fun) {
+  if (__providers !== null) __providers.push([type, fun]);
+}
+function __trim(s) { return s.replace(/^\s+|\s+$/g, ""); }
+function __parseRange(r) {
+  var parts = r.split(";"), params = {};
+  for (var i = 1; i < parts.length; i++) {
+    var kv = parts[i].split("=");
+    if (kv.length === 2) params[__trim(kv[0])] = __trim(kv[1]);
+  }
+  var full = __trim(parts[0]);
+  if (full === "*") full = "*/*";
+  var tp = full.split("/");
+  var q = parseFloat(params.q);
+  if (params.q === undefined || isNaN(q) || q < 0 || q > 1) params.q = "1";
+  return [tp[0], tp[1] || "", params];
+}
+function __fitness(mime, ranges) {
+  var best = -1, bestQ = 0, t = __parseRange(mime);
+  for (var i = 0; i < ranges.length; i++) {
+    var r = ranges[i];
+    if ((r[0] === t[0] || r[0] === "*" || t[0] === "*") && (r[1] === t[1] || r[1] === "*" || t[1] === "*")) {
+      var pm = 0;
+      for (var k in t[2]) if (k !== "q" && r[2][k] === t[2][k]) pm++;
+      var f = (r[0] === t[0] ? 100 : 0) + (r[1] === t[1] ? 10 : 0) + pm;
+      if (f > best) { best = f; bestQ = parseFloat(r[2].q); }
+    }
+  }
+  return [best, bestQ];
+}
+function __bestMatch(supported, header) {
+  var ranges = header.split(",").map(__parseRange), best = null;
+  for (var i = 0; i < supported.length; i++) {
+    var fq = __fitness(supported[i], ranges);
+    // Highest quality, then most specific; the earliest offer wins ties.
+    if (fq[1] > 0 && (best === null || fq[1] > best[1] || (fq[1] === best[1] && fq[0] > best[0])))
+      best = [fq[0], fq[1], supported[i]];
+  }
+  return best ? best[2] : "";
+}
+function __runProvides(req) {
+  var h = req.headers || {}, accept = h.Accept, key = null, i;
+  if (req.query && req.query.format) {
+    key = req.query.format;
+  } else if (accept) {
+    var supported = [];
+    for (i = 0; i < __providers.length; i++) supported = supported.concat(__mimesByKey[__providers[i][0]] || []);
+    var m = __bestMatch(supported, accept);
+    key = m ? __keysByMime[m] : null;
+  } else {
+    key = __providers[0][0];
+  }
+  for (i = 0; i < __providers.length; i++) {
+    if (__providers[i][0] !== key) continue;
+    var out = __providers[i][1]();
+    if (typeof out === "string") out = {body: out};
+    else if (out === undefined || out === null) out = {body: ""};
+    out.headers = out.headers || {};
+    var hasType = false;
+    for (var hk in out.headers) if (hk.toLowerCase() === "content-type") hasType = true;
+    var mimes = __mimesByKey[key];
+    if (!hasType && mimes && mimes.length) out.headers["Content-Type"] = mimes[0];
+    return out;
+  }
+  var offered = [];
+  for (i = 0; i < __providers.length; i++) offered.push(__providers[i][0]);
+  throw ["error", "not_acceptable", "Content-Type " + (accept || key) + " not supported, try one of: " + offered.join(", ")];
+}
 function getRow() { return null; }
 function __freeze(o) {
   if (o && typeof o === "object" && !Object.isFrozen(o)) {
@@ -112,6 +205,16 @@ function __validate(i, nd, od, uc, so) {
 function __filter(i, dj, rj) {
   try { return JSON.stringify({ok: !!__funs[i](__freeze(JSON.parse(dj)), JSON.parse(rj))}); }
   catch (e) { return JSON.stringify(__errjson(e)); }
+}
+function __show(i, argsjson) {
+  __providers = [];
+  try {
+    var args = JSON.parse(argsjson);
+    var r = __funs[i].apply(null, args);
+    if ((r === undefined || r === null) && __providers.length) r = __runProvides(args[1]);
+    return JSON.stringify({ok: r === undefined ? null : r});
+  } catch (e) { return JSON.stringify(__errjson(e)); }
+  finally { __providers = null; }
 }
 function __call(i, argsjson) {
   try { var r = __funs[i].apply(null, JSON.parse(argsjson)); return JSON.stringify({ok: r === undefined ? null : r}); }
@@ -278,6 +381,11 @@ impl JsFuns {
         Ok(r.as_bool().unwrap_or(false))
     }
 
+    /// Run a show function, with provides()/registerType() negotiation.
+    fn show(&self, i: usize, args: &[Value]) -> Result<Value> {
+        unwrap_ok(self.call("__show", CallArgs::IS(i as i32, Value::Array(args.to_vec()).to_string()))?)
+    }
+
     fn apply(&self, i: usize, args: &[Value]) -> Result<Value> {
         unwrap_ok(self.call("__call", CallArgs::IS(i as i32, Value::Array(args.to_vec()).to_string()))?)
     }
@@ -300,11 +408,21 @@ fn unwrap_ok(v: Value) -> Result<Value> {
             Some((k, r)) => (k.clone(), r.as_str().map(String::from).unwrap_or_else(|| r.to_string())),
             None => ("error".into(), t.to_string()),
         };
-        return Err(CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, &err, reason));
+        return Err(CouchError::new(error_status(&err), &err, reason));
     }
     let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("render_error");
     let reason = v.get("reason").and_then(|e| e.as_str()).unwrap_or("").to_string();
-    Err(CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, err, reason))
+    Err(CouchError::new(error_status(err), err, reason))
+}
+
+/// HTTP status for an error from a JavaScript function. Like CouchDB, only
+/// a failed content negotiation (406) is a client error; anything thrown
+/// by the function itself is a server-side render error.
+fn error_status(err: &str) -> StatusCode {
+    match err {
+        "not_acceptable" => StatusCode::NOT_ACCEPTABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 // ---------------------------------------------------------- validation
@@ -497,13 +615,25 @@ impl ViewFilter {
 
 // ------------------------------------------------------- _show / _update
 
+/// HTTP/1 header names reach us lowercased; CouchDB hands functions the
+/// names as clients send them, conventionally "Accept", "Content-Type".
+fn title_case(name: &str) -> String {
+    name.split('-')
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 fn js_req(req: &Req, db: &Db, id: Option<&str>) -> Value {
     let query: serde_json::Map<String, Value> =
         req.query.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
     let headers: serde_json::Map<String, Value> = req
         .headers
         .iter()
-        .map(|(k, v)| (k.as_str().to_string(), json!(v.to_str().unwrap_or(""))))
+        .map(|(k, v)| (title_case(k.as_str()), json!(v.to_str().unwrap_or(""))))
         .collect();
     let form: serde_json::Map<String, Value> =
         if req.content_type().starts_with("application/x-www-form-urlencoded") {
@@ -552,7 +682,11 @@ fn render_response(resp: &Value, default_code: StatusCode) -> Response {
         }
         _ => (default_code, serde_json::Map::new(), Vec::new(), "text/html; charset=utf-8"),
     };
-    let mut b = Response::builder().status(code).header(header::CONTENT_TYPE, ct);
+    let mut b = Response::builder().status(code);
+    // The function's own Content-Type wins over the default for its body kind.
+    if !headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+        b = b.header(header::CONTENT_TYPE, ct);
+    }
     for (k, v) in headers {
         if let Some(s) = v.as_str() {
             b = b.header(k.as_str(), s);
@@ -581,7 +715,7 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
             };
             let funs = JsFuns::new(&ddoc, &[src.to_string()], &[]);
             let jreq = js_req(req, db, id.as_deref());
-            let r = blocking(|| funs.apply(0, &[doc, jreq]))?;
+            let r = blocking(|| funs.show(0, &[doc, jreq]))?;
             Ok(render_response(&r, StatusCode::OK))
         }
         ["_update", name, docid @ ..] => {
