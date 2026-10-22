@@ -41,14 +41,14 @@ fn unknown(module: &str, reason: &str) -> CouchError {
 
 /// A decoded JSON value as io_lib:format's ~w prints it: binaries as
 /// their bytes, objects as {[{K,V}]}.
-fn erl_w(v: &Value) -> String {
+pub fn erl_w(v: &Value) -> String {
     let mut out = String::new();
     write_term(v, false, &mut out);
     out
 }
 
 /// ... and as ~p prints it: printable binaries and lists as strings.
-fn erl_p(v: &Value) -> String {
+pub fn erl_p(v: &Value) -> String {
     let mut out = String::new();
     write_term(v, true, &mut out);
     out

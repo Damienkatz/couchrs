@@ -51,6 +51,74 @@ pub fn to_string<T: Serialize + ?Sized>(v: &T) -> String {
     String::from_utf8(to_vec(v)).unwrap_or_default()
 }
 
+/// A body as couch_mrview_http and chttpd_db stream them: each of the
+/// "rows" (and of /queries' "results", rows and all) on its own line.
+pub fn rows_body(v: &serde_json::Value) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    write_rows(v, &mut out);
+    out.push(b'\n');
+    out
+}
+
+fn write_rows(v: &serde_json::Value, out: &mut Vec<u8>) {
+    let serde_json::Value::Object(o) = v else {
+        out.extend(to_vec(v));
+        return;
+    };
+    out.push(b'{');
+    for (i, (k, x)) in o.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend(to_vec(k));
+        out.push(b':');
+        match (k.as_str(), x) {
+            ("rows" | "results", serde_json::Value::Array(items)) => {
+                out.extend_from_slice(b"[\r\n");
+                for (j, item) in items.iter().enumerate() {
+                    if j > 0 {
+                        out.extend_from_slice(b",\r\n");
+                    }
+                    if k == "results" { write_rows(item, out) } else { out.extend(to_vec(item)) }
+                }
+                out.extend_from_slice(b"\r\n]");
+            }
+            _ => out.extend(to_vec(x)),
+        }
+    }
+    out.push(b'}');
+}
+
+/// A normal or longpoll _changes body as chttpd_db sends it: the results
+/// between newlines (and one more for a longpoll that timed out), then
+/// the rest.
+pub fn changes_body(v: &serde_json::Value, timed_out: bool) -> Vec<u8> {
+    let mut out = b"{\"results\":[\n".to_vec();
+    let empty = Vec::new();
+    let rows = v.get("results").and_then(serde_json::Value::as_array).unwrap_or(&empty);
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b",\r\n");
+        }
+        out.extend(to_vec(r));
+    }
+    if timed_out {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b"\n],\n");
+    let rest: Vec<(&String, &serde_json::Value)> = v.as_object().into_iter().flatten().filter(|(k, _)| *k != "results").collect();
+    for (i, (k, x)) in rest.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend(to_vec(k));
+        out.push(b':');
+        out.extend(to_vec(x));
+    }
+    out.extend_from_slice(b"}\n\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

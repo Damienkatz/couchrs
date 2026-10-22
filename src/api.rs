@@ -155,7 +155,7 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
                 });
             }
             let r = json_response(StatusCode::CREATED, &json!({"ok": true}));
-            Ok(with_header(r, header::LOCATION, &format!("/{name}")))
+            Ok(with_header(r, header::LOCATION, &crate::http::absolute_uri(req, &format!("/{}", crate::http::url_encode(name)))))
         }
         Method::DELETE => {
             if req.q("rev").is_some() {
@@ -179,7 +179,11 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
             let rev = save_docs(req, &db, vec![doc], true).await?.pop().unwrap()?;
             let status = if batch { StatusCode::ACCEPTED } else { StatusCode::CREATED };
             let r = json_response(status, &json!({"ok": true, "id": id, "rev": rev}));
-            let r = with_header(r, header::LOCATION, &format!("/{name}/{id}"));
+            let r = with_header(
+                r,
+                header::LOCATION,
+                &crate::http::absolute_uri(req, &format!("/{}/{}", crate::http::url_encode(name), crate::http::url_encode(&id))),
+            );
             Ok(with_header(r, header::ETAG, &format!("\"{rev}\"")))
         }
         _ => not_allowed("DELETE,GET,HEAD,POST"),
@@ -366,15 +370,23 @@ async fn doc_request(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         Method::GET | Method::HEAD => get_doc(req, db, id),
         Method::PUT => put_doc(req, db, id).await,
         Method::DELETE => {
-            let rev = rev_from_req(req).ok_or_else(CouchError::conflict)?;
+            // chttpd_db opens the document first: a 404 if it isn't there.
+            let snap = db.snapshot();
+            if id.starts_with("_local/") {
+                snap.get_local(id)?.ok_or_else(CouchError::missing)?;
+            } else {
+                match snap.get_fdi(id)? {
+                    None => return Err(CouchError::missing()),
+                    Some(f) if f.deleted => return Err(CouchError::deleted()),
+                    Some(_) => {}
+                }
+            }
             let mut doc = Doc {
                 id: id.to_string(),
                 deleted: true,
                 ..Default::default()
             };
-            if id.starts_with("_local/") {
-                doc.revs = (0, vec![rev.trim_start_matches("0-").to_string()]);
-            } else {
+            if let Some(rev) = rev_from_req(req) {
                 let (p, r) = parse_rev(&rev)?;
                 doc.revs = (p, vec![r]);
             }
@@ -855,17 +867,11 @@ async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     // Sizes are checked of the doc as sent (its id, if any, its own).
     check_doc_limits(&req.server.config, std::slice::from_ref(&doc))?;
     doc.id = id.to_string();
-    if doc.revs.1.is_empty() {
-        if let Some(r) = rev_from_req(req) {
-            if doc.is_local() {
-                doc.revs = (0, vec![r.trim_start_matches("0-").to_string()]);
-            } else {
-                let (p, rid) = parse_rev(&r)?;
-                doc.revs = (p, vec![rid]);
-            }
-        }
-    } else if doc.is_local() {
-        doc.revs = (0, vec![doc.rev().unwrap_or_default().trim_start_matches("0-").to_string()]);
+    if doc.revs.1.is_empty()
+        && let Some(r) = rev_from_req(req)
+    {
+        let (p, rid) = parse_rev(&r)?;
+        doc.revs = (p, vec![rid]);
     }
     let new_edits = req.q_bool("new_edits")?.unwrap_or(true);
     let rev = save_docs(req, db, vec![doc], new_edits).await?.pop().unwrap()?;
@@ -876,7 +882,8 @@ async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     };
     let r = json_response(status, &json!({"ok": true, "id": id, "rev": rev}));
     let r = with_header(r, header::ETAG, &format!("\"{rev}\""));
-    Ok(with_header(r, header::LOCATION, &format!("/{}/{}", db.name, id)))
+    let loc = format!("/{}/{}", crate::http::url_encode(&db.name), crate::http::url_encode(id));
+    Ok(with_header(r, header::LOCATION, &crate::http::absolute_uri(req, &loc)))
 }
 
 async fn copy_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
@@ -908,6 +915,8 @@ async fn copy_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     };
     let new_rev = save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
     let r = json_response(StatusCode::CREATED, &json!({"ok": true, "id": dest_id, "rev": new_rev}));
+    let loc = format!("/{}/{}", crate::http::url_encode(&db.name), crate::http::url_encode(&dest_id));
+    let r = with_header(r, header::LOCATION, &crate::http::absolute_uri(req, &loc));
     Ok(with_header(r, header::ETAG, &format!("\"{new_rev}\"")))
 }
 
@@ -1027,7 +1036,13 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
             let new_rev = save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
             let status = if req.method == Method::PUT { StatusCode::CREATED } else { StatusCode::OK };
             let r = json_response(status, &json!({"ok": true, "id": id, "rev": new_rev}));
-            Ok(with_header(r, header::ETAG, &format!("\"{new_rev}\"")))
+            let r = with_header(r, header::ETAG, &format!("\"{new_rev}\""));
+            if req.method == Method::DELETE {
+                return Ok(r);
+            }
+            let name = name.split('/').map(crate::http::url_encode).collect::<Vec<_>>().join("/");
+            let loc = format!("/{}/{}/{name}", crate::http::url_encode(&db.name), crate::http::url_encode(id));
+            Ok(with_header(r, header::LOCATION, &crate::http::absolute_uri(req, &loc)))
         }
         _ => not_allowed("DELETE,GET,HEAD,PUT"),
     }
@@ -1190,6 +1205,17 @@ impl QueryArgs {
         Ok(a)
     }
 
+    /// A /queries query: as from_obj/2, but a single key in `keys` is a
+    /// range of just that key, as couch_mrview_http:parse_param/4 makes it.
+    pub fn from_query(obj: &Map<String, Value>, base: QueryArgs) -> Result<QueryArgs> {
+        let mut a = QueryArgs::from_obj(obj, base)?;
+        if let Some(keys) = a.keys.take_if(|k| k.len() == 1) {
+            a.start_key = keys.first().cloned();
+            a.end_key = keys.first().cloned();
+        }
+        Ok(a)
+    }
+
     pub fn doc_opts(&self) -> DocOpts {
         DocOpts {
             conflicts: self.conflicts,
@@ -1212,7 +1238,7 @@ async fn all_docs(req: &Req, db: &Arc<Db>, kind: AllDocsKind) -> Result<Response
     }
     let snap = db.snapshot();
     let v = blocking(|| run_all_docs(&snap, &args, kind))?;
-    ok_json(v)
+    Ok(crate::http::rows_response(&v))
 }
 
 async fn multi_query(req: &Req, db: &Arc<Db>, kind: AllDocsKind) -> Result<Response> {
@@ -1228,10 +1254,10 @@ async fn multi_query(req: &Req, db: &Arc<Db>, kind: AllDocsKind) -> Result<Respo
     let mut results = Vec::new();
     for q in queries {
         let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
-        let args = QueryArgs::from_obj(obj, QueryArgs::default())?;
+        let args = QueryArgs::from_query(obj, QueryArgs::default())?;
         results.push(blocking(|| run_all_docs(&snap, &args, kind))?);
     }
-    ok_json(json!({"results": results}))
+    Ok(crate::http::rows_response(&json!({"results": results})))
 }
 
 fn key_str(v: &Value) -> Option<String> {
@@ -1266,7 +1292,7 @@ async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[Str
                 _ => return not_allowed("GET,HEAD,POST"),
             }
             let snap = db.snapshot();
-            ok_json(blocking(|| run_partition_all_docs(&snap, &args, partition))?)
+            Ok(crate::http::rows_response(&blocking(|| run_partition_all_docs(&snap, &args, partition))?))
         }
         ["_design", ddoc, "_view", view] => {
             let mut args = QueryArgs::from_req(req)?;
@@ -1292,7 +1318,7 @@ async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[Str
             let mut results = Vec::new();
             for q in &queries {
                 let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
-                let mut args = QueryArgs::from_obj(obj, base.clone())?;
+                let mut args = QueryArgs::from_query(obj, base.clone())?;
                 args.partition = Some(partition.to_string());
                 results.push(crate::views::view_json(req, db, &format!("_design/{ddoc}"), view, &args)?);
             }
@@ -1401,11 +1427,7 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
                 }
             }
         }
-        let mut out = json!({"total_rows": total, "offset": null, "rows": rows});
-        if args.update_seq {
-            out["update_seq"] = json!(snap.seq_str(snap.update_seq()));
-        }
-        return Ok(out);
+        return Ok(rows_out(snap, args, json!(total), Value::Null, rows));
     }
     let dir = if args.descending { Dir::Rev } else { Dir::Fwd };
     let mut start = args.start_key.as_ref().and_then(key_str);
@@ -1461,11 +1483,19 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
             Ok(rows.len() < limit)
         })?;
     }
-    let mut out = json!({"total_rows": total, "offset": offset + args.skip.min(total as usize) as u64, "rows": rows});
+    Ok(rows_out(snap, args, json!(total), json!(offset + args.skip.min(total as usize) as u64), rows))
+}
+
+/// {total_rows, offset, update_seq (when asked), rows}, in that order.
+fn rows_out(snap: &Snapshot, args: &QueryArgs, total: Value, offset: Value, rows: Vec<Value>) -> Value {
+    let mut out = Map::new();
+    out.insert("total_rows".into(), total);
+    out.insert("offset".into(), offset);
     if args.update_seq {
-        out["update_seq"] = json!(snap.seq_str(snap.update_seq()));
+        out.insert("update_seq".into(), json!(snap.seq_str(snap.update_seq())));
     }
-    Ok(out)
+    out.insert("rows".into(), Value::Array(rows));
+    Value::Object(out)
 }
 
 // --------------------------------------------------------------- bulk docs
@@ -1492,10 +1522,6 @@ async fn bulk_docs(req: &Req, db: &Arc<Db>) -> Result<Response> {
             doc.id = new_uuid();
         }
         validate_docid(&doc.id)?;
-        if doc.is_local() && !doc.revs.1.is_empty() {
-            let r = doc.rev().unwrap();
-            doc.revs = (0, vec![r.split_once('-').map(|x| x.1.to_string()).unwrap_or(r)]);
-        }
         parsed.push(doc);
     }
     let ids: Vec<String> = parsed.iter().map(|d| d.id.clone()).collect();
@@ -1550,11 +1576,11 @@ async fn bulk_get(req: &Req, db: &Arc<Db>) -> Result<Response> {
                 .into_iter()
                 .map(|r| match r.get("ok") {
                     Some(doc) => json!({"ok": doc}),
-                    None => json!({"error": {"id": id, "rev": r.get("missing"), "error": "not_found", "reason": "missing"}}),
+                    None => json!({"error": {"rev": r.get("missing"), "reason": "missing", "id": id, "error": "not_found"}}),
                 })
                 .collect(),
-            Ok(_) => vec![json!({"error": {"id": id, "rev": rev, "error": "not_found", "reason": "missing"}})],
-            Err(e) => vec![json!({"error": {"id": id, "rev": rev, "error": e.error, "reason": e.reason}})],
+            Ok(_) => vec![json!({"error": {"rev": rev, "reason": "missing", "id": id, "error": "not_found"}})],
+            Err(e) => vec![json!({"error": {"rev": rev, "reason": e.reason, "id": id, "error": e.error}})],
         };
         results.push(json!({"id": id, "docs": entries}));
     }

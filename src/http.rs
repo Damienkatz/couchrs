@@ -29,6 +29,40 @@ pub struct Req {
     pub auth: crate::auth::Auth,
     /// How many times this request has been rewritten (_rewrite).
     pub rewrites: u32,
+    /// Whether it came over HTTPS.
+    pub tls: bool,
+}
+
+/// Marks the requests of the HTTPS listener.
+#[derive(Clone, Copy)]
+pub struct Tls;
+
+/// couch_util:url_encode/1: all but letters, digits and _ . - : as %XX.
+pub fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"_.-:".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// chttpd:absolute_uri/2: a path on this server as the client reached it,
+/// through a proxy's X-Forwarded-Host and -Ssl or -Proto if there's one.
+pub fn absolute_uri(req: &Req, path: &str) -> String {
+    let config = &req.server.config;
+    let xhost = config.get_or("chttpd", "x_forwarded_host", "X-Forwarded-Host").to_lowercase();
+    let host = req.header(&xhost).or_else(|| req.header("host")).map(String::from).unwrap_or_else(|| {
+        let port = if req.tls { config.get_or("ssl", "port", "6984") } else { config.get_or("chttpd", "port", "5984") };
+        format!("{}:{port}", config.get_or("chttpd", "bind_address", "127.0.0.1"))
+    });
+    let xssl = config.get_or("chttpd", "x_forwarded_ssl", "X-Forwarded-Ssl").to_lowercase();
+    let xproto = config.get_or("chttpd", "x_forwarded_proto", "X-Forwarded-Proto").to_lowercase();
+    let https = req.header(&xssl) == Some("on") || req.header(&xproto) == Some("https") || req.tls;
+    format!("{}://{host}{path}", if https { "https" } else { "http" })
 }
 
 impl Req {
@@ -162,6 +196,16 @@ pub fn json_response(status: StatusCode, v: &Value) -> Response {
         .unwrap()
 }
 
+/// A response with rows, streamed as CouchDB streams them.
+pub fn rows_response(v: &Value) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "must-revalidate")
+        .body(Body::from(crate::json::rows_body(v)))
+        .unwrap()
+}
+
 pub fn ok_json(v: Value) -> Result<Response> {
     Ok(json_response(StatusCode::OK, &v))
 }
@@ -251,6 +295,7 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
         trailing_slash: raw_path.ends_with('/'),
         auth: crate::auth::Auth::default(),
         rewrites: 0,
+        tls: parts.extensions.get::<Tls>().is_some(),
     };
     let is_head = method == Method::HEAD;
     let mut req = req;
@@ -490,7 +535,7 @@ fn session(req: &Req) -> Result<Response> {
             Some(next) => {
                 let (mut parts, body) = r.into_parts();
                 parts.status = StatusCode::FOUND;
-                if let Ok(v) = HeaderValue::from_str(next) {
+                if let Ok(v) = HeaderValue::from_str(&absolute_uri(req, next)) {
                     parts.headers.insert(header::LOCATION, v);
                 }
                 Response::from_parts(parts, body)
@@ -755,7 +800,7 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
         let sbind = if addr.contains(':') { format!("[{addr}]:{port}") } else { format!("{addr}:{port}") };
         let l = crate::tls::listen(&sbind, cfg).await?;
         tracing::info!("couchdb-rs listening on https://{sbind}");
-        let sapp = app.clone();
+        let sapp = app.clone().layer(axum::Extension(Tls));
         tokio::spawn(async move { axum::serve(l, sapp).await });
     }
     if server.config.get_bool("prometheus", "additional_port", false) {

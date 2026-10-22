@@ -161,6 +161,12 @@ static REGISTRY: OnceLock<Registry> = OnceLock::new();
 static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
+/// The server's configuration, once the stats are loaded (for code that
+/// has no server to ask).
+pub fn config() -> Option<&'static Arc<Config>> {
+    CONFIG.get()
+}
+
 /// Load the metrics with this config's `[stats] interval` and start the
 /// thread that clears stale histogram bins.
 pub fn init(config: Arc<Config>) {

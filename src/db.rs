@@ -407,6 +407,16 @@ impl Snapshot {
         Ok(n)
     }
 
+    /// Changes before `seq` (what a descending _changes has left).
+    pub fn pending_before(&self, seq: u64) -> u64 {
+        let mut n = 0u64;
+        let _ = self.view.scan(CF_SEQ, None, Some(&be(seq)), false, |_, _| {
+            n += 1;
+            Ok(true)
+        });
+        n
+    }
+
     /// Changes after `seq` (the `pending` count of _changes), by scanning.
     pub fn pending_after(&self, seq: u64) -> u64 {
         let mut n = 0u64;
@@ -1219,23 +1229,27 @@ fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<Applie
     Ok((w.batch, header, results, counts))
 }
 
+/// couch_db_updater:increment_local_doc_revs/1: a local document's new
+/// revision is the one given plus one (0-1 without one, 0-0 deleted),
+/// with no checking against what's there.
 fn update_local(slot: &mut Option<LocalDoc>, doc: &Doc) -> UpdateResult {
-    let given: u64 = match doc.revs.1.first() {
-        None => 0,
-        Some(r) => r.parse().map_err(|_| CouchError::conflict())?,
-    };
-    let cur = slot.as_ref().map(|l| l.rev).unwrap_or(0);
-    if given != cur {
-        return Err(CouchError::conflict());
-    }
     if doc.deleted {
-        if slot.is_none() {
-            return Err(CouchError::not_found("missing"));
-        }
         *slot = None;
         return Ok("0-0".into());
     }
-    let rev = cur + 1;
+    let invalid = || CouchError::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error", "Invalid rev format");
+    let rev = match (doc.revs.0, doc.revs.1.first()) {
+        (0, None) => 1,
+        (0, Some(r)) => {
+            // binary_to_integer/1
+            let digits = r.strip_prefix(['+', '-']).unwrap_or(r);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || r.starts_with('-') {
+                return Err(invalid());
+            }
+            digits.parse::<u64>().ok().and_then(|n| n.checked_add(1)).ok_or_else(invalid)?
+        }
+        _ => return Err(invalid()),
+    };
     *slot = Some(LocalDoc { rev, body: serde_json::to_vec(&doc.body)? });
     Ok(format!("0-{rev}"))
 }

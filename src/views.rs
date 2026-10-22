@@ -77,7 +77,8 @@ pub enum Reducer {
     /// kept as [key, id, value] until finalized.
     First,
     Last,
-    Js(JsFuns, usize),
+    /// A JavaScript reduce: the functions, its index, and its source.
+    Js(JsFuns, usize, Arc<str>),
 }
 
 pub struct ViewSpec {
@@ -85,11 +86,79 @@ pub struct ViewSpec {
     pub reducer: Reducer,
 }
 
-fn red_err(e: CouchError) -> Value {
-    json!({"error": e.error, "reason": e.reason})
+/// A reduction that failed inside the index (where couch_btree's reduce
+/// throws): the update fails, as CouchDB's index updater does.
+fn check_failures(st: &IndexState) -> Result<()> {
+    for v in &st.views {
+        if let Some(VRed { red: Some(j), .. }) = v.full_reduce()
+            && let Some((e, r)) = as_failure(&j.0)
+        {
+            return Err(CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, &e, r).with_ref());
+        }
+    }
+    Ok(())
+}
+
+/// A reduction couchjs refused as not reducing ({reduce_overflow_error, Msg}).
+fn is_overflow(v: &Value) -> bool {
+    v.as_object().is_some_and(|o| o.len() == 1 && o.contains_key("reduce_overflow_error"))
+}
+
+fn js_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// couchjs' reduce_limit (runReduce/5): a reduction longer than
+/// reduce_limit_threshold, and more than 1/reduce_limit_ratio of the
+/// input line less the function's source, is an overflow error (only
+/// logged with "log").
+fn reduce_limit(op: &str, payload: &Value, ctx: &str, src: &str, out: Value) -> Value {
+    let config = crate::stats::config();
+    let get = |k: &str| config.and_then(|c| c.get("query_server_config", k));
+    let limit = get("reduce_limit").unwrap_or_else(|| "true".into());
+    if limit != "true" && limit != "log" {
+        return out;
+    }
+    let threshold: f64 = get("reduce_limit_threshold").and_then(|t| t.parse().ok()).unwrap_or(5000.0);
+    let ratio: f64 = get("reduce_limit_ratio").and_then(|r| r.parse().ok()).unwrap_or(2.0);
+    let len = js_len(&serde_json::to_string(&[&out]).unwrap_or_default());
+    if (len as f64) <= threshold {
+        return out;
+    }
+    // The line couchjs read: [op, [src], payload, ctx].
+    let line = js_len(&crate::json::to_string(&json!([op, [src], payload, ctx])));
+    let input = line - js_len(src);
+    if (len as f64) * ratio <= input as f64 {
+        return out;
+    }
+    let msg = format!("Reduce output must shrink more rapidly: input size: {input} output size: {len} context: {ctx}");
+    if limit == "log" {
+        tracing::warn!("reduce_overflow_error: {msg}");
+        return out;
+    }
+    json!({ "reduce_overflow_error": msg })
 }
 
 impl ViewSpec {
+    /// os_rereduce/4: an overflow below is the answer; otherwise the
+    /// function's, limited.
+    fn js_rereduce(&self, f: &JsFuns, i: usize, src: &str, vals: &[Value], ctx: &str) -> Value {
+        if let Some(o) = vals.iter().find(|v| is_overflow(v)) {
+            return o.clone();
+        }
+        let out = f.rereduce(i, vals).unwrap_or(Value::Null);
+        reduce_limit("rereduce", &Value::Array(vals.to_vec()), ctx, src, out)
+    }
+
+    /// What fabric's coordinator makes of a reduction: rereduced once more
+    /// (with the view as context), and finalized.
+    fn coordinator(&self, v: Value, ctx: &str) -> Value {
+        match &self.reducer {
+            Reducer::Js(f, i, src) => self.js_rereduce(f, *i, src, std::slice::from_ref(&v), ctx),
+            _ => v,
+        }
+    }
+
     pub fn cmp_key(&self, a: &Value, b: &Value) -> Ordering {
         if self.raw { cmp_json_raw(a, b) } else { cmp_json(a, b) }
     }
@@ -99,7 +168,7 @@ impl ViewSpec {
             Reducer::None => return None,
             Reducer::Count => json!(kvs.len()),
             Reducer::Sum => builtin_sum(kvs.iter().map(|(_, v)| v)),
-            Reducer::Stats => builtin_stats(kvs.iter().map(|(_, v)| v.clone()).collect(), false),
+            Reducer::Stats => builtin_stats(kvs.iter().map(|(_, v)| v.clone()).collect()),
             Reducer::ApproxCountDistinct => {
                 let mut h = Hll::new();
                 for (k, _) in kvs {
@@ -114,7 +183,12 @@ impl ViewSpec {
                 let rows = kvs.iter().map(|(k, v)| json!([k.get(0).cloned().unwrap_or(Value::Null), k.get(1).cloned().unwrap_or(Value::Null), v]));
                 self.first_last(rows.collect(), matches!(self.reducer, Reducer::First))
             }
-            Reducer::Js(f, i) => f.reduce(*i, kvs).unwrap_or_else(red_err),
+            // couchjs' runReduce: a function that throws reduces to null.
+            Reducer::Js(f, i, src) => {
+                let out = f.reduce(*i, kvs).unwrap_or(Value::Null);
+                let kvs = Value::Array(kvs.iter().map(|(k, v)| json!([k, v])).collect());
+                reduce_limit("reduce", &kvs, "", src, out)
+            }
         })
     }
 
@@ -139,11 +213,15 @@ impl ViewSpec {
     }
 
     pub fn rereduce_values(&self, vals: &[Value]) -> Option<Value> {
+        // A failure below fails the whole.
+        if let Some(f) = vals.iter().find(|v| as_failure(v).is_some()) {
+            return Some(f.clone());
+        }
         Some(match &self.reducer {
             Reducer::None => return None,
-            Reducer::Count => json!(vals.iter().filter_map(|v| v.as_u64()).sum::<u64>()),
+            Reducer::Count => builtin_sum(vals.iter()),
             Reducer::Sum => builtin_sum(vals.iter()),
-            Reducer::Stats => builtin_stats(vals.to_vec(), true),
+            Reducer::Stats => builtin_stats(vals.to_vec()),
             Reducer::ApproxCountDistinct => {
                 let mut h = Hll::new();
                 for v in vals {
@@ -159,7 +237,8 @@ impl ViewSpec {
                 let rows = vals.iter().filter(|v| v.as_array().is_some_and(|a| a.len() == 3)).cloned().collect();
                 self.first_last(rows, matches!(self.reducer, Reducer::First))
             }
-            Reducer::Js(f, i) => f.rereduce(*i, vals).unwrap_or_else(red_err),
+            // os_rereduce/4: an overflow below is the answer.
+            Reducer::Js(f, i, src) => self.js_rereduce(f, *i, src, vals, ""),
         })
     }
 }
@@ -196,90 +275,264 @@ impl Spec for ViewSpec {
     }
 }
 
-fn builtin_sum<'a>(vals: impl Iterator<Item = &'a Value>) -> Value {
-    let mut acc: Option<Value> = None;
-    for v in vals {
-        acc = Some(match acc {
-            None => v.clone(),
-            Some(a) => sum2(&a, v),
-        });
-    }
-    acc.unwrap_or(json!(0))
+// ------------------------------------------------- builtin reductions
+//
+// couch_query_servers' _sum and _stats. Where CouchDB throws inside the
+// B-tree a reduction is a failure, and the index update fails with it;
+// _sum's own errors are values, as CouchDB catches them.
+
+const SUM_ERROR: &str = "The _sum function requires that map values be numbers, arrays of numbers, or objects. Objects cannot be mixed with other data structures. Objects can be arbitrarily nested, provided that the values for all fields are themselves numbers, arrays of numbers, or objects.";
+
+/// The member a failed reduction is kept under.
+const FAILURE: &str = "\u{0}couchdb_rs_reduce_failure";
+
+fn failure(error: &str, reason: String) -> Value {
+    json!({ FAILURE: [error, reason] })
 }
 
-fn num(v: f64) -> Value {
-    if v.fract() == 0.0 && v.abs() < 9.0e15 {
-        json!(v as i64)
-    } else {
-        json!(v)
+/// A failed reduction's error and reason.
+fn as_failure(v: &Value) -> Option<(String, String)> {
+    let f = v.as_object().filter(|o| o.len() == 1)?.get(FAILURE)?.as_array()?;
+    Some((f.first()?.as_str()?.to_string(), f.get(1)?.as_str()?.to_string()))
+}
+
+fn int_of(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from))
+}
+
+fn from_int(i: i128) -> Option<Value> {
+    i64::try_from(i).map(Value::from).or_else(|_| u64::try_from(i).map(Value::from)).ok()
+}
+
+/// Erlang arithmetic: integers stay integers.
+fn arith(a: &serde_json::Number, b: &serde_json::Number, op: fn(i128, i128) -> Option<i128>, fop: fn(f64, f64) -> f64) -> Result<Value> {
+    if let (Some(x), Some(y)) = (int_of(a), int_of(b))
+        && let Some(v) = op(x, y).and_then(from_int)
+    {
+        return Ok(v);
+    }
+    serde_json::Number::from_f64(fop(a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0)))
+        .map(Value::Number)
+        .ok_or_else(|| CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, "unknown_error", "badarith"))
+}
+
+fn add(a: &serde_json::Number, b: &serde_json::Number) -> Result<Value> {
+    arith(a, b, i128::checked_add, |x, y| x + y)
+}
+
+fn num_cmp(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
+    match (int_of(a), int_of(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => a.as_f64().unwrap_or(0.0).partial_cmp(&b.as_f64().unwrap_or(0.0)).unwrap_or(Ordering::Equal),
     }
 }
 
-fn sum2(a: &Value, b: &Value) -> Value {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => {
-            if let (Some(p), Some(q)) = (x.as_i64(), y.as_i64())
-                && let Some(s) = p.checked_add(q) {
-                    return json!(s);
+/// Why a _sum stopped: an error object to return, or a crash.
+enum SumStop {
+    /// {builtin_reduce_error, Obj} and {invalid_value, Reason, Cause}.
+    Value(Value),
+    Crash(String, String),
+}
+
+fn sum_invalid(cause: &Value) -> SumStop {
+    SumStop::Value(json!({"error": "builtin_reduce_error", "reason": SUM_ERROR, "caused_by": cause}))
+}
+
+fn sum_crash(e: CouchError) -> SumStop {
+    SumStop::Crash(e.error, e.reason)
+}
+
+/// sum_values/2: the next value added to the sum so far.
+fn sum_values(v: &Value, acc: &Value) -> std::result::Result<Value, SumStop> {
+    match (v, acc) {
+        (Value::Number(x), Value::Number(y)) => add(y, x).map_err(sum_crash),
+        (Value::Array(x), Value::Array(y)) => sum_arrays(y, x),
+        (Value::Number(_), Value::Array(y)) => sum_arrays(y, std::slice::from_ref(v)),
+        (Value::Array(x), Value::Number(_)) => sum_arrays(std::slice::from_ref(acc), x),
+        (Value::Object(props), _) => {
+            match props.get("error") {
+                Some(Value::String(e)) if e == "builtin_reduce_error" => return Err(SumStop::Value(v.clone())),
+                None => {}
+                Some(other) => {
+                    let e = format!("{{case_clause,{{{},{}}}}}", crate::mango::erl_w(&json!("error")), crate::mango::erl_w(other));
+                    return Err(SumStop::Crash(e, String::new()));
                 }
-            num(x.as_f64().unwrap_or(0.0) + y.as_f64().unwrap_or(0.0))
-        }
-        (Value::Array(x), Value::Array(y)) => {
-            let n = x.len().max(y.len());
-            Value::Array(
-                (0..n)
-                    .map(|i| match (x.get(i), y.get(i)) {
-                        (Some(p), Some(q)) => sum2(p, q),
-                        (Some(p), None) | (None, Some(p)) => p.clone(),
-                        _ => json!(0),
-                    })
-                    .collect(),
-            )
-        }
-        (Value::Number(_), Value::Array(_)) => sum2(&json!([a]), b),
-        (Value::Array(_), Value::Number(_)) => sum2(a, &json!([b])),
-        (Value::Object(x), Value::Object(y)) => {
-            let mut m = x.clone();
-            for (k, v) in y {
-                let nv = match m.get(k) {
-                    Some(e) => sum2(e, v),
-                    None => v.clone(),
-                };
-                m.insert(k.clone(), nv);
             }
-            Value::Object(m)
+            match acc {
+                Value::Number(n) if int_of(n) == Some(0) => Ok(v.clone()),
+                Value::Object(acc_props) => sum_objects(props, acc_props),
+                other => Err(SumStop::Crash(format!("{{case_clause,{}}}", crate::mango::erl_w(other)), String::new())),
+            }
         }
-        _ => json!({"error": "builtin_reduce_error", "reason": "The _sum function requires that map values be numbers, arrays of numbers, or objects."}),
+        _ => Err(sum_invalid(v)),
     }
 }
 
-fn builtin_stats(vals: Vec<Value>, rereduce: bool) -> Value {
-    let mut sum = 0.0;
-    let mut count = 0.0;
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    let mut sumsqr = 0.0;
-    for v in vals {
-        if rereduce {
-            sum += v["sum"].as_f64().unwrap_or(0.0);
-            count += v["count"].as_f64().unwrap_or(0.0);
-            min = min.min(v["min"].as_f64().unwrap_or(f64::INFINITY));
-            max = max.max(v["max"].as_f64().unwrap_or(f64::NEG_INFINITY));
-            sumsqr += v["sumsqr"].as_f64().unwrap_or(0.0);
-        } else if let Some(x) = v.as_f64() {
-            sum += x;
-            count += 1.0;
-            min = min.min(x);
-            max = max.max(x);
-            sumsqr += x * x;
-        } else if v.get("count").is_some() && v.get("sum").is_some() {
-            // Pre-aggregated stats objects are accepted like CouchDB does.
-            return builtin_stats(vec![v], true);
-        } else {
-            return json!({"error": "builtin_reduce_error", "reason": "The _stats function requires that map values be numbers or arrays of numbers"});
+/// sum_objects/2: two objects' members merged in key order, those in both
+/// summed.
+fn sum_objects(a: &Map<String, Value>, b: &Map<String, Value>) -> std::result::Result<Value, SumStop> {
+    let mut x: Vec<(&String, &Value)> = a.iter().collect();
+    let mut y: Vec<(&String, &Value)> = b.iter().collect();
+    x.sort_by(|p, q| p.0.as_bytes().cmp(q.0.as_bytes()));
+    y.sort_by(|p, q| p.0.as_bytes().cmp(q.0.as_bytes()));
+    let (mut i, mut j) = (0, 0);
+    let mut out = Map::new();
+    while i < x.len() && j < y.len() {
+        match x[i].0.as_bytes().cmp(y[j].0.as_bytes()) {
+            Ordering::Equal => {
+                out.insert(x[i].0.clone(), sum_values(x[i].1, y[j].1)?);
+                i += 1;
+                j += 1;
+            }
+            Ordering::Less => {
+                out.insert(x[i].0.clone(), x[i].1.clone());
+                i += 1;
+            }
+            Ordering::Greater => {
+                out.insert(y[j].0.clone(), y[j].1.clone());
+                j += 1;
+            }
         }
     }
-    json!({"sum": num(sum), "count": num(count), "min": num(min), "max": num(max), "sumsqr": num(sumsqr)})
+    for (k, v) in x[i..].iter().chain(&y[j..]) {
+        out.insert((*k).clone(), (*v).clone());
+    }
+    Ok(Value::Object(out))
+}
+
+/// sum_arrays/2: element by element, the longer's tail kept.
+fn sum_arrays(xs: &[Value], ys: &[Value]) -> std::result::Result<Value, SumStop> {
+    let mut out = Vec::with_capacity(xs.len().max(ys.len()));
+    let mut k = 0;
+    while k < xs.len() && k < ys.len() {
+        match (&xs[k], &ys[k]) {
+            (Value::Number(a), Value::Number(b)) => out.push(add(a, b).map_err(sum_crash)?),
+            _ => return Err(sum_invalid(&Value::Array(xs[k..].to_vec()))),
+        }
+        k += 1;
+    }
+    out.extend(xs[k..].iter().chain(&ys[k..]).cloned());
+    Ok(Value::Array(out))
+}
+
+/// builtin_sum_rows/2: the values summed, or the error that stopped it.
+fn builtin_sum<'a>(vals: impl Iterator<Item = &'a Value>) -> Value {
+    let mut acc = json!(0);
+    for v in vals {
+        acc = match sum_values(v, &acc) {
+            Ok(a) => a,
+            Err(SumStop::Value(e)) => return e,
+            Err(SumStop::Crash(e, r)) => return failure(&e, r),
+        };
+    }
+    acc
+}
+
+/// One _stats accumulator: sum, count, min, max and sum of squares.
+#[derive(Clone)]
+struct Stat([Value; 5]);
+
+enum StatAcc {
+    One(Box<Stat>),
+    Many(Vec<StatAcc>),
+}
+
+type StatResult<T> = std::result::Result<T, (String, String)>;
+
+fn invalid_value(reason: String) -> (String, String) {
+    ("invalid_value".into(), reason)
+}
+
+fn stat_of(n: &serde_json::Number) -> StatResult<Stat> {
+    let sqr = arith(n, n, i128::checked_mul, |x, y| x * y).map_err(|e| (e.error, e.reason))?;
+    Ok(Stat([Value::Number(n.clone()), json!(1), Value::Number(n.clone()), Value::Number(n.clone()), sqr]))
+}
+
+/// An object's members as ~p shows a proplist.
+fn proplist_p(o: &Map<String, Value>) -> String {
+    let p = crate::mango::erl_p(&Value::Object(o.clone()));
+    format!("[{}]", &p[2..p.len() - 2])
+}
+
+/// unpack_stats/1: a pre-reduced {sum, count, min, max, sumsqr}.
+fn unpack_stats(o: &Map<String, Value>) -> StatResult<Stat> {
+    let mut out: [Value; 5] = Default::default();
+    for (i, k) in ["sum", "count", "min", "max", "sumsqr"].iter().enumerate() {
+        out[i] = match o.get(*k) {
+            Some(v @ Value::Number(_)) => v.clone(),
+            None => return Err(invalid_value(format!("user _stats input missing required field {k} ({})", proplist_p(o)))),
+            Some(other) => {
+                return Err(invalid_value(format!("non-numeric _stats input received for {k}: {}", crate::mango::erl_w(other))));
+            }
+        };
+    }
+    Ok(Stat(out))
+}
+
+/// build_initial_accumulator/1.
+fn initial_stats(v: &Value) -> StatResult<StatAcc> {
+    match v {
+        Value::Array(l) => Ok(StatAcc::Many(l.iter().map(initial_stats).collect::<StatResult<_>>()?)),
+        Value::Number(n) => Ok(StatAcc::One(Box::new(stat_of(n)?))),
+        Value::Object(o) => Ok(StatAcc::One(Box::new(unpack_stats(o)?))),
+        other => Err(invalid_value(format!("non-numeric _stats input: {}", crate::mango::erl_w(other)))),
+    }
+}
+
+/// stat_values/2.
+fn stat_values(v: &Value, acc: StatAcc) -> StatResult<StatAcc> {
+    match (v, acc) {
+        (Value::Array(l), StatAcc::Many(accs)) => {
+            if l.len() != accs.len() {
+                return Err(("unknown_error".into(), "function_clause".into()));
+            }
+            Ok(StatAcc::Many(l.iter().zip(accs).map(|(x, a)| stat_values(x, a)).collect::<StatResult<_>>()?))
+        }
+        (Value::Object(o), StatAcc::One(a)) => Ok(StatAcc::One(Box::new(combine_stats(unpack_stats(o)?, *a)?))),
+        (Value::Number(n), StatAcc::One(a)) => Ok(StatAcc::One(Box::new(combine_stats(stat_of(n)?, *a)?))),
+        (other, _) => Err(invalid_value(format!(
+            "The _stats function requires that map values be numbers or arrays of numbers, not '{}'",
+            crate::mango::erl_p(other)
+        ))),
+    }
+}
+
+fn combine_stats(new: Stat, acc: Stat) -> StatResult<Stat> {
+    let n = |v: &Value| match v {
+        Value::Number(n) => n.clone(),
+        _ => serde_json::Number::from(0),
+    };
+    let sum = |i: usize| add(&n(&new.0[i]), &n(&acc.0[i])).map_err(|e| (e.error, e.reason));
+    // min/2 and max/2 give the first of equals.
+    let min = if num_cmp(&n(&new.0[2]), &n(&acc.0[2])) == Ordering::Greater { acc.0[2].clone() } else { new.0[2].clone() };
+    let max = if num_cmp(&n(&new.0[3]), &n(&acc.0[3])) == Ordering::Less { acc.0[3].clone() } else { new.0[3].clone() };
+    Ok(Stat([sum(0)?, sum(1)?, min, max, sum(4)?]))
+}
+
+fn pack_stats(a: StatAcc) -> Value {
+    match a {
+        StatAcc::One(stat) => {
+            let Stat([sum, count, min, max, sumsqr]) = *stat;
+            json!({"sum": sum, "count": count, "min": min, "max": max, "sumsqr": sumsqr})
+        }
+        StatAcc::Many(l) => Value::Array(l.into_iter().map(pack_stats).collect()),
+    }
+}
+
+/// builtin_stats/2, reducing or rereducing (the reductions are packed).
+fn builtin_stats(vals: Vec<Value>) -> Value {
+    let mut it = vals.iter();
+    let Some(first) = it.next() else { return json!({"sum": 0, "count": 0, "min": 0, "max": 0, "sumsqr": 0}) };
+    let res = initial_stats(first).and_then(|mut acc| {
+        for v in it {
+            acc = stat_values(v, acc)?;
+        }
+        Ok(acc)
+    });
+    match res {
+        Ok(acc) => pack_stats(acc),
+        Err((e, r)) => failure(&e, r),
+    }
 }
 
 /// HyperLogLog for _approx_count_distinct.
@@ -430,7 +683,7 @@ fn parse_reducer(src: &str, js_red: &mut Vec<String>, ddoc: &Value) -> Result<Re
         s => {
             js_red.push(s.to_string());
             // placeholder index fixed up once JsFuns exists
-            Reducer::Js(JsFuns::new(&Value::Null, &[], &[]), js_red.len() - 1)
+            Reducer::Js(JsFuns::new(&Value::Null, &[], &[]), js_red.len() - 1, Arc::from(s))
         }
     })
 }
@@ -578,8 +831,8 @@ impl IndexDef {
         };
         if let Some(j) = &js {
             for d in defs.iter_mut() {
-                if let Reducer::Js(_, i) = &d.reducer {
-                    d.reducer = Reducer::Js(j.clone(), *i);
+                if let Reducer::Js(_, i, src) = &d.reducer {
+                    d.reducer = Reducer::Js(j.clone(), *i, src.clone());
                 }
             }
         }
@@ -871,6 +1124,7 @@ impl Index {
             let empty = st.seq == 0 && st.ids.root.is_none() && st.views.iter().all(|v| v.root.is_none());
             if empty && bulk_enabled() {
                 self.bulk_build(&snap, &mut st, &task)?;
+                check_failures(&st)?;
                 self.commit(&st)?;
                 *self.state.write() = st.clone();
                 return Ok(st);
@@ -1141,6 +1395,7 @@ impl Index {
         for (vi, acts) in view_acts.into_iter().enumerate() {
             st.views[vi] = st.views[vi].modify(acts)?;
         }
+        check_failures(st)?;
         st.seq = last_seq;
         Ok(())
     }
@@ -1284,6 +1539,9 @@ fn key_range(args: &QueryArgs, spec: &ViewSpec) -> Range<VKey> {
 }
 
 fn group_key(args: &QueryArgs, key: &Value) -> Value {
+    if args.group_level == Some(0) {
+        return Value::Null;
+    }
     if let Some(l) = args.group_level {
         if let Value::Array(a) = key {
             return Value::Array(a.iter().take(l).cloned().collect());
@@ -1294,6 +1552,9 @@ fn group_key(args: &QueryArgs, key: &Value) -> Value {
 }
 
 fn same_group(args: &QueryArgs, spec: &ViewSpec, a: &Value, b: &Value) -> bool {
+    if args.group_level == Some(0) {
+        return true;
+    }
     if let Some(l) = args.group_level {
         return match (a, b) {
             (Value::Array(x), Value::Array(y)) => {
@@ -1348,6 +1609,8 @@ pub struct ViewResult {
 pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, args: &QueryArgs) -> Result<ViewResult> {
     let tree = &st.views[vi];
     let vdef = &def.views[vi];
+    // fabric_view's reduce context: the view, as a path.
+    let ctx = format!("{}/{}/_view/{}", snap.name, def.ddoc_id, vdef.name);
     let has_reduce = !matches!(vdef.reducer, Reducer::None);
     let reduce = args.reduce.unwrap_or(has_reduce);
     if reduce && !has_reduce
@@ -1423,14 +1686,16 @@ pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, a
                     if rows.len() >= args.limit {
                         return Ok(false);
                     }
-                    let v = red.red.map(|j| finalize_red(&vdef.reducer, j.0)).unwrap_or(Value::Null);
-                    if let Some(e) = v.get("error").filter(|_| v.get("reason").is_some()) {
-                        err = Some(CouchError::new(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            e.as_str().unwrap_or("reduce_error"),
-                            v["reason"].as_str().unwrap_or("").to_string(),
-                        ));
+                    let v = red.red.map(|j| j.0).unwrap_or(Value::Null);
+                    let v = finalize_red(&vdef.reducer, spec.coordinator(v, &ctx));
+                    if let Some((e, r)) = as_failure(&v) {
+                        err = Some(CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, &e, r).with_ref());
                         return Ok(false);
+                    }
+                    // fabric_view_row:transform/1 of an overflow.
+                    if is_overflow(&v) {
+                        rows.push(json!({"key": null, "error": "reduce_overflow_error", "reason": v["reduce_overflow_error"]}));
+                        return Ok(true);
                     }
                     rows.push(json!({"key": group_key(args, &user_key(&k.0.0)), "value": v}));
                     Ok(true)
@@ -1528,15 +1793,17 @@ pub fn prepare(db: &Arc<Db>, dir: PathBuf, ddoc_id: &str, update: &str) -> Resul
 }
 
 fn view_response(res: ViewResult, args: &QueryArgs) -> Value {
-    let mut out = if res.reduced {
-        json!({"rows": res.rows})
-    } else {
-        json!({"total_rows": res.total_rows, "offset": res.offset, "rows": res.rows})
-    };
-    if args.update_seq {
-        out["update_seq"] = json!(res.update_seq);
+    let mut out = Map::new();
+    if !res.reduced {
+        out.insert("total_rows".into(), json!(res.total_rows));
+        out.insert("offset".into(), json!(res.offset));
     }
-    out
+    // update_seq comes before the rows.
+    if args.update_seq {
+        out.insert("update_seq".into(), json!(res.update_seq));
+    }
+    out.insert("rows".into(), Value::Array(res.rows));
+    Value::Object(out)
 }
 
 /// Query a view: {total_rows, offset, rows} for map results, {rows} for
@@ -1593,7 +1860,7 @@ pub async fn http_view(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Re
         _ => return not_allowed("GET,POST,HEAD"),
     }
     crate::stat!("couchdb.httpd.view_reads").inc();
-    ok_json(view_json(req, db, ddoc_id, view, &args)?)
+    Ok(crate::http::rows_response(&view_json(req, db, ddoc_id, view, &args)?))
 }
 
 pub async fn http_view_queries(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Result<Response> {
@@ -1614,13 +1881,17 @@ pub async fn http_view_queries(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &st
         let mut results = Vec::new();
         for q in &queries {
             let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
-            let args = QueryArgs::from_obj(obj, base.clone())?;
+            let args = QueryArgs::from_query(obj, base.clone())?;
             check_partition(&idx.def, &args)?;
             results.push(view_response(query_view(&snap, &st, &idx.def, vi, &args)?, &args));
         }
         Ok(json!({"results": results}))
+    }).map_err(|mut e| {
+        // multi_query_view/4 sends its errors without a stack.
+        e.stack_ref = None;
+        e
     })?;
-    ok_json(v)
+    Ok(crate::http::rows_response(&v))
 }
 
 pub async fn http_ddoc_info(req: &Req, db: &Arc<Db>, ddoc_id: &str) -> Result<Response> {

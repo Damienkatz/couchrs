@@ -232,10 +232,16 @@ def local_docs():
     eq((s, b["rev"]), (201, "0-1"))
     s, b, _ = req("PUT", f"/{db}/_local/cp", {"_rev": "0-1", "seq": 2})
     eq(b["rev"], "0-2")
+    # No conflicts: the revision given, plus one (increment_local_doc_revs/1).
     s, b, _ = req("PUT", f"/{db}/_local/cp", {"_rev": "0-1", "seq": 3})
-    eq(s, 409)
+    eq((s, b["rev"]), (201, "0-2"))
     s, b, _ = req("GET", f"/{db}/_local/cp")
-    eq(b, {"_id": "_local/cp", "_rev": "0-2", "seq": 2})
+    eq(b, {"_id": "_local/cp", "_rev": "0-2", "seq": 3})
+    eq(req("PUT", f"/{db}/_local/x", {"_rev": "0-9"})[1]["rev"], "0-10")
+    eq(req("PUT", f"/{db}/_local/x", {"_rev": "1-abc"})[:2], (500, {"error": "error", "reason": "Invalid rev format"}))
+    eq(req("DELETE", f"/{db}/_local/x")[:2], (200, {"ok": True, "id": "_local/x", "rev": "0-0"}))
+    eq(req("DELETE", f"/{db}/_local/x")[:2], (404, {"error": "not_found", "reason": "missing"}))
+    eq(req("DELETE", f"/{db}/nope")[:2], (404, {"error": "not_found", "reason": "missing"}))
     s, b, _ = req("GET", f"/{db}/_local_docs")
     eq([r["id"] for r in b["rows"]], ["_local/cp"])
     s, b, _ = req("GET", f"/{db}/_changes")
@@ -331,7 +337,8 @@ def changes_feed():
     t.join(15)
     eq([r["id"] for r in result["r"][1]["results"]], ["late"])
     # continuous with timeout ends with last_seq
-    r = urllib.request.urlopen(BASE + f"/{db}/_changes?feed=continuous&timeout=300", timeout=10)
+    creds = {"Authorization": "Basic " + base64.b64encode(CREDS.encode()).decode()} if CREDS else {}
+    r = urllib.request.urlopen(urllib.request.Request(BASE + f"/{db}/_changes?feed=continuous&timeout=300", headers=creds), timeout=10)
     lines = [json.loads(l) for l in r.read().decode().splitlines() if l.strip()]
     eq(lines[-1].keys() >= {"last_seq"}, True)
     eq(len(lines), 7)
@@ -351,7 +358,7 @@ def views():
     ddoc = {"views": {
         "by_author": {"map": "function(doc) { if (doc.type == 'post') emit(doc.author, doc.words); }", "reduce": "_sum"},
         "by_tag": {"map": "function(doc) { (doc.tags||[]).forEach(function(t) { emit([t, doc.author], 1); }); }", "reduce": "_count"},
-        "stats": {"map": "function(doc) { emit(null, doc.words); }", "reduce": "_stats"},
+        "stats": {"map": "function(doc) { if (doc.words !== undefined) emit(null, doc.words); }", "reduce": "_stats"},
         "js_red": {"map": "function(doc) { emit(doc.author, doc.words); }",
                    "reduce": "function(k, v, re) { return Math.max.apply(null, v); }"},
         "dup": {"map": "function(doc) { emit(1, 1); emit(1, 2); }"},
@@ -406,6 +413,16 @@ def views():
     eq(b["name"], "v")
     s, b, _ = req("GET", f"/{db}/_design/v/_view/missing")
     eq(s, 404)
+    # A value _stats can't take fails the index, every view of it (the
+    # B-tree's reduce throws); _sum's errors are values.
+    req("PUT", f"/{db}/_design/bad", {"views": {"s": {"map": "function(doc) { if (doc.k !== undefined) emit(doc._id, doc.k); }", "reduce": "_stats"},
+                                                "m": {"map": "function(doc) { emit(1, 1); }"}}})
+    for path in ["s", "m", "s?reduce=false"]:
+        s, b, _ = req("GET", f"/{db}/_design/bad/_view/{path}")
+        eq((s, b["error"]), (500, "invalid_value"), path)
+    req("PUT", f"/{db}/_design/sum", {"views": {"s": {"map": "function(doc) { if (doc.k !== undefined) emit(doc._id, doc.k); }", "reduce": "_sum"}}})
+    s, b, _ = req("GET", f"/{db}/_design/sum/_view/s")
+    eq((s, b["rows"][0]["value"]["error"]), (200, "builtin_reduce_error"))
     s, b, _ = req("GET", f"/{db}/_design/v/_view/dup?group=true")
     eq(s, 400)
     # view survives a ddoc-unrelated restart of the index (same signature)
@@ -908,6 +925,10 @@ def proxy_and_jwt_auth():
              "{chttpd_auth, jwt_authentication_handler}, {chttpd_auth, cookie_authentication_handler}, "
              "{chttpd_auth, default_authentication_handler}")
         time.sleep(0.5)
+        # CouchDB reads authentication_handlers only when chttpd starts.
+        if "proxy" not in req("GET", "/_session", headers=ADMIN)[1]["info"]["authentication_handlers"]:
+            print("     (authentication_handlers not changed at runtime: skipped)")
+            return
 
         def session(headers):
             s, b, _ = req("GET", "/_session", headers={"Authorization": "", **headers})
@@ -1314,8 +1335,11 @@ def fauxton_web_ui():
         raise AssertionError("expected a redirect")
     except urllib.error.HTTPError as e:
         eq(e.code, 301)
-        eq(e.headers["Location"], "/_utils/")
+        eq(e.headers["Location"], f"{BASE}/_utils/")
     s, html, h = req("GET", "/_utils/", raw=True)
+    if s == 404 and req("GET", "/")[1]["vendor"]["name"] != "couchdb-rs":
+        print("     (this CouchDB was built without Fauxton: skipped)")
+        return
     eq(s, 200)
     assert h["Content-Type"].startswith("text/html"), h["Content-Type"]
     assert b"Project Fauxton" in html
@@ -1339,13 +1363,16 @@ def fauxton_web_ui():
 @test
 def delete_and_recreate_while_in_use():
     db = new_db()
+    # CouchDB's cluster layer answers 500s ("No DB shards could be opened",
+    # internal_server_error) while its shards come and go.
+    couchdb = req("GET", "/")[1]["vendor"]["name"] != "couchdb-rs"
     stop = threading.Event()
     bad = []
 
     def check(what, s, b):
         # Deleted underneath, a write may see 404 (or 409/412 racing the
         # recreate), never a server error.
-        if s >= 500:
+        if s >= 500 and not couchdb:
             bad.append((what, s, b))
 
     def writer(n):

@@ -38,7 +38,7 @@ pub fn serve(req: &Req) -> Result<Response> {
     if req.path.len() == 1 && !req.trailing_slash {
         return Ok(Response::builder()
             .status(StatusCode::MOVED_PERMANENTLY)
-            .header(header::LOCATION, "/_utils/")
+            .header(header::LOCATION, crate::http::absolute_uri(req, "/_utils/"))
             .body(Body::empty())
             .unwrap());
     }

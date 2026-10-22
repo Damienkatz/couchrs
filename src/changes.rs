@@ -207,7 +207,8 @@ fn collect(snap: &Snapshot, args: &mut ChangesArgs, since: u64, limit: usize) ->
     let dir = if args.descending { Dir::Rev } else { Dir::Fwd };
     let mut last = since;
     let req = args.req_json.clone();
-    let start = if args.descending && since == 0 { 0 } else { since };
+    // Descending starts at the newest change, whatever `since` says.
+    let start = if args.descending { 0 } else { since };
     snap.fold_changes(start, dir, |fdi| {
         // Check the limit before advancing `last`: a change we stop in
         // front of must not be covered by last_seq, or a client that
@@ -276,12 +277,19 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
             } else {
                 json!(snap.seq_str(last))
             };
-            let pend = if args.descending { 0 } else { pending(&snap, last) };
+            // Descending, what's left are the changes before the last row.
+            let pend = if args.descending {
+                let lowest = rows.last().and_then(|r| parse_seq(&r["seq"])).unwrap_or(u64::MAX);
+                snap.pending_before(lowest)
+            } else {
+                pending(&snap, last)
+            };
             let mut out = json!({"results": rows, "last_seq": last_seq, "pending": pend});
             if args.db_updates {
                 out.as_object_mut().map(|o| o.shift_remove("pending"));
+                return Ok(json_response(StatusCode::OK, &out));
             }
-            Ok(json_response(StatusCode::OK, &out))
+            Ok(changes_response(&out, false))
         }
         "longpoll" => {
             let _client = FeedClient::new();
@@ -297,8 +305,9 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
                     let mut out = json!({"results": rows, "last_seq": snap.seq_str(last), "pending": pend});
                     if args.db_updates {
                         out.as_object_mut().map(|o| o.shift_remove("pending"));
+                        return Ok(json_response(StatusCode::OK, &out));
                     }
-                    return Ok(json_response(StatusCode::OK, &out));
+                    return Ok(changes_response(&out, false));
                 }
                 args.since = last;
                 let wait = tokio::time::timeout_at(deadline, rx.changed()).await;
@@ -307,8 +316,9 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
                     let mut out = json!({"results": [], "last_seq": snap.seq_str(args.since), "pending": 0});
                     if args.db_updates {
                         out.as_object_mut().map(|o| o.shift_remove("pending"));
+                        return Ok(json_response(StatusCode::OK, &out));
                     }
-                    return Ok(json_response(StatusCode::OK, &out));
+                    return Ok(changes_response(&out, true));
                 }
             }
         }
@@ -527,4 +537,14 @@ pub fn start_global_changes(server: &Arc<crate::server::Server>) {
             }
         }
     });
+}
+
+/// A normal or longpoll feed's response, laid out as chttpd_db sends it.
+fn changes_response(v: &Value, timed_out: bool) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "must-revalidate")
+        .body(Body::from(crate::json::changes_body(v, timed_out)))
+        .unwrap()
 }
