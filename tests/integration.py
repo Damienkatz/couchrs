@@ -580,6 +580,41 @@ def concurrent_writers():
 
 
 @test
+def fauxton_web_ui():
+    r = urllib.request.Request(BASE + "/_utils", method="GET")
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    try:
+        urllib.request.build_opener(NoRedirect).open(r, timeout=30)
+        raise AssertionError("expected a redirect")
+    except urllib.error.HTTPError as e:
+        eq(e.code, 301)
+        eq(e.headers["Location"], "/_utils/")
+    s, html, h = req("GET", "/_utils/", raw=True)
+    eq(s, 200)
+    assert h["Content-Type"].startswith("text/html"), h["Content-Type"]
+    assert b"Project Fauxton" in html
+    # Every script and stylesheet index.html names is served.
+    import re
+    assets = re.findall(rb'(?:src|href)="(dashboard\.assets/[^"]+)"', html)
+    assert assets, html[:200]
+    for a in assets:
+        s, body, h = req("GET", "/_utils/" + a.decode(), raw=True)
+        eq(s, 200, a)
+        assert len(body) > 0
+        assert h["Content-Type"] in ("application/javascript", "text/css", "image/png"), (a, h["Content-Type"])
+    s, _, _ = req("GET", "/_utils/missing.js")
+    eq(s, 404)
+    s, _, _ = req("GET", "/_utils/../_all_dbs")
+    assert s in (400, 404), s
+    s, b, _ = req("GET", "/_cluster_setup")
+    eq(b, {"state": "single_node_enabled"})
+
+
+@test
 def delete_and_recreate_while_in_use():
     db = new_db()
     stop = threading.Event()

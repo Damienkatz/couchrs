@@ -22,6 +22,8 @@ pub struct Req {
     pub headers: HeaderMap,
     pub body: Bytes,
     pub server: Arc<Server>,
+    /// Whether the raw path ended in '/' (lost when splitting `path`).
+    pub trailing_slash: bool,
 }
 
 impl Req {
@@ -148,6 +150,7 @@ pub async fn handle(State(server): State<Arc<Server>>, req: Request) -> Response
         headers: parts.headers,
         body,
         server,
+        trailing_slash: raw_path.ends_with('/'),
     };
     let is_head = method == Method::HEAD;
     let resp = match authorize(&req) {
@@ -171,7 +174,9 @@ fn authorize(req: &Req) -> Result<()> {
     let Some((user, pass)) = &req.server.config.admin else {
         return Ok(());
     };
-    if req.path.is_empty() || req.path[0] == "_up" || req.path[0] == "_session" {
+    // Like CouchDB, the welcome, _up, _session and the web UI's static
+    // files need no credentials; Fauxton logs in through _session.
+    if req.path.is_empty() || matches!(req.path[0].as_str(), "_up" | "_session" | "_utils") {
         return Ok(());
     }
     if let Some(h) = req.header("authorization")
@@ -242,6 +247,7 @@ async fn route(req: Req) -> Result<Response> {
         Some("_uuids") => uuids(&req),
         Some("_up") => ok_json(json!({"status": "ok", "seeds": {}})),
         Some("_session") => session(&req),
+        Some("_utils") => crate::fauxton::serve(&req),
         Some("_active_tasks") => ok_json(json!([])),
         Some("_membership") => ok_json(json!({
             "all_nodes": ["couchdb@127.0.0.1"], "cluster_nodes": ["couchdb@127.0.0.1"]
@@ -254,6 +260,15 @@ async fn route(req: Req) -> Result<Response> {
         )),
         Some("_scheduler") => ok_json(json!({"total_rows": 0, "offset": 0, "docs": [], "jobs": []})),
         Some("_db_updates") => crate::changes::db_updates(req).await,
+        // Fauxton's setup page asks this; couchdb-rs is always one node.
+        Some("_cluster_setup") => match req.method {
+            Method::GET | Method::HEAD => ok_json(json!({"state": "single_node_enabled"})),
+            _ => Err(CouchError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "couchdb-rs is a single node; set the admin and bind address on its command line.",
+            )),
+        },
         Some("favicon.ico") => Err(CouchError::not_found("missing")),
         Some(s) if s.starts_with('_') && !matches!(s, "_users" | "_replicator" | "_global_changes") => {
             Err(CouchError::new(
@@ -415,7 +430,13 @@ fn node(req: &Req) -> Result<Response> {
             "couchdb": {"database_dir": req.server.config.data_dir.to_string_lossy()},
             "chttpd": {"bind_address": req.server.config.bind}
         })),
-        ["_config", _, _] if req.method == Method::PUT => ok_json(json!("")),
+        // Settings come from the command line; refuse edits rather than
+        // pretend to apply them.
+        ["_config", ..] if req.method != Method::GET && req.method != Method::HEAD => Err(CouchError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_implemented",
+            "couchdb-rs takes its configuration from the command line; it can't be changed over HTTP.",
+        )),
         ["_config", ..] => ok_json(json!({})),
         ["_stats", ..] => ok_json(json!({})),
         ["_system"] => ok_json(json!({"uptime": 0})),

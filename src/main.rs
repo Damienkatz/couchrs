@@ -6,6 +6,7 @@ pub mod db;
 pub mod doc;
 pub mod error;
 pub mod extsort;
+pub mod fauxton;
 pub mod file;
 pub mod http;
 pub mod js;
