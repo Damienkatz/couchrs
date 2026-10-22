@@ -388,6 +388,11 @@ fn doc_to_vdu_json(d: &doc::Doc) -> Value {
     Value::Object(m)
 }
 
+/// Whether any design doc has a validate_doc_update function (cached).
+pub fn has_validators(db: &Db, snap: &Snapshot) -> Result<bool> {
+    Ok(vdu_funs(db, snap)?.is_some())
+}
+
 /// Run every validate_doc_update function against each doc. Returns a
 /// per-doc error (None = valid).
 pub fn validate_docs(db: &Db, snap: &Snapshot, docs: &mut [doc::Doc], _new_edits: bool) -> Result<Vec<Option<CouchError>>> {

@@ -17,6 +17,7 @@
   --rust: #eb6834;
   --rocks: #1baf7a;
   --hybrid: #eda100;
+  --inline: #e87ba4;
   --good: #006300;
   --font: system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -25,13 +26,13 @@
   :root:not([data-theme="light"]) {
     --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7;
     --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
-    --erlang: #3987e5; --rust: #d95926; --rocks: #199e70; --hybrid: #c98500; --good: #0ca30c; color-scheme: dark;
+    --erlang: #3987e5; --rust: #d95926; --rocks: #199e70; --hybrid: #c98500; --inline: #d55181; --good: #0ca30c; color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7;
   --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
-  --erlang: #3987e5; --rust: #d95926; --rocks: #199e70; --hybrid: #c98500; --good: #0ca30c; color-scheme: dark;
+  --erlang: #3987e5; --rust: #d95926; --rocks: #199e70; --hybrid: #c98500; --inline: #d55181; --good: #0ca30c; color-scheme: dark;
 }
 body {
   background: var(--page); color: var(--ink); font: 15px/1.55 var(--font);
@@ -205,14 +206,15 @@ code { font-family: var(--mono); font-size: 0.92em; }
 <script>
 (function () {
   const R = JSON.parse(document.getElementById('data').textContent);
-  const E = R.results.erlang || {}, S = R.results.rust || {}, K = R.results.rocksdb || {}, Hy = R.results.hybrid || {};
-  const SRC = { erlang: E, rust: S, rocksdb: K, hybrid: Hy };
+  const E = R.results.erlang || {}, S = R.results.rust || {}, K = R.results.rocksdb || {}, Hy = R.results.hybrid || {}, HI = R.results.hybrid_inline || {};
+  const SRC = { erlang: E, rust: S, rocksdb: K, hybrid: Hy, hybrid_inline: HI };
   const SERIES = [
     { key: 'erlang', name: 'CouchDB (Erlang)', color: 'var(--erlang)' },
     { key: 'rust', name: 'couchdb-rs', color: 'var(--rust)' },
   ];
   if (R.results.rocksdb) SERIES.push({ key: 'rocksdb', name: 'couchdb-rs (RocksDB)', color: 'var(--rocks)' });
   if (R.results.hybrid) SERIES.push({ key: 'hybrid', name: 'couchdb-rs (RocksDB docs + B-tree views)', color: 'var(--hybrid)' });
+  if (R.results.hybrid_inline) SERIES.push({ key: 'hybrid_inline', name: 'hybrid, point reads inline', color: 'var(--inline)' });
   // One bar-chart row: f picks the value out of each server's results.
   const row = (label, f) => { const r = { label }; for (const s of SERIES) r[s.key] = f(SRC[s.key]); return r; };
   const tip = document.getElementById('tip');
@@ -627,7 +629,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
       for (const { key, name } of SERIES) for (const st of g(SRC[key], 'scale.steps') || []) {
         const r = h('tr');
         [name, compact(st.clients), compact(st.connected), compact(st.ops_per_sec), ms(st.ops.get.p99_ms), ms(st.ops.put.p99_ms), ms(st.ops.get_att.p99_ms),
-          compact(st.http_errors), compact(st.io_errors), compact(st.timeouts), compact(st.connect_errors), bytes(st.server_footprint_bytes), st.server_cpu_cores.toFixed(1)]
+          compact(st.http_errors), compact(st.io_errors), compact(st.timeouts), compact(st.connect_errors), bytes(st.server_footprint_bytes), st.server_cpu_cores == null ? '–' : st.server_cpu_cores.toFixed(1)]
           .forEach(c => r.appendChild(h('td', null, c)));
         tb.appendChild(r);
       }

@@ -38,6 +38,10 @@ struct Args {
     measure: u64,
     ramp: usize,
     server_pid: Option<i32>,
+    /// Reuse the database another run set up (for several generators).
+    no_setup: bool,
+    /// Offset for client ids, so several generators own distinct docs.
+    id_base: usize,
 }
 
 fn parse_args() -> Args {
@@ -52,6 +56,8 @@ fn parse_args() -> Args {
         measure: 60,
         ramp: 3000,
         server_pid: None,
+        no_setup: false,
+        id_base: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -67,6 +73,8 @@ fn parse_args() -> Args {
             "--measure" => a.measure = v().parse().unwrap(),
             "--ramp" => a.ramp = v().parse().unwrap(),
             "--server-pid" => a.server_pid = Some(v().parse().unwrap()),
+            "--no-setup" => a.no_setup = true,
+            "--id-base" => a.id_base = v().parse().unwrap(),
             _ => panic!("unknown argument {k}"),
         }
     }
@@ -196,6 +204,12 @@ struct Target {
 
 async fn connect(t: &Target, src: IpAddr) -> std::io::Result<SendRequest<Full<Bytes>>> {
     let sock = tokio::net::TcpSocket::new_v4()?;
+    // Optional cap on the kernel socket buffers (COUCHSCALE_SOCKBUF bytes),
+    // to see whether the kernel's network memory pool is the limit.
+    if let Some(n) = std::env::var("COUCHSCALE_SOCKBUF").ok().and_then(|v| v.parse().ok()) {
+        sock.set_recv_buffer_size(n)?;
+        sock.set_send_buffer_size(n)?;
+    }
     sock.bind(SocketAddr::new(src, 0))?;
     let stream = sock.connect(t.addr).await?;
     stream.set_nodelay(true)?;
@@ -240,6 +254,11 @@ async fn client(id: usize, src: IpAddr, t: Arc<Target>, sh: Arc<Shared>) {
     let mut rev: Option<String> = None;
     let mut send = None;
     let mut backoff = Duration::from_millis(100);
+    // COUCHSCALE_OPS limits the mix, e.g. "get,get_att" or "put".
+    let mix: Vec<usize> = match std::env::var("COUCHSCALE_OPS") {
+        Ok(v) => v.split(',').map(|o| OPS.iter().position(|k| *k == o).expect("op name")).collect(),
+        Err(_) => (0..OPS.len()).collect(),
+    };
     while !sh.stop.load(Relaxed) {
         let s = match send.as_mut() {
             Some(s) => s,
@@ -257,7 +276,7 @@ async fn client(id: usize, src: IpAddr, t: Arc<Target>, sh: Arc<Shared>) {
                 }
             },
         };
-        let op = rng.below(3) as usize;
+        let op = mix[rng.below(mix.len() as u64) as usize];
         let (method, path, body) = match op {
             0 => (Method::GET, format!("/{}/p-{:06}", t.db, rng.below(POOL_DOCS as u64)), None),
             1 => {
@@ -388,7 +407,9 @@ async fn main() {
     let addr: SocketAddr = scheme_rest.parse().expect("--url must be http://[user:pass@]IP:PORT");
     let t = Arc::new(Target { addr, host_header: scheme_rest.clone(), auth, db: a.db.clone() });
     eprintln!("{}: setting up {} ({} docs with attachments)", a.name, a.db, POOL_DOCS);
-    setup(&t).await;
+    if !a.no_setup {
+        setup(&t).await;
+    }
 
     let sh = Arc::new(Shared {
         window: std::sync::RwLock::new(None),
@@ -403,7 +424,7 @@ async fn main() {
         eprintln!("== {} step {}: host {host}, ramping to {clients} clients", a.name, hi + 1);
         let ramp0 = Instant::now();
         for j in 0..a.per_host {
-            let id = hi * a.per_host + j;
+            let id = a.id_base + hi * a.per_host + j;
             tasks.push(tokio::spawn(client(id, host, t.clone(), sh.clone())));
             if j % 100 == 99 {
                 // Pace new connections at --ramp per second.

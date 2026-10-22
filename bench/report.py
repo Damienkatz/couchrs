@@ -99,14 +99,18 @@ if any("scale" in v for v in results.values() if isinstance(v, dict)):
         "65,536) was raised to 200,000 and its Erlang port limit to 262,144 for this test.",
         "Server memory in the scaling test is macOS physical footprint; CPU is the server's CPU time over the "
         "measured window. The load generator shares the machine's 14 cores with the server.",
-        "Why couchdb-rs collapses above ~15K clients: every request runs its database work inside tokio's "
-        "block_in_place, and a PUT blocks there until its group commit is durable. Each blocked call hands its "
-        "worker's runtime to a thread from tokio's blocking pool, capped at 512; once that is exhausted, sampled "
-        "stacks show requests queued on the pool's spawn lock while the server's CPUs sit idle. Neither the "
-        "load generator (under 1 core) nor the storage engine was the limit.",
-        "CouchDB's step-1 I/O errors are connections it closed during that window, which clients reopened. "
-        "At 75K and 90K clients no CouchDB PUT succeeded, which accounts for its HTTP errors there; the test "
-        "did not record their status codes.",
+        "Why couchdb-rs falls off above ~15K clients is not settled. Two suspects were ruled out: taking point "
+        "reads off tokio's block_in_place (the hybrid, point reads inline series) changed nothing, and the "
+        "numbers were the same with a 29 GB virtual machine running and with it suspended (this run).",
+        "What the tests do show: with PUTs only, throughput holds (16.8K req/s at 15K clients, 16.4K at 30K); "
+        "with GETs only it falls (22K to 9.5K), while the server stays under one core and answers a fresh "
+        "request in about 2 ms. Sampled stacks of both the server and the load generator show their busy "
+        "threads inside the kernel's recvfrom and writev with everything else idle, which points at the "
+        "macOS network stack carrying tens of thousands of loopback connections. Confirming that needs "
+        "clients on separate machines.",
+        "CouchDB's HTTP errors from 60K clients up are PUTs that timed out inside CouchDB "
+        "(fabric_worker_timeout on update_docs in its log); at 75K and 90K no PUT succeeded. Its memory and "
+        "CPU were not captured in this run (the sampler read the previous CouchDB process while it exited).",
     ]
 html = open(os.path.join(here, "report_template.html")).read()
 payload = json.dumps(data).replace("</", "<\\/")

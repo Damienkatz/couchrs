@@ -14,6 +14,14 @@ use md5::{Digest, Md5};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
+/// Run work that may take a while (a JavaScript function, a scan, a
+/// large attachment) without stalling the other tasks on this worker.
+///
+/// Not for point reads (one doc, one body, one small attachment):
+/// RocksDB answers those from memory in microseconds, while each
+/// block_in_place hands the worker's queue to the blocking pool through
+/// one shared lock. At tens of thousands of connections those handoffs
+/// serialize, and the server stalls with its CPUs idle.
 pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
     tokio::task::block_in_place(f)
 }
@@ -148,7 +156,11 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
 /// Run validation then submit docs to the writer.
 pub async fn save_docs(db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: bool) -> Result<Vec<Result<String>>> {
     let snap = db.snapshot();
-    let pre = blocking(|| crate::js::validate_docs(db, &snap, &mut docs, new_edits))?;
+    let pre = if crate::js::has_validators(db, &snap)? {
+        blocking(|| crate::js::validate_docs(db, &snap, &mut docs, new_edits))?
+    } else {
+        vec![None; docs.len()]
+    };
     let mut idx = Vec::new();
     let mut to_save = Vec::new();
     for (i, (d, err)) in docs.into_iter().zip(pre.iter()).enumerate() {
@@ -174,7 +186,9 @@ pub async fn save_docs(db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: bool) -> Res
         let mut staged = Vec::with_capacity(pending.len());
         for (_, d) in &pending {
             let mut d = d.clone();
-            blocking(|| db.stage_atts(&mut d))?;
+            if d.atts.iter().any(|a| matches!(a.data, AttData::Bytes(_))) {
+                blocking(|| db.stage_atts(&mut d))?;
+            }
             staged.push(d);
         }
         let saved = db.update_docs(staged, new_edits).await?;
@@ -267,7 +281,7 @@ fn get_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     if let Some(open_revs) = req.q("open_revs") {
         return open_revs_response(req, &snap, id, open_revs, &opts);
     }
-    let fdi = blocking(|| snap.get_fdi(id))?.ok_or_else(CouchError::missing)?;
+    let fdi = snap.get_fdi(id)?.ok_or_else(CouchError::missing)?;
     let rev = match req.q("rev") {
         Some(r) => {
             let (p, rid) = parse_rev(r)?;
@@ -285,7 +299,8 @@ fn get_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     if req.header("if-none-match") == Some(etag.as_str()) {
         return Ok(with_header(empty(StatusCode::NOT_MODIFIED), header::ETAG, &etag));
     }
-    let v = blocking(|| snap.doc_json(&fdi, &rev, &opts))?;
+    // Inlined attachment bodies can be large; the doc alone is a point read.
+    let v = if opts.attachments { blocking(|| snap.doc_json(&fdi, &rev, &opts))? } else { snap.doc_json(&fdi, &rev, &opts)? };
     Ok(with_header(json_response(StatusCode::OK, &v), header::ETAG, &etag))
 }
 
@@ -454,13 +469,15 @@ fn stream_pieces(snap: Snapshot, pieces: Vec<Piece>) -> Body {
                 Piece::Data(b) => yield Ok::<Bytes, std::io::Error>(b),
                 Piece::Att(att) => {
                     for group in att.chunks.chunks(16) {
-                        let r = tokio::task::block_in_place(|| -> std::io::Result<Vec<u8>> {
+                        let read = || -> std::io::Result<Vec<u8>> {
                             let mut buf = Vec::new();
                             for pos in group {
                                 buf.extend_from_slice(&snap.read_chunk(*pos)?);
                             }
                             Ok(buf)
-                        });
+                        };
+                        // A single chunk (up to 64 KB) is a point read.
+                        let r = if att.chunks.len() <= 1 { read() } else { tokio::task::block_in_place(read) };
                         match r {
                             Ok(b) => yield Ok(Bytes::from(b)),
                             Err(e) => {
@@ -581,7 +598,7 @@ async fn copy_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         }
         None => fdi.winner(),
     };
-    let mut doc = blocking(|| snap.load_doc(&fdi, &rev))?;
+    let mut doc = snap.load_doc(&fdi, &rev)?;
     doc.id = dest_id.clone();
     doc.revs = match dest_rev {
         Some(r) => {
@@ -648,7 +665,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                 (Some(f), Some(r)) => {
                     let (p, rid) = parse_rev(r)?;
                     let ri = Snapshot::find_rev(f, p, &rid).ok_or_else(CouchError::conflict)?;
-                    blocking(|| snap.load_doc(f, &ri))?
+                    snap.load_doc(f, &ri)?
                 }
                 (Some(f), None) if f.deleted && req.method == Method::PUT => Doc {
                     id: id.to_string(),
