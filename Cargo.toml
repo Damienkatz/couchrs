@@ -10,6 +10,7 @@ base64 = "0.23.1"
 bincode = "1"
 bytes = "1.12.1"
 crc32fast = "1.5.3"
+flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
 form_urlencoded = "1.2.2"
 futures = "0.3.34"
 hex = "0.4.3"
@@ -32,6 +33,7 @@ regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "json", "socks", "http2"] }
 rocksdb = { version = "0.25.0", default-features = false, features = ["bindgen-runtime", "multi-threaded-cf"] }
 rquickjs = "0.14.0"
+rustls = "0.23.46"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha1 = "0.11.0"
@@ -39,6 +41,7 @@ sha2 = "0.11.1"
 snap = "1.1.2"
 thiserror = "2.0.21"
 tokio = { version = "1.54.0", features = ["full"] }
+tokio-rustls = "0.26.6"
 tokio-stream = "0.1.19"
 tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 tracing = "0.1.44"

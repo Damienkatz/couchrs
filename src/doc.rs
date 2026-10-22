@@ -540,6 +540,62 @@ pub struct DocOpts {
     pub follows: bool,
 }
 
+pub const DEFAULT_COMPRESSIBLE_TYPES: &str = "text/*, application/javascript, application/json, application/xml";
+
+/// Whether a content type is one [attachments] compressible_types names
+/// (compressible_att_type/1): `*` matches anything, parameters ignored,
+/// case not.
+pub fn compressible_type(config: &crate::config::Config, content_type: &str) -> bool {
+    let types = config.get_or("attachments", "compressible_types", DEFAULT_COMPRESSIBLE_TYPES);
+    types.split(',').map(str::trim).filter(|t| !t.is_empty()).any(|t| {
+        let pat = format!("(?i)^\\s*{}(?:\\s*;.*?)?\\s*$", regex::escape(t).replace("\\*", ".*"));
+        regex::Regex::new(&pat).is_ok_and(|re| re.is_match(content_type))
+    })
+}
+
+/// Gzip as Erlang's zlib does it (deflateInit2 with 16 + 15 window bits,
+/// so zlib writes the header): the same bytes, so the same digest.
+pub fn gzip(data: &[u8], level: u32) -> Vec<u8> {
+    let mut c = flate2::Compress::new_gzip(flate2::Compression::new(level.min(9)), 15);
+    let mut out = Vec::with_capacity(data.len() / 2 + 64);
+    loop {
+        let before = c.total_in() as usize;
+        match c.compress_vec(&data[before..], &mut out, flate2::FlushCompress::Finish) {
+            Ok(flate2::Status::StreamEnd) => return out,
+            Ok(_) => out.reserve(out.capacity().max(4096)),
+            Err(_) => return out,
+        }
+    }
+}
+
+/// Decompress gzip data, refusing more than 4GB of output
+/// (couch_util:gunzip_with_limit/1).
+pub fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(data).take(4 << 30).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Store a new attachment gzipped if its type is compressible, as
+/// couch_db:with_stream/3 does: length stays the data's, the digest is
+/// of the gzipped bytes (zlib's, so it matches CouchDB's).
+pub fn maybe_compress_att(config: &crate::config::Config, a: &mut Att) {
+    let level = config.get_int("attachments", "compression_level", 8u32);
+    if level == 0 || a.encoding.is_some() || !compressible_type(config, &a.content_type) {
+        return;
+    }
+    if let AttData::Bytes(bytes) = &a.data {
+        a.length = bytes.len() as u64;
+        let gz = gzip(bytes, level);
+        // CouchDB's digest is of the bytes stored.
+        a.md5 = Md5::digest(&gz).to_vec();
+        a.encoded_length = gz.len() as u64;
+        a.encoding = Some("gzip".into());
+        a.data = AttData::Bytes(bytes::Bytes::from(gz));
+    }
+}
+
 /// How an attachment appears in a doc's JSON.
 pub enum AttBody {
     Stub,

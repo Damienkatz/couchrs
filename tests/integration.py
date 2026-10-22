@@ -1622,6 +1622,68 @@ def special_doc_fields():
         req("DELETE", f"/{db}")
 
 
+@test
+def gzip_and_attachment_encoding():
+    import gzip as gz
+    import hashlib
+    import zlib
+    db = new_db()
+    try:
+        # Request bodies may come gzipped.
+        hdr = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+        eq(req("PUT", f"/{db}/z", gz.compress(b'{"a": 1}'), headers=hdr)[0], 201)
+        eq(req("GET", f"/{db}/z")[1]["a"], 1)
+        eq(req("POST", f"/{db}/_bulk_docs", gz.compress(b'{"docs": [{"_id": "y"}]}'), headers=hdr)[0], 201)
+        eq(req("PUT", f"/{db}/w", b"not gzip", headers=hdr)[:2], (400, {"error": "bad_request", "reason": "Request body is not properly gzipped."}))
+        eq(req("PUT", f"/{db}/w", b"{}", headers={"Content-Type": "application/json", "Content-Encoding": "deflate"})[:2],
+           (415, {"error": "bad_content_type", "reason": "deflate is not a supported content encoding."}))
+
+        # Compressible types are stored gzipped (digest of the gzipped
+        # bytes, as zlib makes them) and served decoded unless the client
+        # takes gzip.
+        text = b"hello world " * 200
+        rev = req("PUT", f"/{db}/d/a.txt", text, headers={"Content-Type": "text/plain"})[1]["rev"]
+        c = zlib.compressobj(8, zlib.DEFLATED, 16 + 15, 8)
+        stored = c.compress(text) + c.flush()
+        digest = base64.b64encode(hashlib.md5(stored).digest()).decode()
+        info = req("GET", f"/{db}/d?att_encoding_info=true")[1]["_attachments"]["a.txt"]
+        eq(info, {"content_type": "text/plain", "revpos": 1, "digest": "md5-" + digest, "length": len(text), "stub": True,
+                  "encoding": "gzip", "encoded_length": len(stored)})
+        s, body, h = req("GET", f"/{db}/d/a.txt", headers={"Accept-Encoding": "gzip"}, raw=True)
+        eq((s, h["Content-Encoding"], gz.decompress(body), h["ETag"], h["Accept-Ranges"]), (200, "gzip", text, f'"{digest}"', "none"))
+        s, body, h = req("GET", f"/{db}/d/a.txt", raw=True)
+        eq((s, h.get("Content-Encoding"), body, h["Content-Length"]), (200, None, text, str(len(text))))
+        eq((h["Content-Security-Policy"], h["Cache-Control"]), ("sandbox", "must-revalidate"))
+        eq(base64.b64decode(req("GET", f"/{db}/d?attachments=true")[1]["_attachments"]["a.txt"]["data"]), text)
+
+        # Other types aren't, and take byte ranges.
+        data = b"binarydata0123456789"
+        rev = req("PUT", f"/{db}/d/b.bin?rev={rev}", data, headers={"Content-Type": "application/octet-stream"})[1]["rev"]
+        assert "encoding" not in req("GET", f"/{db}/d?att_encoding_info=true")[1]["_attachments"]["b.bin"]
+        s, body, h = req("GET", f"/{db}/d/b.bin", headers={"Range": "bytes=2-5"}, raw=True)
+        eq((s, body, h["Content-Range"], h["Accept-Ranges"]), (206, b"nary", "bytes 2-5/20", "bytes"))
+        eq(req("GET", f"/{db}/d/b.bin", headers={"Range": "bytes=-3"}, raw=True)[1], b"789")
+        eq(req("GET", f"/{db}/d/b.bin", headers={"Range": "bytes=15-99"}, raw=True)[1], b"56789")
+        eq(req("GET", f"/{db}/d/b.bin", headers={"Range": "bytes=0-"}, raw=True)[:2], (200, data))
+        s, body, h = req("GET", f"/{db}/d/b.bin", headers={"Range": "bytes=0-1,4-5"}, raw=True)
+        eq((s, h["Content-Type"].split(";")[0]), (206, "multipart/byteranges"))
+        assert b"Content-Range: bytes 0-1/20\r\n\r\nbi" in body and b"Content-Range: bytes 4-5/20\r\n\r\nry" in body, body
+        eq(req("GET", f"/{db}/d/b.bin", headers={"Range": "bytes=5-2"})[:2],
+           (416, {"error": "requested_range_not_satisfiable", "reason": "Requested range not satisfiable"}))
+
+        # Uploaded gzipped, kept so (identity length unknown) and decoded
+        # on the way out.
+        rev = req("PUT", f"/{db}/d/up.txt?rev={rev}", gz.compress(text),
+                  headers={"Content-Type": "text/plain", "Content-Encoding": "gzip"})[1]["rev"]
+        info = req("GET", f"/{db}/d?att_encoding_info=true")[1]["_attachments"]["up.txt"]
+        eq((info["encoding"], info["length"] == info["encoded_length"]), ("gzip", True))
+        eq(req("GET", f"/{db}/d/up.txt", raw=True)[1], text)
+        eq(req("PUT", f"/{db}/d/br.txt?rev={rev}", b"x", headers={"Content-Type": "text/plain", "Content-Encoding": "br"})[:2],
+           (415, {"error": "bad_content_type", "reason": "Only gzip and identity content-encodings are supported"}))
+    finally:
+        req("DELETE", f"/{db}")
+
+
 def main():
     failed = 0
     for t in TESTS:

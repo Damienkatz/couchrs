@@ -215,6 +215,15 @@ impl Snapshot {
         Ok(out)
     }
 
+    /// An attachment's data in identity form.
+    pub fn read_att_decoded(&self, a: &AttInfo) -> Result<Vec<u8>> {
+        let raw = self.read_att(a)?;
+        match a.encoding.as_deref() {
+            Some("gzip") => crate::doc::gunzip(&raw).map_err(|e| CouchError::internal(format!("bad gzip attachment: {e}"))),
+            _ => Ok(raw),
+        }
+    }
+
     /// `sizes.external` counts inflated body and attachment bytes.
     /// `sizes.active` counts live data as stored: deflated bodies and
     /// attachments plus RocksDB's estimate of live index data. `sizes.file`
@@ -289,7 +298,7 @@ impl Snapshot {
                 };
                 let stub = match (want, opts.follows) {
                     (true, true) => att_json(a, opts, AttBody::Follows),
-                    (true, false) => att_json(a, opts, AttBody::Data(self.read_att(a)?)),
+                    (true, false) => att_json(a, opts, AttBody::Data(self.read_att_decoded(a)?)),
                     (false, _) => att_json(a, opts, AttBody::Stub),
                 };
                 atts.insert(a.name.clone(), stub);

@@ -25,6 +25,7 @@ pub mod smoosh;
 pub mod stats;
 pub mod system;
 pub mod tasks;
+pub mod tls;
 pub mod views;
 
 use std::path::PathBuf;

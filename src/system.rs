@@ -37,6 +37,12 @@ pub fn uptime_secs() -> u64 {
 /// A connection that counts the bytes through it (Erlang's io statistics).
 pub struct Counted<S>(S);
 
+impl<S> Counted<S> {
+    pub fn new(s: S) -> Counted<S> {
+        Counted(s)
+    }
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();

@@ -78,9 +78,26 @@ impl Req {
         if self.body.is_empty() {
             return Err(CouchError::bad_request("Request body must be a JSON object"));
         }
-        serde_json::from_slice(&self.body).map_err(|_| {
+        let body = self.decoded_body()?;
+        serde_json::from_slice(&body).map_err(|_| {
             CouchError::new(StatusCode::BAD_REQUEST, "bad_request", "invalid UTF-8 JSON")
         })
+    }
+
+    /// The body, gunzipped if sent with Content-Encoding: gzip
+    /// (chttpd:maybe_decompress/2).
+    pub fn decoded_body(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+        match self.header("content-encoding").unwrap_or("identity") {
+            "identity" => Ok(std::borrow::Cow::Borrowed(&self.body)),
+            "gzip" => crate::doc::gunzip(&self.body)
+                .map(std::borrow::Cow::Owned)
+                .map_err(|_| CouchError::bad_request("Request body is not properly gzipped.")),
+            other => Err(CouchError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "bad_content_type",
+                format!("{other} is not a supported content encoding."),
+            )),
+        }
     }
 
     pub fn json_obj_body(&self) -> Result<serde_json::Map<String, Value>> {
@@ -576,6 +593,16 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("couchdb-rs listening on http://{bind}");
     crate::system::mark_start();
+    if server.config.get_bool("ssl", "enable", false) {
+        let cfg = crate::tls::server_config(&server.config).map_err(std::io::Error::other)?;
+        let addr = server.config.get_or("chttpd", "bind_address", "127.0.0.1");
+        let port = server.config.get_or("ssl", "port", "6984");
+        let sbind = if addr.contains(':') { format!("[{addr}]:{port}") } else { format!("{addr}:{port}") };
+        let l = crate::tls::listen(&sbind, cfg).await?;
+        tracing::info!("couchdb-rs listening on https://{sbind}");
+        let sapp = app.clone();
+        tokio::spawn(async move { axum::serve(l, sapp).await });
+    }
     if server.config.get_bool("prometheus", "additional_port", false) {
         let pbind = bind_addr(&server, "prometheus", "17986");
         let l = tokio::net::TcpListener::bind(&pbind).await?;

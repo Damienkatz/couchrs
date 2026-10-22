@@ -194,6 +194,9 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
     let replicator_db = crate::replicator::docs::is_replicator_db(&db.name);
     let mut early: Vec<Option<CouchError>> = vec![None; docs.len()];
     for (d, e) in docs.iter_mut().zip(early.iter_mut()) {
+        for a in d.atts.iter_mut() {
+            crate::doc::maybe_compress_att(config, a);
+        }
         if d.is_local() {
             continue;
         }
@@ -532,6 +535,104 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
         .unwrap())
 }
 
+/// Byte ranges from a Range header (mochiweb's parse_range_request/1 and
+/// parse_ranges/2): None for no usable header, or the whole body.
+fn parse_ranges(h: Option<&str>, len: u64) -> Result<Option<Vec<(u64, u64)>>> {
+    let Some(spec) = h.and_then(|h| h.trim().strip_prefix("bytes=")) else { return Ok(None) };
+    let mut raw = Vec::new();
+    for part in spec.split(',').map(str::trim) {
+        let Some((a, b)) = part.split_once('-') else { return Ok(None) };
+        let num = |s: &str| -> std::result::Result<Option<u64>, ()> { if s.is_empty() { Ok(None) } else { s.parse().map(Some).map_err(|_| ()) } };
+        match (num(a), num(b)) {
+            (Ok(None), Ok(None)) | (Err(_), _) | (_, Err(_)) => return Ok(None),
+            (Ok(x), Ok(y)) => raw.push((x, y)),
+        }
+    }
+    let mut out = Vec::new();
+    for (i, r) in raw.into_iter().enumerate() {
+        let (from, to) = match r {
+            (Some(0), None) if i == 0 => return Ok(None),
+            (Some(f), Some(t)) if t < f => {
+                return Err(CouchError::new(StatusCode::RANGE_NOT_SATISFIABLE, "requested_range_not_satisfiable", "Requested range not satisfiable"));
+            }
+            (Some(f), Some(t)) => (f, t.min(len.saturating_sub(1))),
+            (None, Some(t)) => (len.saturating_sub(t), len.saturating_sub(1)),
+            (Some(f), None) => (f, len.saturating_sub(1)),
+            (None, None) => return Ok(None),
+        };
+        out.push((from, to));
+    }
+    Ok(Some(out))
+}
+
+/// GET of an attachment (db_attachment_req/4): encoded when stored so and
+/// the client accepts it, else in identity form; ranges of identity
+/// attachments.
+fn attachment_response(req: &Req, snap: &Snapshot, att: &AttInfo) -> Result<Response> {
+    let etag = format!("\"{}\"", crate::doc::B64.encode(&att.md5));
+    let accepts = |enc: &str| {
+        req.header("accept-encoding").is_some_and(|h| {
+            h.split(',').any(|p| {
+                let mut it = p.split(';');
+                let name = it.next().unwrap_or("").trim();
+                let q0 = it.any(|q| q.trim().strip_prefix("q=").is_some_and(|v| v.trim().parse::<f64>().is_ok_and(|q| q == 0.0)));
+                (name.eq_ignore_ascii_case(enc) || name == "*") && !q0
+            })
+        })
+    };
+    let enc = att.encoding.clone();
+    let send_encoded = enc.as_deref().is_some_and(accepts);
+    let config = &req.server.config;
+    let mut b = Response::builder()
+        .header(header::ETAG, &etag)
+        .header(header::CACHE_CONTROL, "must-revalidate")
+        .header(header::CONTENT_TYPE, &att.content_type);
+    if send_encoded && let Some(e) = &enc {
+        b = b.header(header::CONTENT_ENCODING, e);
+    }
+    b = b.header(header::ACCEPT_RANGES, if enc.is_none() { "bytes" } else { "none" });
+    if config.get_bool("csp", "attachments_enable", true) {
+        b = b.header("Content-Security-Policy", config.get_or("csp", "attachments_header_value", "sandbox"));
+    }
+    if send_encoded || enc.is_none() {
+        let len = att.encoded_length;
+        if enc.is_none()
+            && let Some(ranges) = parse_ranges(req.header("range"), len)?
+        {
+            let data = blocking(|| snap.read_att(att))?;
+            let slice = |(f, t): (u64, u64)| Bytes::copy_from_slice(&data[f.min(len) as usize..(t + 1).min(len) as usize]);
+            if ranges.len() == 1 {
+                let (f, t) = ranges[0];
+                return Ok(b
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header("Content-Range", format!("bytes {f}-{t}/{len}"))
+                    .header(header::CONTENT_LENGTH, t + 1 - f)
+                    .body(Body::from(slice((f, t))))
+                    .unwrap());
+            }
+            if ranges.len() < 10 {
+                let boundary = hex::encode(uuid::Uuid::new_v4().as_bytes());
+                let mut out = format!("--{boundary}").into_bytes();
+                for (f, t) in ranges {
+                    out.extend_from_slice(format!("\r\nContent-Type: {}\r\nContent-Range: bytes {f}-{t}/{len}\r\n\r\n", att.content_type).as_bytes());
+                    out.extend_from_slice(&slice((f, t)));
+                    out.extend_from_slice(format!("\r\n--{boundary}").as_bytes());
+                }
+                out.extend_from_slice(b"--");
+                return Ok(Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, format!("multipart/byteranges; boundary=\"{boundary}\""))
+                    .body(Body::from(out))
+                    .unwrap());
+            }
+        }
+        return Ok(b.status(StatusCode::OK).header(header::CONTENT_LENGTH, len).body(stream_pieces(snap.clone(), vec![Piece::Att(att.clone())])).unwrap());
+    }
+    // Stored encoded, the client wants identity: decode it.
+    let data = blocking(|| snap.read_att_decoded(att))?;
+    Ok(b.status(StatusCode::OK).header(header::CONTENT_LENGTH, data.len()).body(Body::from(data)).unwrap())
+}
+
 enum Piece {
     Data(Bytes),
     Att(AttInfo),
@@ -720,19 +821,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
             if req.header("if-none-match") == Some(etag.as_str()) {
                 return Ok(with_header(empty(StatusCode::NOT_MODIFIED), header::ETAG, &etag));
             }
-            let len = att.encoded_length;
-            let mut b = Response::builder()
-                .header(header::CONTENT_LENGTH, len)
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, &att.content_type)
-                .header(header::ETAG, &etag)
-                .header("Content-MD5", crate::doc::B64.encode(&att.md5))
-                .header(header::ACCEPT_RANGES, "none");
-            if let Some(e) = &att.encoding {
-                b = b.header(header::CONTENT_ENCODING, e);
-            }
-            let att = att.clone();
-            Ok(b.body(stream_pieces(snap.clone(), vec![Piece::Att(att)])).unwrap())
+            attachment_response(req, &snap, att)
         }
         Method::PUT | Method::DELETE => {
             let snap = db.snapshot();
@@ -779,6 +868,19 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                     .unwrap_or("application/octet-stream")
                     .to_string();
                 let data = req.body.clone();
+                // Uploaded gzipped, it is kept gzipped (its identity length
+                // unknown).
+                let encoding = match req.header("content-encoding").map(|e| e.trim().to_ascii_lowercase()).as_deref() {
+                    None | Some("identity") => None,
+                    Some("gzip") => Some("gzip".to_string()),
+                    Some(_) => {
+                        return Err(CouchError::new(
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            "bad_content_type",
+                            "Only gzip and identity content-encodings are supported",
+                        ));
+                    }
+                };
                 doc.atts.retain(|a| a.name != name);
                 doc.atts.push(Att {
                     name: name.to_string(),
@@ -786,7 +888,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                     revpos: None,
                     length: data.len() as u64,
                     md5: Md5::digest(&data).to_vec(),
-                    encoding: None,
+                    encoding,
                     encoded_length: data.len() as u64,
                     stored_length: 0,
                     data: AttData::Bytes(data),
