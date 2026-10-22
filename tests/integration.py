@@ -790,6 +790,105 @@ def proxy_and_jwt_auth():
 
 
 @test
+def list_functions():
+    db = new_db()
+    req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": "a", "n": 1}, {"_id": "b", "n": 2}, {"_id": "c", "n": 3}]})
+    req("PUT", f"/{db}/_design/l", {
+        "views": {"by_n": {"map": "function(d){ emit(d.n, d._id); }", "reduce": "_count"}},
+        "lists": {
+            "plain": "function(head, req){ var r; send('H:' + JSON.stringify(head) + '\\n'); while (r = getRow()) { send(r.key + '=' + r.value + '\\n'); } return 'TAIL'; }",
+            "started": "function(head, req){ start({code: 201, headers: {'Content-Type': 'text/plain', 'X-Foo': 'bar'}}); var r; while (r = getRow()) send(r.id + ','); return 'end'; }",
+            "prov": "function(head, req){ provides('json', function(){ var a=[], r; while (r = getRow()) a.push(r.key); send(JSON.stringify(a)); }); provides('html', function(){ var r; send('<ul>'); while (r = getRow()) send('<li>' + r.key + '</li>'); return '</ul>'; }); }",
+            "err": "function(head, req){ throw({forbidden: 'nope'}); }",
+        },
+        "shows": {"s": "function(doc, req){ send('a'); send('b'); return 'c'; }",
+                  "missing": "function(doc, req){ return doc.x; }"},
+    })
+    p = f"/{db}/_design/l/_list"
+
+    def get(path, **kw):
+        s, b, h = req(kw.pop("method", "GET"), path, kw.pop("body", None), headers=kw.pop("headers", {}), raw=True)
+        return s, b.decode(), h.get("Content-Type")
+
+    eq(get(f"{p}/plain/by_n?reduce=false"),
+       (200, 'H:{"total_rows":3,"offset":0}\n1=a\n2=b\n3=c\nTAIL', "application/json"))
+    eq(get(f"{p}/plain/by_n")[1], "H:{}\nnull=3\nTAIL")
+    eq(get(f"{p}/plain/by_n?group=true")[1], "H:{}\n1=1\n2=1\n3=1\nTAIL")
+    s, b, h = req("GET", f"{p}/started/by_n?reduce=false", raw=True)
+    eq((s, b, h["Content-Type"], h["X-Foo"]), (201, b"a,b,c,end", "text/plain", "bar"))
+    eq(get(f"{p}/prov/by_n?reduce=false", headers={"Accept": "application/json"}), (200, "[1,2,3]", "application/json"))
+    eq(get(f"{p}/prov/by_n?reduce=false", headers={"Accept": "text/html"}),
+       (200, "<ul><li>1</li><li>2</li><li>3</li></ul>", "text/html; charset=utf-8"))
+    s, b, _ = get(f"{p}/prov/by_n?reduce=false", headers={"Accept": "image/png"})
+    eq((s, json.loads(b)["reason"]),
+       (406, "Content-Type image/png not supported, try one of: text/html; charset=utf-8, application/json, text/x-json"))
+    s, b, _ = get(f"{p}/err/by_n?reduce=false")
+    eq((s, json.loads(b)), (500, {"error": "render_error", "reason": "function raised error: [object Object] \nstacktrace: undefined"}))
+    # Another design doc's view, _all_docs, and keys posted to the view.
+    eq(get(f"{p}/plain/l/by_n?reduce=false&limit=1")[1], 'H:{"total_rows":3,"offset":0}\n1=a\nTAIL')
+    eq(get(f"{p}/plain/_all_docs?limit=1")[1], 'H:{"total_rows":4,"offset":0}\n_design/l=[object Object]\nTAIL')
+    eq(get(f"{p}/plain/by_n?reduce=false", method="POST", body={"keys": [2]})[1], 'H:{"total_rows":3,"offset":1}\n2=b\nTAIL')
+    s, b, _ = get(f"{p}/nolist/by_n")
+    eq((s, json.loads(b)), (404, {"error": "not_found", "reason": "missing json key: nolist"}))
+    s, b, _ = get(f"{p}/plain/noview")
+    eq((s, json.loads(b)), (404, {"error": "not_found", "reason": "missing_named_view"}))
+    # Shows: send() chunks come before the return value; a show that fails
+    # on a missing document named in the path is a 404.
+    eq(get(f"/{db}/_design/l/_show/s")[:2], (200, "abc"))
+    s, b, _ = get(f"/{db}/_design/l/_show/missing/zzz")
+    eq((s, json.loads(b)), (404, {"error": "not_found", "reason": "document not found"}))
+    eq(get(f"/{db}/_design/l/_show/missing")[0], 500)
+
+
+@test
+def rewrites():
+    db = new_db()
+    req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": "a", "n": 1}, {"_id": "b", "n": 2}, {"_id": "c", "n": 3}]})
+    view = {"v": {"map": "function(d){ if (d.n) emit(d.n, d._id); }"}}
+    req("PUT", f"/{db}/_design/r", {"views": view, "rewrites": [
+        {"from": "doc/:id", "to": "../../:id"},
+        {"from": "view/:k", "to": "_view/v", "query": {"key": ":k"}, "formats": {"k": "int"}},
+        {"from": "views/:k", "to": "_view/v", "query": {"key": ":k"}},
+        {"from": "all", "to": "../../_all_docs", "query": {"limit": "2"}},
+        {"from": "star/*", "to": "../../*"},
+        {"from": "m", "to": "../../a", "method": "GET"},
+        {"from": "info", "to": "../.."},
+        {"from": "pass", "to": "_view/v"},
+    ]})
+    req("PUT", f"/{db}/_design/rx", {"rewrites": [{"from": "esc", "to": "../../../_all_dbs"}]})
+    req("PUT", f"/{db}/_design/rf", {"views": view, "rewrites":
+        "function(req) { var p = req.path; if (p[4] == 'doc') return '../../' + p[5]; "
+        "if (p[4] == 'code') return {code: 418, body: 'teapot', headers: {'X-T': '1'}}; "
+        "if (p[4] == 'q') return {path: '_view/v', query: {key: '2'}}; "
+        "if (p[4] == 'forbid') throw({forbidden: 'no'}); if (p[4] == 'bad') return {path: 1}; return null; }"})
+    r = f"/{db}/_design/r/_rewrite"
+    eq(req("GET", f"{r}/doc/a")[1]["n"], 1)
+    eq([x["id"] for x in req("GET", f"{r}/view/2")[1]["rows"]], ["b"])
+    eq(req("GET", f"{r}/views/2")[1]["rows"], [])  # "2", not 2, without the int format
+    eq(len(req("GET", f"{r}/all")[1]["rows"]), 2)
+    eq(len(req("GET", f"{r}/all?limit=1")[1]["rows"]), 2)  # the rule's query wins
+    eq(req("GET", f"{r}/star/b")[1]["n"], 2)
+    eq(req("GET", f"{r}/star/_design/r")[1]["_id"], "_design/r")
+    eq(req("GET", f"{r}/m")[1]["n"], 1)
+    eq(req("POST", f"{r}/m", {})[:2], (404, {"error": "not_found", "reason": "missing"}))
+    eq(req("GET", f"{r}/info")[1]["db_name"], db)
+    eq([x["id"] for x in req("GET", f"{r}/pass?key=3")[1]["rows"]], ["c"])
+    eq(req("GET", f"{r}/zzz")[:2], (404, {"error": "not_found", "reason": "missing"}))
+    eq(req("GET", f"/{db}/_design/rx/_rewrite/esc")[:2],
+       (500, {"error": "insecure_rewrite_rule", "reason": "too many ../.. segments"}))
+    f = f"/{db}/_design/rf/_rewrite"
+    eq(req("GET", f"{f}/doc/a")[1]["n"], 1)
+    s, b, h = req("GET", f"{f}/code", raw=True)
+    eq((s, b, h["X-T"]), (418, b"teapot", "1"))
+    eq([x["id"] for x in req("GET", f"{f}/q")[1]["rows"]], ["b"])
+    eq(req("GET", f"{f}/zzz")[:2], (404, {"error": "rewrite_error", "reason": "Invalid path."}))
+    eq(req("GET", f"{f}/bad")[:2], (500, {"error": "rewrite_error", "reason": "bad path"}))
+    eq(req("GET", f"{f}/forbid")[:2],
+       (500, {"error": "rewrite_error", "reason": "function raised error: [object Object] \nstacktrace: undefined"}))
+    eq(req("GET", f"/{db}/_design/rx/_rewrite")[0], 500)
+
+
+@test
 def show_content_negotiation():
     db = new_db()
     req("PUT", f"/{db}/_design/fn", {

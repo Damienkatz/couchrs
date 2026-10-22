@@ -8,7 +8,7 @@ use crate::btree::{Dir, Range};
 use crate::db::{Db, Snapshot};
 use crate::doc::{self, DocOpts};
 use crate::error::{CouchError, Result};
-use crate::http::{Req, json_response, with_header};
+use crate::http::{Req, with_header};
 use axum::body::Body;
 use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
@@ -21,6 +21,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// CouchDB's mimeparse.js, used by provides() content negotiation.
+const MIMEPARSE: &str = include_str!("../share/mimeparse.js");
+
 const PRELUDE: &str = r#"
 var __emits = null;
 function emit(k, v) {
@@ -32,101 +35,127 @@ var __log = [];
 function sum(a) { var r = 0; for (var i = 0; i < a.length; i++) r += a[i]; return r; }
 function toJSON(o) { return JSON.stringify(o); }
 function isArray(o) { return Array.isArray(o); }
-function start() {} function send() {}
-// Content negotiation for show functions, as in CouchDB's render.js and
-// mimeparse.js: registerType(key, mime...) names a format, provides(key,
-// fun) offers one, and __runProvides picks by ?format=, then Accept.
-var __mimesByKey = {}, __keysByMime = {}, __providers = null;
-function registerType() {
-  var key = arguments[0], mimes = [];
-  for (var i = 1; i < arguments.length; i++) mimes.push(arguments[i]);
-  __mimesByKey[key] = mimes;
-  for (var j = 0; j < mimes.length; j++) __keysByMime[mimes[j]] = key;
-}
-registerType("all", "*/*");
-registerType("text", "text/plain; charset=utf-8", "txt");
-registerType("html", "text/html; charset=utf-8");
-registerType("xhtml", "application/xhtml+xml", "xhtml");
-registerType("xml", "application/xml", "text/xml", "application/x-xml");
-registerType("js", "text/javascript", "application/javascript", "application/x-javascript");
-registerType("css", "text/css");
-registerType("ics", "text/calendar");
-registerType("csv", "text/csv");
-registerType("rss", "application/rss+xml");
-registerType("atom", "application/atom+xml");
-registerType("yaml", "application/x-yaml", "text/yaml");
-registerType("multipart_form", "multipart/form-data");
-registerType("url_encoded_form", "application/x-www-form-urlencoded");
-registerType("json", "application/json", "text/x-json");
-function provides(type, fun) {
-  if (__providers !== null) __providers.push([type, fun]);
-}
-function __trim(s) { return s.replace(/^\s+|\s+$/g, ""); }
-function __parseRange(r) {
-  var parts = r.split(";"), params = {};
-  for (var i = 1; i < parts.length; i++) {
-    var kv = parts[i].split("=");
-    if (kv.length === 2) params[__trim(kv[0])] = __trim(kv[1]);
+// Shows, lists and updates run as CouchDB's render.js runs them;
+// Mimeparse is CouchDB's mimeparse.js, evaluated before this prelude.
+var Mime = (function() {
+  var mimesByKey = {};
+  var keysByMime = {};
+  function registerType() {
+    var mimes = [], key = arguments[0];
+    for (var i = 1; i < arguments.length; i++) mimes.push(arguments[i]);
+    mimesByKey[key] = mimes;
+    for (var i = 0; i < mimes.length; i++) keysByMime[mimes[i]] = key;
   }
-  var full = __trim(parts[0]);
-  if (full === "*") full = "*/*";
-  var tp = full.split("/");
-  var q = parseFloat(params.q);
-  if (params.q === undefined || isNaN(q) || q < 0 || q > 1) params.q = "1";
-  return [tp[0], tp[1] || "", params];
-}
-function __fitness(mime, ranges) {
-  var best = -1, bestQ = 0, t = __parseRange(mime);
-  for (var i = 0; i < ranges.length; i++) {
-    var r = ranges[i];
-    if ((r[0] === t[0] || r[0] === "*" || t[0] === "*") && (r[1] === t[1] || r[1] === "*" || t[1] === "*")) {
-      var pm = 0;
-      for (var k in t[2]) if (k !== "q" && r[2][k] === t[2][k]) pm++;
-      var f = (r[0] === t[0] ? 100 : 0) + (r[1] === t[1] ? 10 : 0) + pm;
-      if (f > best) { best = f; bestQ = parseFloat(r[2].q); }
+  registerType("all", "*/*");
+  registerType("text", "text/plain; charset=utf-8", "txt");
+  registerType("html", "text/html; charset=utf-8");
+  registerType("xhtml", "application/xhtml+xml", "xhtml");
+  registerType("xml", "application/xml", "text/xml", "application/x-xml");
+  registerType("js", "text/javascript", "application/javascript", "application/x-javascript");
+  registerType("css", "text/css");
+  registerType("ics", "text/calendar");
+  registerType("csv", "text/csv");
+  registerType("rss", "application/rss+xml");
+  registerType("atom", "application/atom+xml");
+  registerType("yaml", "application/x-yaml", "text/yaml");
+  registerType("multipart_form", "multipart/form-data");
+  registerType("url_encoded_form", "application/x-www-form-urlencoded");
+  registerType("json", "application/json", "text/x-json");
+  var providesUsed = false;
+  var mimeFuns = [];
+  var responseContentType = null;
+  function provides(type, fun) {
+    providesUsed = true;
+    mimeFuns.push([type, fun]);
+  }
+  function resetProvides() {
+    providesUsed = false;
+    mimeFuns = [];
+    responseContentType = null;
+  }
+  function runProvides(req) {
+    var supportedMimes = [], bestFun, bestKey = null, accept = req.headers["Accept"];
+    if (req.query && req.query.format) {
+      bestKey = req.query.format;
+      responseContentType = mimesByKey[bestKey][0];
+    } else if (accept) {
+      mimeFuns.reverse().forEach(function(mimeFun) {
+        var mimeKey = mimeFun[0];
+        if (mimesByKey[mimeKey]) supportedMimes = supportedMimes.concat(mimesByKey[mimeKey]);
+      });
+      responseContentType = Mimeparse.bestMatch(supportedMimes, accept);
+      bestKey = keysByMime[responseContentType];
+    } else {
+      bestKey = mimeFuns[0][0];
+      responseContentType = mimesByKey[bestKey][0];
+    }
+    if (bestKey) {
+      for (var i = 0; i < mimeFuns.length; i++) {
+        if (mimeFuns[i][0] == bestKey) { bestFun = mimeFuns[i][1]; break; }
+      }
+    }
+    if (bestFun) {
+      return bestFun.call(null);
+    } else {
+      var supportedTypes = mimeFuns.map(function(mf) { return mimesByKey[mf[0]].join(', ') || mf[0]; });
+      throw(["error", "not_acceptable",
+        "Content-Type " + (accept || bestKey) + " not supported, try one of: " + supportedTypes.join(', ')]);
     }
   }
-  return [best, bestQ];
+  return {
+    registerType: registerType,
+    provides: provides,
+    resetProvides: resetProvides,
+    runProvides: runProvides,
+    providesUsed: function() { return providesUsed; },
+    responseContentType: function() { return responseContentType; }
+  };
+})();
+function registerType() { return Mime.registerType.apply(null, arguments); }
+function provides(type, fun) { Mime.provides(type, fun); }
+var __chunks = [], __startResp = {}, __gotRow = false, __lastRow = false;
+// A list's rows, and what it has produced: the start response and body.
+var __rows = [], __rowAt = 0, __listStart = null, __listBody = [];
+function start(resp) { __startResp = resp || {}; }
+function send(chunk) { __chunks.push(chunk.toString()); }
+function __applyContentType(resp, type) {
+  resp["headers"] = resp["headers"] || {};
+  if (type) resp["headers"]["Content-Type"] = resp["headers"]["Content-Type"] || type;
+  return resp;
 }
-function __bestMatch(supported, header) {
-  var ranges = header.split(",").map(__parseRange), best = null;
-  for (var i = 0; i < supported.length; i++) {
-    var fq = __fitness(supported[i], ranges);
-    // Highest quality, then most specific; the earliest offer wins ties.
-    if (fq[1] > 0 && (best === null || fq[1] > best[1] || (fq[1] === best[1] && fq[0] > best[0])))
-      best = [fq[0], fq[1], supported[i]];
-  }
-  return best ? best[2] : "";
+function __sendStart() {
+  __listStart = __applyContentType(__startResp || {}, Mime.responseContentType());
+  __listBody = __listBody.concat(__chunks);
+  __chunks = [];
+  __startResp = {};
 }
-function __runProvides(req) {
-  var h = req.headers || {}, accept = h.Accept, key = null, i;
-  if (req.query && req.query.format) {
-    key = req.query.format;
-  } else if (accept) {
-    var supported = [];
-    for (i = 0; i < __providers.length; i++) supported = supported.concat(__mimesByKey[__providers[i][0]] || []);
-    var m = __bestMatch(supported, accept);
-    key = m ? __keysByMime[m] : null;
-  } else {
-    key = __providers[0][0];
-  }
-  for (i = 0; i < __providers.length; i++) {
-    if (__providers[i][0] !== key) continue;
-    var out = __providers[i][1]();
-    if (typeof out === "string") out = {body: out};
-    else if (out === undefined || out === null) out = {body: ""};
-    out.headers = out.headers || {};
-    var hasType = false;
-    for (var hk in out.headers) if (hk.toLowerCase() === "content-type") hasType = true;
-    var mimes = __mimesByKey[key];
-    if (!hasType && mimes && mimes.length) out.headers["Content-Type"] = mimes[0];
-    return out;
-  }
-  var offered = [];
-  for (i = 0; i < __providers.length; i++) offered.push(__providers[i][0]);
-  throw ["error", "not_acceptable", "Content-Type " + (accept || key) + " not supported, try one of: " + offered.join(", ")];
+function __blowChunks() {
+  __listBody = __listBody.concat(__chunks);
+  __chunks = [];
 }
-function getRow() { return null; }
+function getRow() {
+  if (__lastRow) return null;
+  if (!__gotRow) { __gotRow = true; __sendStart(); } else { __blowChunks(); }
+  if (__rowAt >= __rows.length) { __lastRow = true; return null; }
+  return __rows[__rowAt++];
+}
+function __resetList() { __gotRow = false; __lastRow = false; __chunks = []; __startResp = {}; }
+function __wrapResp(resp) {
+  var type = typeof resp;
+  return (type == "string" || type == "xml") ? {body: resp} : resp;
+}
+function __typeOf(value) {
+  var s = typeof value;
+  if (s === 'object') s = value ? (value instanceof Array ? 'array' : s) : 'null';
+  return s;
+}
+function __renderError(e, errType) {
+  if (e && (e.error && e.reason || e[0] == "error" || e[0] == "fatal")) throw e;
+  var msg = "function raised error: " + (e && e.toSource ? e.toSource() : String(e)) +
+    " \nstacktrace: " + (e === null || e === undefined ? undefined : e.stack);
+  log(msg);
+  throw(["error", errType || "render_error", msg]);
+}
 function __freeze(o) {
   if (o && typeof o === "object" && !Object.isFrozen(o)) {
     Object.freeze(o);
@@ -169,7 +198,8 @@ function __eval_fun(src, ddoc) {
   return f;
 }
 function __errjson(e) {
-  if (Array.isArray(e) && e[0] === "error") return {error: e[1], reason: e[2]};
+  if (Array.isArray(e) && (e[0] === "error" || e[0] === "fatal")) return {error: e[1], reason: e[2]};
+  if (e && typeof e.error === "string" && e.reason !== undefined) return {error: e.error, reason: String(e.reason)};
   if (e && typeof e === "object" && !(e instanceof Error)) return {thrown: e};
   return {error: "render_error", reason: String(e && e.message !== undefined ? e.message : e)};
 }
@@ -207,18 +237,73 @@ function __filter(i, dj, rj) {
   catch (e) { return JSON.stringify(__errjson(e)); }
 }
 function __show(i, argsjson) {
-  __providers = [];
   try {
     var args = JSON.parse(argsjson);
-    var r = __funs[i].apply(null, args);
-    if ((r === undefined || r === null) && __providers.length) r = __runProvides(args[1]);
-    return JSON.stringify({ok: r === undefined ? null : r});
+    try {
+      __resetList();
+      Mime.resetProvides();
+      var resp = __funs[i].apply(null, args) || {};
+      resp = __wrapResp(resp);
+      if (__chunks.length && __chunks.length > 0) {
+        resp.headers = resp.headers || {};
+        for (var header in __startResp) resp.headers[header] = __startResp[header];
+        resp.body = __chunks.join("") + (resp.body || "");
+        __resetList();
+      }
+      if (Mime.providesUsed()) {
+        var provided = __wrapResp(Mime.runProvides(args[1]) || {});
+        resp.body = (resp.body || "") + __chunks.join("");
+        resp.body += provided.body || "";
+        resp = __applyContentType(resp, Mime.responseContentType());
+        __resetList();
+      }
+      var type = __typeOf(resp);
+      if (type == 'object' || type == 'string') return JSON.stringify({ok: __wrapResp(resp)});
+      throw(["error", "render_error", "undefined response from show function"]);
+    } catch (e) {
+      // A missing document named in the path is a 404.
+      if (args[0] === null && args[1].path && args[1].path.length > 5) throw(["error", "not_found", "document not found"]);
+      __renderError(e);
+    }
   } catch (e) { return JSON.stringify(__errjson(e)); }
-  finally { __providers = null; }
 }
-function __call(i, argsjson) {
-  try { var r = __funs[i].apply(null, JSON.parse(argsjson)); return JSON.stringify({ok: r === undefined ? null : r}); }
-  catch (e) { return JSON.stringify(__errjson(e)); }
+function __list(i, argsjson, rowsjson) {
+  try {
+    Mime.resetProvides();
+    __resetList();
+    __rows = JSON.parse(rowsjson); __rowAt = 0; __listStart = null; __listBody = [];
+    var args = JSON.parse(argsjson);
+    try {
+      var tail = __funs[i].apply(null, args);
+      if (Mime.providesUsed()) tail = Mime.runProvides(args[1]);
+      if (!__gotRow) getRow();
+      if (typeof tail != "undefined") __chunks.push(tail);
+      __blowChunks();
+    } catch (e) { __renderError(e); }
+    return JSON.stringify({ok: {start: __listStart, body: __listBody.join("")}});
+  } catch (e) { return JSON.stringify(__errjson(e)); }
+  finally { __rows = []; }
+}
+function __rewrite(i, argsjson) {
+  try {
+    var args = JSON.parse(argsjson);
+    var result;
+    try { result = __funs[i].apply(null, args); } catch (e) { __renderError(e, "rewrite_error"); }
+    return JSON.stringify({ok: result ? result : null});
+  } catch (e) { return JSON.stringify(__errjson(e)); }
+}
+function __update(i, argsjson) {
+  try {
+    var args = JSON.parse(argsjson);
+    try {
+      if (args[1].method == "GET") throw(["error", "method_not_allowed", "Update functions do not allow GET"]);
+      var result = __funs[i].apply(null, args);
+      var resp = result[1];
+      var type = __typeOf(resp);
+      if (type == 'object' || type == 'string') return JSON.stringify({ok: [result[0], __wrapResp(resp)]});
+      throw(["error", "render_error", "undefined response from update function"]);
+    } catch (e) { __renderError(e); }
+  } catch (e) { return JSON.stringify(__errjson(e)); }
 }
 "#;
 
@@ -297,6 +382,7 @@ impl JsFuns {
         })));
         let ctx = Context::full(&rt).map_err(|e| CouchError::internal(e.to_string()))?;
         ctx.with(|c| -> Result<()> {
+            c.eval::<(), _>(MIMEPARSE).map_err(|e| js_err(&c, e))?;
             c.eval::<(), _>(PRELUDE).map_err(|e| js_err(&c, e))?;
             c.eval::<(), _>(self.setup.as_str()).map_err(|e| js_err(&c, e))?;
             Ok(())
@@ -386,8 +472,17 @@ impl JsFuns {
         unwrap_ok(self.call("__show", CallArgs::IS(i as i32, Value::Array(args.to_vec()).to_string()))?)
     }
 
-    fn apply(&self, i: usize, args: &[Value]) -> Result<Value> {
-        unwrap_ok(self.call("__call", CallArgs::IS(i as i32, Value::Array(args.to_vec()).to_string()))?)
+    /// Run a list function over `rows`: {start: {code, headers}, body}.
+    fn list(&self, i: usize, args: &[Value], rows: &[Value]) -> Result<Value> {
+        unwrap_ok(self.call(
+            "__list",
+            CallArgs::ISS(i as i32, Value::Array(args.to_vec()).to_string(), Value::Array(rows.to_vec()).to_string()),
+        )?)
+    }
+
+    /// Run an update function: [new doc or null, response].
+    fn update(&self, i: usize, args: &[Value]) -> Result<Value> {
+        unwrap_ok(self.call("__update", CallArgs::IS(i as i32, Value::Array(args.to_vec()).to_string()))?)
     }
 }
 
@@ -415,12 +510,18 @@ fn unwrap_ok(v: Value) -> Result<Value> {
     Err(CouchError::new(error_status(err), err, reason))
 }
 
-/// HTTP status for an error from a JavaScript function. Like CouchDB, only
-/// a failed content negotiation (406) is a client error; anything thrown
-/// by the function itself is a server-side render error.
+/// HTTP status for a JavaScript error, by name, as chttpd maps them.
+/// Show, list and update functions report anything they throw that isn't
+/// in CouchDB's error form as a render_error.
 fn error_status(err: &str) -> StatusCode {
     match err {
+        "bad_request" => StatusCode::BAD_REQUEST,
+        "unauthorized" => StatusCode::UNAUTHORIZED,
+        "forbidden" => StatusCode::FORBIDDEN,
+        "not_found" => StatusCode::NOT_FOUND,
+        "method_not_allowed" => StatusCode::METHOD_NOT_ALLOWED,
         "not_acceptable" => StatusCode::NOT_ACCEPTABLE,
+        "conflict" => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -706,11 +807,7 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
     let ddoc = crate::changes::load_ddoc(&snap, ddoc_id)?;
     match rest {
         ["_show", name, docid @ ..] => {
-            let src = ddoc
-                .get("shows")
-                .and_then(|s| s.get(*name))
-                .and_then(|s| s.as_str())
-                .ok_or_else(|| CouchError::not_found(format!("missing show function {name} on design doc {ddoc_id}")))?;
+            let src = ddoc_fun(&ddoc, "shows", name)?;
             let id = if docid.is_empty() { None } else { Some(docid.join("/")) };
             let doc = match &id {
                 Some(i) => match snap.get_fdi(i)? {
@@ -725,14 +822,7 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
             Ok(render_response(&r, StatusCode::OK))
         }
         ["_update", name, docid @ ..] => {
-            if req.method != Method::POST && req.method != Method::PUT {
-                return crate::http::not_allowed("POST,PUT");
-            }
-            let src = ddoc
-                .get("updates")
-                .and_then(|s| s.get(*name))
-                .and_then(|s| s.as_str())
-                .ok_or_else(|| CouchError::not_found(format!("missing update function {name} on design doc {ddoc_id}")))?;
+            let src = ddoc_fun(&ddoc, "updates", name)?;
             let id = if docid.is_empty() { None } else { Some(docid.join("/")) };
             let doc = match &id {
                 Some(i) => match snap.get_fdi(i)? {
@@ -743,7 +833,7 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
             };
             let funs = JsFuns::new(&ddoc, &[src.to_string()], &[]);
             let jreq = js_req(req, db, id.as_deref());
-            let r = blocking(|| funs.apply(0, &[doc, jreq]))?;
+            let r = blocking(|| funs.update(0, &[doc, jreq]))?;
             let arr = r.as_array().cloned().unwrap_or_default();
             let new_doc = arr.first().cloned().unwrap_or(Value::Null);
             let resp = arr.get(1).cloned().unwrap_or(json!(""));
@@ -759,11 +849,77 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
             }
             Ok(render_response(&resp, StatusCode::OK))
         }
-        _ => Ok(json_response(
-            StatusCode::NOT_IMPLEMENTED,
-            &json!({"error": "not_implemented", "reason": "_list and _rewrite are not supported"}),
-        )),
+        ["_list", name, source @ ..] => {
+            if req.method != Method::GET && req.method != Method::POST && req.method != Method::HEAD {
+                return crate::http::not_allowed("GET,POST,HEAD");
+            }
+            let src = ddoc_fun(&ddoc, "lists", name)?;
+            let mut args = crate::api::QueryArgs::from_req(req)?;
+            if req.method == Method::POST {
+                args = crate::api::QueryArgs::from_obj(&req.json_obj_body()?, args)?;
+            }
+            // The rows: _all_docs, a view in this design doc, or a view in
+            // another one (_list/LIST/DDOC/VIEW).
+            let mut result = match source {
+                ["_all_docs"] => {
+                    let s = db.snapshot();
+                    blocking(|| crate::api::run_all_docs(&s, &args, crate::api::AllDocsKind::All))?
+                }
+                [view] => crate::views::view_json(req, db, ddoc_id, view, &args)?,
+                [other, view] => crate::views::view_json(req, db, &format!("_design/{other}"), view, &args)?,
+                _ => return Err(CouchError::not_found("missing")),
+            };
+            let rows = match result.as_object_mut().and_then(|o| o.remove("rows")) {
+                Some(Value::Array(r)) => r,
+                _ => Vec::new(),
+            };
+            let funs = JsFuns::new(&ddoc, &[src.to_string()], &[]);
+            let jreq = js_req(req, db, None);
+            let out = blocking(|| funs.list(0, &[result, jreq], &rows))?;
+            let start = out.get("start").cloned().unwrap_or(json!({}));
+            let code = start
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .and_then(|c| StatusCode::from_u16(c as u16).ok())
+                .unwrap_or(StatusCode::OK);
+            let headers = start.get("headers").and_then(|h| h.as_object()).cloned().unwrap_or_default();
+            let mut b = Response::builder().status(code);
+            if !headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+                b = b.header(header::CONTENT_TYPE, "application/json");
+            }
+            for (k, v) in headers {
+                if let Some(s) = v.as_str() {
+                    b = b.header(k.as_str(), s);
+                }
+            }
+            let body = out.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string();
+            Ok(b.body(Body::from(body)).unwrap())
+        }
+        ["_rewrite", ..] => crate::rewrite::handle(req, &ddoc).await,
+        _ => Err(CouchError::not_found("missing")),
     }
+}
+
+/// Run a design doc's rewrite function on the request: the new path or
+/// rewrite object, or null for no match.
+pub fn run_rewrite(req: &Req, ddoc: &Value, src: &str) -> Result<Value> {
+    let db = req.server.open_db(&req.path[0])?;
+    let mut jreq = js_req(req, &db, None);
+    if let Some(o) = jreq.as_object_mut() {
+        for k in ["info", "form", "uuid", "id"] {
+            o.remove(k);
+        }
+    }
+    let funs = JsFuns::new(ddoc, &[src.to_string()], &[]);
+    blocking(|| unwrap_ok(funs.call("__rewrite", CallArgs::IS(0, Value::Array(vec![jreq]).to_string()))?))
+}
+
+/// A design doc function by kind and name; CouchDB's error when missing.
+fn ddoc_fun<'a>(ddoc: &'a Value, kind: &str, name: &str) -> Result<&'a str> {
+    ddoc.get(kind)
+        .and_then(|s| s.get(name))
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| CouchError::not_found(format!("missing json key: {name}")))
 }
 
 #[cfg(test)]

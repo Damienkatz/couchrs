@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 pub const VERSION: &str = "3.5.0";
 
+#[derive(Clone)]
 pub struct Req {
     pub method: Method,
     pub path: Vec<String>,
@@ -25,6 +26,8 @@ pub struct Req {
     pub trailing_slash: bool,
     /// Who is asking, as authenticated.
     pub auth: crate::auth::Auth,
+    /// How many times this request has been rewritten (_rewrite).
+    pub rewrites: u32,
 }
 
 impl Req {
@@ -153,6 +156,7 @@ pub async fn handle(State(server): State<Arc<Server>>, req: Request) -> Response
         server,
         trailing_slash: raw_path.ends_with('/'),
         auth: crate::auth::Auth::default(),
+        rewrites: 0,
     };
     let is_head = method == Method::HEAD;
     let mut req = req;
@@ -206,6 +210,14 @@ fn method_not_allowed(allowed: &str) -> CouchError {
 
 pub fn not_allowed(allowed: &str) -> Result<Response> {
     Err(method_not_allowed(allowed))
+}
+
+/// Authorize and route a request made inside the server (a rewrite).
+pub fn dispatch(req: Req) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response>> + Send>> {
+    Box::pin(async move {
+        crate::auth::authorize_request(&req.server, &req.auth.user, &req.method, &req.path)?;
+        route(req).await
+    })
 }
 
 async fn route(req: Req) -> Result<Response> {

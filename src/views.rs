@@ -1301,6 +1301,17 @@ fn view_response(res: ViewResult, args: &QueryArgs) -> Value {
     out
 }
 
+/// Query a view: {total_rows, offset, rows} for map results, {rows} for
+/// reduced ones (plus update_seq when asked).
+pub fn view_json(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str, args: &QueryArgs) -> Result<Value> {
+    let dir = index_dir(req, db);
+    blocking(|| -> Result<Value> {
+        let (snap, idx, st) = prepare(db, dir, ddoc_id, &args.update)?;
+        let vi = idx.def.view_index(view).ok_or_else(|| CouchError::not_found("missing_named_view"))?;
+        Ok(view_response(query_view(&snap, &st, &idx.def, vi, args)?, args))
+    })
+}
+
 pub async fn http_view(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Result<Response> {
     let mut args = QueryArgs::from_req(req)?;
     match req.method {
@@ -1311,13 +1322,7 @@ pub async fn http_view(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Re
         }
         _ => return not_allowed("GET,POST,HEAD"),
     }
-    let dir = index_dir(req, db);
-    let v = blocking(|| -> Result<Value> {
-        let (snap, idx, st) = prepare(db, dir, ddoc_id, &args.update)?;
-        let vi = idx.def.view_index(view).ok_or_else(|| CouchError::not_found("missing_named_view"))?;
-        Ok(view_response(query_view(&snap, &st, &idx.def, vi, &args)?, &args))
-    })?;
-    ok_json(v)
+    ok_json(view_json(req, db, ddoc_id, view, &args)?)
 }
 
 pub async fn http_view_queries(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Result<Response> {

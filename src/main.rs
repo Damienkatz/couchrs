@@ -16,6 +16,7 @@ pub mod jwt;
 pub mod keytree;
 pub mod mango;
 pub mod passwords;
+pub mod rewrite;
 pub mod rstore;
 pub mod server;
 pub mod views;
