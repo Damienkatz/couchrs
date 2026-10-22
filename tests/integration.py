@@ -1604,6 +1604,24 @@ def replicator_database():
             req("DELETE", f"/{d}")
 
 
+@test
+def special_doc_fields():
+    # _access (for per-document access, CouchDB's "access-ready") and the
+    # replication state fields are stored as given; others are refused.
+    db = new_db()
+    try:
+        body = {"_access": ["bob"], "_replication_state": "x", "_replication_state_time": "t", "_replication_state_reason": "r",
+                "_replication_id": "i", "_replication_stats": {"a": 1}, "v": 1}
+        eq(req("PUT", f"/{db}/a", body)[0], 201)
+        got = req("GET", f"/{db}/a")[1]
+        got.pop("_rev")
+        eq(got, dict(body, _id="a"))
+        eq(req("PUT", f"/{db}/b", {"_bogus": 1})[:2], (400, {"error": "doc_validation", "reason": "Bad special document member: _bogus"}))
+        assert "access-ready" in req("GET", "/")[1]["features"]
+    finally:
+        req("DELETE", f"/{db}")
+
+
 def main():
     failed = 0
     for t in TESTS:
