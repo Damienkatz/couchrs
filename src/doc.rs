@@ -504,23 +504,36 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
     Ok(atts)
 }
 
-/// Deterministic rev id: md5 over the edit's content and its parent.
-pub fn new_rev_id(doc: &Doc, parent: Option<(u64, &str)>, body_json: &[u8]) -> String {
-    let mut h = Md5::new();
-    h.update([doc.deleted as u8]);
-    if let Some((p, id)) = parent {
-        h.update(p.to_be_bytes());
-        h.update(id.as_bytes());
-    } else {
-        h.update(0u64.to_be_bytes());
-    }
-    h.update(body_json);
-    for a in &doc.atts {
-        h.update(a.name.as_bytes());
-        h.update([0]);
-        h.update(&a.md5);
-    }
-    hex::encode(h.finalize())
+/// The rev id of an edit, as couch_db:new_revid/1 makes it (so the same
+/// edit gets the same id here as in CouchDB): md5 of term_to_binary of
+/// [Deleted, OldStart, OldRev, Body, [{Name, Type, Md5}]], attachments
+/// last to first, a parent rev's 32 hex digits as its 16 bytes.
+pub fn new_rev_id(doc: &Doc, parent: Option<(u64, &str)>) -> String {
+    use crate::replicator::rep::{Term, ejson};
+    let (start, old) = match parent {
+        None => (0, Term::Int(0)),
+        Some((p, id)) => {
+            let bin = match hex::decode(id) {
+                Ok(b) if id.len() == 32 => b,
+                _ => id.as_bytes().to_vec(),
+            };
+            (p, Term::Bin(bin))
+        }
+    };
+    let atts = doc
+        .atts
+        .iter()
+        .rev()
+        .map(|a| Term::Tuple(vec![Term::Bin(a.name.as_bytes().to_vec()), Term::Bin(a.content_type.as_bytes().to_vec()), Term::Bin(a.md5.clone())]))
+        .collect();
+    let term = Term::List(vec![
+        Term::Atom(if doc.deleted { "true" } else { "false" }),
+        Term::Int(start as i128),
+        old,
+        ejson(&Value::Object(doc.body.clone())),
+        Term::List(atts),
+    ]);
+    hex::encode(Md5::digest(term.encode()))
 }
 
 /// Options controlling how a document is rendered.

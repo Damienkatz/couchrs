@@ -39,6 +39,10 @@ pub struct ChangesArgs {
     pub filter: Filter,
     pub req_json: Value,
     pub seq_interval: Option<u64>,
+    /// What each row becomes, or None to leave it out (and uncounted).
+    pub transform: Option<fn(&Value) -> Option<Value>>,
+    /// _db_updates: no pending counts.
+    pub db_updates: bool,
 }
 
 fn parse_args(req: &Req, db: &Db) -> Result<ChangesArgs> {
@@ -142,6 +146,8 @@ fn parse_args(req: &Req, db: &Db) -> Result<ChangesArgs> {
         filter,
         req_json,
         seq_interval: req.q_u64("seq_interval")?,
+        transform: None,
+        db_updates: false,
     })
 }
 
@@ -211,7 +217,11 @@ fn collect(snap: &Snapshot, args: &mut ChangesArgs, since: u64, limit: usize) ->
         }
         last = fdi.update_seq;
         if args.filter.matches(snap, fdi, &req)? {
-            rows.push(change_row(snap, fdi, args)?);
+            let row = change_row(snap, fdi, args)?;
+            match args.transform {
+                Some(t) => rows.extend(t(&row)),
+                None => rows.push(row),
+            }
             if rows.len() >= limit {
                 return Ok(false);
             }
@@ -249,7 +259,12 @@ pub async fn changes(req: Req, db: Arc<Db>) -> Result<Response> {
     if req.method != Method::GET && req.method != Method::POST && req.method != Method::HEAD {
         return not_allowed("GET,POST,HEAD");
     }
-    let mut args = parse_args(&req, &db)?;
+    let args = parse_args(&req, &db)?;
+    run_feed(db, args).await
+}
+
+/// A feed of a database's changes, of any kind.
+async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
     match args.feed.as_str() {
         "normal" => {
             let snap = db.snapshot();
@@ -262,10 +277,11 @@ pub async fn changes(req: Req, db: Arc<Db>) -> Result<Response> {
                 json!(snap.seq_str(last))
             };
             let pend = if args.descending { 0 } else { pending(&snap, last) };
-            Ok(json_response(
-                StatusCode::OK,
-                &json!({"results": rows, "last_seq": last_seq, "pending": pend}),
-            ))
+            let mut out = json!({"results": rows, "last_seq": last_seq, "pending": pend});
+            if args.db_updates {
+                out.as_object_mut().map(|o| o.remove("pending"));
+            }
+            Ok(json_response(StatusCode::OK, &out))
         }
         "longpoll" => {
             let _client = FeedClient::new();
@@ -278,19 +294,21 @@ pub async fn changes(req: Req, db: Arc<Db>) -> Result<Response> {
                 let (rows, last) = blocking(|| collect(&snap, &mut args, since, limit))?;
                 if !rows.is_empty() || tokio::time::Instant::now() >= deadline {
                     let pend = pending(&snap, last);
-                    return Ok(json_response(
-                        StatusCode::OK,
-                        &json!({"results": rows, "last_seq": snap.seq_str(last), "pending": pend}),
-                    ));
+                    let mut out = json!({"results": rows, "last_seq": snap.seq_str(last), "pending": pend});
+                    if args.db_updates {
+                        out.as_object_mut().map(|o| o.remove("pending"));
+                    }
+                    return Ok(json_response(StatusCode::OK, &out));
                 }
                 args.since = last;
                 let wait = tokio::time::timeout_at(deadline, rx.changed()).await;
                 if wait.is_err() {
                     let snap = db.snapshot();
-                    return Ok(json_response(
-                        StatusCode::OK,
-                        &json!({"results": [], "last_seq": snap.seq_str(args.since), "pending": 0}),
-                    ));
+                    let mut out = json!({"results": [], "last_seq": snap.seq_str(args.since), "pending": 0});
+                    if args.db_updates {
+                        out.as_object_mut().map(|o| o.remove("pending"));
+                    }
+                    return Ok(json_response(StatusCode::OK, &out));
                 }
             }
         }
@@ -348,7 +366,8 @@ fn continuous_stream(
             since = last;
             if remaining == 0 {
                 if !eventsource {
-                    yield Ok(Bytes::from(format!("{}\n", json!({"last_seq": snap.seq_str(since), "pending": pending(&snap, since)}))));
+                    let end = if args.db_updates { json!({"last_seq": snap.seq_str(since)}) } else { json!({"last_seq": snap.seq_str(since), "pending": pending(&snap, since)}) };
+                    yield Ok(Bytes::from(format!("{end}\n")));
                 }
                 break;
             }
@@ -380,7 +399,8 @@ fn continuous_stream(
             if done {
                 if !eventsource {
                     let snap = db.snapshot();
-                    yield Ok(Bytes::from(format!("{}\n", json!({"last_seq": snap.seq_str(since), "pending": 0}))));
+                    let end = if args.db_updates { json!({"last_seq": snap.seq_str(since)}) } else { json!({"last_seq": snap.seq_str(since), "pending": 0}) };
+                    yield Ok(Bytes::from(format!("{end}\n")));
                 }
                 break;
             }
@@ -388,43 +408,123 @@ fn continuous_stream(
     }
 }
 
+fn global_changes_db(server: &crate::server::Server) -> String {
+    server.config.get_or("global_changes", "db_name", "_global_changes")
+}
+
+/// global_changes_httpd:default_transform_change/2: "type:db" ids as
+/// database events.
+fn db_update_row(row: &Value) -> Option<Value> {
+    let (kind, db) = row.get("id")?.as_str()?.split_once(':')?;
+    Some(json!({"db_name": db, "type": kind, "seq": row.get("seq").cloned().unwrap_or(Value::Null)}))
+}
+
+/// GET /_db_updates: the changes of the _global_changes database, each a
+/// database's creation, update or deletion (global_changes_httpd).
 pub async fn db_updates(req: Req) -> Result<Response> {
+    if req.method != Method::GET {
+        return not_allowed("GET");
+    }
     let feed = req.q("feed").unwrap_or("normal").to_string();
-    let timeout = Duration::from_millis(req.q_u64("timeout")?.unwrap_or(60_000));
-    let mut rx = crate::db::events().subscribe();
-    // Database creations and deletions.
-    async fn next(rx: &mut tokio::sync::broadcast::Receiver<(String, crate::db::DbEvent)>) -> Option<(String, &'static str)> {
-        loop {
-            match rx.recv().await {
-                Ok((db, crate::db::DbEvent::Created)) => return Some((db, "created")),
-                Ok((db, crate::db::DbEvent::Deleted)) => return Some((db, "deleted")),
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => return None,
-            }
-        }
-    }
-    if feed == "normal" {
-        return Ok(json_response(StatusCode::OK, &json!({"results": [], "last_seq": "0"})));
-    }
-    if feed == "longpoll" {
-        let r = tokio::time::timeout(timeout, next(&mut rx)).await;
-        let results = match r {
-            Ok(Some((db, kind))) => vec![json!({"db_name": db, "type": kind, "seq": "0"})],
-            _ => vec![],
-        };
-        return Ok(json_response(StatusCode::OK, &json!({"results": results, "last_seq": "0"})));
-    }
-    let stream = async_stream::stream! {
-        loop {
-            match tokio::time::timeout(timeout, next(&mut rx)).await {
-                Ok(Some((db, kind))) => yield Ok::<_, Infallible>(Bytes::from(format!("{}\n", json!({"db_name": db, "type": kind, "seq": "0"})))),
-                _ => break,
-            }
+    let non_neg = |k: &str| -> Result<Option<u64>> {
+        match req.q(k) {
+            None => Ok(None),
+            Some(v) => v.parse::<u64>().map(Some).map_err(|_| CouchError::bad_request("invalid_integer")),
         }
     };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from_stream(stream))
-        .unwrap())
+    let limit = non_neg("limit")?;
+    let timeout = non_neg("timeout")?;
+    let heartbeat = match req.q("heartbeat") {
+        Some("true") => Some(60_000),
+        Some("false") | None => None,
+        Some(_) => non_neg("heartbeat")?,
+    };
+    if !req.auth.user.is_server_admin() {
+        return Err(CouchError::unauthorized("You are not a server admin."));
+    }
+    let name = global_changes_db(&req.server);
+    let db = req.server.open_db(&name).map_err(|_| CouchError::not_found("Database does not exist."))?;
+    if !matches!(feed.as_str(), "normal" | "longpoll" | "continuous" | "eventsource") {
+        return Err(CouchError::bad_request("Supported `feed` types: normal, continuous, longpoll, eventsource"));
+    }
+    let snap = db.snapshot();
+    let since = match req.q("since") {
+        None | Some("0") | Some("") => 0,
+        Some("now") => snap.update_seq(),
+        Some(s) => {
+            let v: Value = serde_json::from_str(s).unwrap_or(Value::String(s.to_string()));
+            parse_seq(&v).ok_or_else(|| CouchError::bad_request("Malformed sequence supplied in 'since' parameter."))?
+        }
+    };
+    let args = ChangesArgs {
+        feed: feed.clone(),
+        since,
+        descending: req.q("descending") == Some("true"),
+        limit: limit.map(|l| l as usize).unwrap_or(usize::MAX),
+        include_docs: false,
+        all_docs_style: false,
+        heartbeat,
+        timeout: timeout.unwrap_or(60_000),
+        doc_opts: DocOpts::default(),
+        filter: Filter::None,
+        req_json: Value::Null,
+        seq_interval: None,
+        transform: Some(db_update_row),
+        db_updates: true,
+    };
+    run_feed(db, args).await
+}
+
+/// The global_changes server: database events, gathered for
+/// [global_changes] max_write_delay ms, then written as new revisions of
+/// "type:db" documents in the _global_changes database (while it exists;
+/// until then they wait).
+pub fn start_global_changes(server: &Arc<crate::server::Server>) {
+    let weak = Arc::downgrade(server);
+    let mut rx = crate::db::events().subscribe();
+    tokio::spawn(async move {
+        let mut pending: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let delay = weak.upgrade().map(|s| s.config.get_int("global_changes", "max_write_delay", 500u64)).unwrap_or(500);
+        let mut tick = tokio::time::interval(Duration::from_millis(delay.max(1)));
+        loop {
+            tokio::select! {
+                ev = rx.recv() => {
+                    let (db, kind) = match ev {
+                        Ok((db, crate::db::DbEvent::Created)) => (db, "created"),
+                        Ok((db, crate::db::DbEvent::Updated)) => (db, "updated"),
+                        Ok((db, crate::db::DbEvent::Deleted)) => (db, "deleted"),
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => return,
+                    };
+                    let Some(server) = weak.upgrade() else { return };
+                    if server.config.get("global_changes", "update_db").as_deref() == Some("false") || db == global_changes_db(&server) {
+                        continue;
+                    }
+                    pending.insert(format!("{kind}:{db}"));
+                }
+                _ = tick.tick() => {
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    let Some(server) = weak.upgrade() else { return };
+                    let Ok(db) = server.open_db(&global_changes_db(&server)) else { continue };
+                    let snap = db.snapshot();
+                    let mut docs = Vec::new();
+                    for id in std::mem::take(&mut pending) {
+                        let mut d = json!({"_id": id});
+                        if let Ok(Some(fdi)) = snap.get_fdi(&id) {
+                            d["_rev"] = json!(fdi.winner().rev());
+                        }
+                        if let Ok(doc) = crate::doc::from_json(d) {
+                            docs.push(doc);
+                        }
+                    }
+                    crate::stat!("global_changes.db_writes").add(docs.len() as i64);
+                    if let Err(e) = db.update_docs(docs, true).await {
+                        tracing::warn!("global_changes: {}", e.reason);
+                    }
+                }
+            }
+        }
+    });
 }

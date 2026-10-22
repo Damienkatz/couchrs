@@ -98,10 +98,13 @@ pub fn after_doc_read(user: &crate::auth::UserCtx, sec: &Value, mut v: Value) ->
         }
     }
     if let Some((pos, rev)) = o.get("_rev").and_then(Value::as_str).and_then(|r| r.split_once('-').map(|(p, r)| (p.to_string(), r.to_string()))) {
-        let body: Map<String, Value> = o.iter().filter(|(k, _)| !k.starts_with('_')).map(|(k, v)| (k.clone(), v.clone())).collect();
+        // The body as CouchDB holds it: fields, and the special ones it keeps.
+        let kept = |k: &str| !k.starts_with('_') || k.starts_with("_replication_") || k == "_access";
+        let body: Map<String, Value> = o.iter().filter(|(k, _)| kept(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
         let doc = Doc { id: id.clone(), revs: (0, vec![]), deleted: false, body, atts: vec![], att_gen: 0 };
         let pos: u64 = pos.parse().unwrap_or(1);
-        let new = crate::doc::new_rev_id(&doc, Some((pos.saturating_sub(1), &rev)), serde_json::to_string(&doc.body).unwrap_or_default().as_bytes());
+        // new_revid of the doc as it was, at its own position.
+        let new = crate::doc::new_rev_id(&doc, Some((pos, &rev)));
         o.insert("_rev".into(), json!(format!("{pos}-{new}")));
     }
     v

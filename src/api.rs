@@ -56,6 +56,7 @@ pub async fn db_request(req: Req) -> Result<Response> {
             if req.method != Method::POST {
                 return not_allowed("POST");
             }
+            require_json_ctype(&req)?;
             Ok(json_response(StatusCode::CREATED, &json!({"ok": true, "instance_start_time": "0"})))
         }
         ["_revs_diff"] => revs_diff(&req, &db),
@@ -183,14 +184,57 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
             let r = with_header(r, header::LOCATION, &format!("/{name}/{id}"));
             Ok(with_header(r, header::ETAG, &format!("\"{rev}\"")))
         }
-        _ => not_allowed("DELETE,GET,HEAD,POST,PUT"),
+        _ => not_allowed("DELETE,GET,HEAD,POST"),
     }
 }
 
 /// Check, validate and submit docs to the writer, as `req`'s user:
 /// design documents need a database admin, users-db documents get their
 /// passwords hashed, and validate_doc_update functions see the user.
+/// [couchdb] max_attachment_size: bytes, or None for infinity.
+pub fn max_attachment_size(config: &crate::config::Config) -> Option<u64> {
+    match config.get("couchdb", "max_attachment_size").as_deref() {
+        Some("infinity") => None,
+        Some(v) => v.parse().ok(),
+        None => Some(1 << 30),
+    }
+}
+
+/// What couch_doc:from_json_obj_validate/2 and validate_docid/1 limit:
+/// id length, body size (its JSON), attachment sizes. Any too big fails
+/// the whole request.
+fn check_docid_length(config: &crate::config::Config, id: &str) -> Result<()> {
+    let max_id = config.get("couchdb", "max_document_id_length").filter(|v| v != "infinity").and_then(|v| v.parse::<usize>().ok());
+    if let Some(m) = max_id
+        && m > 0
+        && id.len() > m
+    {
+        return Err(CouchError::new(StatusCode::BAD_REQUEST, "illegal_docid", "Document id is too long"));
+    }
+    Ok(())
+}
+
+fn check_doc_limits(config: &crate::config::Config, docs: &[Doc]) -> Result<()> {
+    let max_doc = config.get_int("couchdb", "max_document_size", 8_000_000u64);
+    let max_att = max_attachment_size(config);
+    for d in docs {
+        check_docid_length(config, &d.id)?;
+        if serde_json::to_vec(&d.body).map(|b| b.len() as u64).unwrap_or(0) > max_doc {
+            return Err(CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "document_too_large", d.id.clone()));
+        }
+        for a in &d.atts {
+            if let (AttData::Bytes(b), Some(m)) = (&a.data, max_att)
+                && b.len() as u64 > m
+            {
+                return Err(CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "attachment_too_large", a.name.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: bool) -> Result<Vec<Result<String>>> {
+    check_doc_limits(&req.server.config, &docs)?;
     let snap = db.snapshot();
     let sec = snap.security();
     let user = &req.auth.user;
@@ -211,7 +255,7 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
             // Design documents must describe valid indexes (couch_mrview
             // validate), including the partitioned option.
             if e.is_none() && !d.deleted && !d.id.starts_with("_design/_") {
-                *e = crate::views::IndexDef::from_ddoc(&crate::js::doc_to_vdu_json(d), snap.partitioned()).err();
+                *e = crate::views::validate_ddoc(&crate::js::doc_to_vdu_json(d), snap.partitioned()).err();
             }
         } else if users_db {
             *e = crate::auth::before_users_doc_update(config, user, &sec, &mut d.body, &d.id).err();
@@ -374,6 +418,14 @@ fn get_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     if req.header("if-none-match") == Some(etag.as_str()) {
         return Ok(with_header(empty(StatusCode::NOT_MODIFIED), header::ETAG, &etag));
     }
+    // With attachments, a client taking multipart/related (as one with no
+    // Accept does) gets their bytes in parts rather than base64.
+    let multipart = opts.attachments && req.accepts_content_type("multipart/related");
+    let mut opts = opts;
+    if multipart {
+        opts.follows = true;
+        opts.att_encoding_info = true;
+    }
     // Inlined attachment bodies can be large; the doc alone is a point read.
     let mut v = if opts.attachments { blocking(|| snap.doc_json(&fdi, &rev, &opts))? } else { snap.doc_json(&fdi, &rev, &opts)? };
     crate::db::count_reads(&snap, 1);
@@ -382,6 +434,9 @@ fn get_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     }
     if crate::auth::is_users_db(&req.server.config, &db.name) {
         v = crate::auth::after_users_doc_read(&req.server.config, &req.auth.user, &snap.security(), id, v)?;
+    }
+    if multipart && v.get("_attachments").and_then(Value::as_object).is_some_and(|a| !a.is_empty()) {
+        return doc_multipart(&snap, &rev, &v, &etag);
     }
     Ok(with_header(json_response(StatusCode::OK, &v), header::ETAG, &etag))
 }
@@ -416,8 +471,16 @@ pub fn resolve_open_revs(snap: &Snapshot, id: &str, spec: &Value, latest: bool) 
     let mut out = Vec::new();
     match spec {
         Value::String(s) if s == "all" => {
+            // couch_key_tree:get_all_leafs/1's order: the trees last to
+            // first, each depth first.
             let fdi = fdi.ok_or_else(CouchError::missing)?;
-            for l in fdi.sorted_leafs() {
+            let mut leafs: Vec<RevInfo> = Vec::new();
+            for tree in fdi.tree.iter().rev() {
+                for l in crate::keytree::leafs(&vec![tree.clone()]) {
+                    leafs.push(RevInfo { pos: l.pos, deleted: l.val.deleted(), id: l.id, val: l.val, path: l.path });
+                }
+            }
+            for l in leafs {
                 if l.val.leaf().is_some() {
                     out.push(Ok((fdi.clone(), l)));
                 }
@@ -466,8 +529,16 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
         serde_json::from_str(spec).map_err(|_| CouchError::bad_request("Invalid open_revs value"))?
     };
     let latest = req.flag("latest")?;
-    if !req.accepts("multipart/mixed") {
-        let results = blocking(|| open_revs(snap, id, &spec, latest, opts))?;
+    if !req.accepts_content_type("multipart/mixed") {
+        let mut results = blocking(|| open_revs(snap, id, &spec, latest, opts))?;
+        if spec == json!("all") {
+            let pos_id = |v: &Value| {
+                let rev = v.get("ok").and_then(|d| d.get("_rev")).and_then(Value::as_str).unwrap_or("");
+                let (p, r) = rev.split_once('-').unwrap_or(("0", ""));
+                (p.parse::<u64>().unwrap_or(0), r.to_string())
+            };
+            results.sort_by_key(pos_id);
+        }
         return ok_json(Value::Array(results));
     }
     // As CouchDB does: one part per revision; a revision with attachments
@@ -523,12 +594,7 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
         pieces.push(Piece::Data(Bytes::from(doc_bytes)));
         for name in follows {
             let Some(att) = body.atts.iter().find(|a| a.name == name) else { continue };
-            pieces.push(Piece::Data(Bytes::from(format!(
-                "\r\n--{inner}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
-                name.replace('"', "\\\""),
-                att.content_type,
-                att.encoded_length
-            ))));
+            pieces.push(Piece::Data(Bytes::from(format!("\r\n--{inner}{}", att_part_headers(&name, att)))));
             pieces.push(Piece::Att(att.clone()));
         }
         pieces.push(Piece::Data(Bytes::from(format!("\r\n--{inner}--\r\n"))));
@@ -644,6 +710,54 @@ enum Piece {
     Att(AttInfo),
 }
 
+/// An attachment's part headers in a multipart document
+/// (couch_httpd_multipart), the bytes sent as stored.
+fn att_part_headers(name: &str, att: &AttInfo) -> String {
+    let enc = match &att.encoding {
+        Some(e) => format!("Content-Encoding: {e}\r\n"),
+        None => String::new(),
+    };
+    format!(
+        "\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Type: {}\r\nContent-Length: {}\r\n{enc}\r\n",
+        name.replace('"', "\\\""),
+        att.content_type,
+        att.encoded_length
+    )
+}
+
+/// A document with its attachments as multipart/related
+/// (send_doc_efficiently/4): the JSON, its attachments marked "follows",
+/// then each one's bytes.
+fn doc_multipart(snap: &Snapshot, rev: &RevInfo, doc: &Value, etag: &str) -> Result<Response> {
+    let follows: Vec<String> = doc
+        .get("_attachments")
+        .and_then(Value::as_object)
+        .map(|a| a.iter().filter(|(_, v)| v.get("follows").is_some()).map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default();
+    let body = blocking(|| snap.read_body(rev.val.leaf().map(|l| l.ptr).unwrap_or_default()))?;
+    let boundary = hex::encode(uuid::Uuid::new_v4().as_bytes());
+    let mut pieces = vec![Piece::Data(Bytes::from(format!("--{boundary}\r\nContent-Type: application/json\r\n\r\n")))];
+    pieces.push(Piece::Data(Bytes::from(serde_json::to_vec(doc)?)));
+    pieces.push(Piece::Data(Bytes::from(format!("\r\n--{boundary}"))));
+    let mut len: u64 = 0;
+    for name in follows {
+        let Some(att) = body.atts.iter().find(|a| a.name == name) else { continue };
+        pieces.push(Piece::Data(Bytes::from(att_part_headers(&name, att))));
+        len += att.encoded_length;
+        pieces.push(Piece::Att(att.clone()));
+        pieces.push(Piece::Data(Bytes::from(format!("\r\n--{boundary}"))));
+    }
+    pieces.push(Piece::Data(Bytes::from_static(b"--")));
+    len += pieces.iter().map(|p| if let Piece::Data(b) = p { b.len() as u64 } else { 0 }).sum::<u64>();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, format!("multipart/related; boundary=\"{boundary}\""))
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::ETAG, etag)
+        .body(stream_pieces(snap.clone(), pieces))
+        .unwrap())
+}
+
 /// Stream a response made of literal pieces and attachment data, reading
 /// attachment chunks from disk only as the client consumes them.
 fn stream_pieces(snap: Snapshot, pieces: Vec<Piece>) -> Body {
@@ -734,11 +848,14 @@ async fn parse_multipart_doc(req: &Req) -> Result<Doc> {
 
 async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     validate_docid(id)?;
+    check_docid_length(&req.server.config, id)?;
     let mut doc = if req.content_type().starts_with("multipart/related") {
         parse_multipart_doc(req).await?
     } else {
         from_json(req.json_body()?)?
     };
+    // Sizes are checked of the doc as sent (its id, if any, its own).
+    check_doc_limits(&req.server.config, std::slice::from_ref(&doc))?;
     doc.id = id.to_string();
     if doc.revs.1.is_empty() {
         if let Some(r) = rev_from_req(req) {
@@ -874,6 +991,9 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                     .unwrap_or("application/octet-stream")
                     .to_string();
                 let data = req.body.clone();
+                if max_attachment_size(&req.server.config).is_some_and(|m| data.len() as u64 > m) {
+                    return Err(CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "attachment_too_large", name.to_string()));
+                }
                 // Uploaded gzipped, it is kept gzipped (its identity length
                 // unknown).
                 let encoding = match req.header("content-encoding").map(|e| e.trim().to_ascii_lowercase()).as_deref() {
@@ -888,7 +1008,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                     }
                 };
                 doc.atts.retain(|a| a.name != name);
-                doc.atts.push(Att {
+                doc.atts.insert(0, Att {
                     name: name.to_string(),
                     content_type: ct,
                     revpos: None,
@@ -1308,10 +1428,21 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
         end,
         inclusive_end: args.inclusive_end,
     };
-    let offset = match &start {
+    let mut offset = match &start {
         Some(s) => snap.count_docs_before(s, dir)?,
         None => 0,
     };
+    // _design_docs counts the design documents only.
+    let mut total = total;
+    if kind == AllDocsKind::Design {
+        let ids = crate::views::design_doc_ids(snap)?;
+        total = ids.len() as u64;
+        offset = match &start {
+            Some(s) if args.descending => ids.iter().filter(|i| i.as_str() > s.as_str()).count() as u64,
+            Some(s) => ids.iter().filter(|i| i.as_str() < s.as_str()).count() as u64,
+            None => 0,
+        };
+    }
     let mut skip = args.skip;
     let limit = args.limit;
     if limit > 0 {
@@ -1348,10 +1479,10 @@ async fn bulk_docs(req: &Req, db: &Arc<Db>) -> Result<Response> {
     }
     crate::stat!("couchdb.httpd.bulk_requests").inc();
     let body = req.json_obj_body()?;
-    let docs = body
-        .get("docs")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| CouchError::bad_request("POST body must include `docs` parameter."))?;
+    let docs = match body.get("docs") {
+        None => return Err(CouchError::bad_request("POST body must include `docs` parameter.")),
+        Some(d) => d.as_array().ok_or_else(|| CouchError::bad_request("`docs` parameter must be an array."))?,
+    };
     crate::stat!("couchdb.httpd.bulk_docs").observe(docs.len() as f64);
     let new_edits = body.get("new_edits").and_then(|v| v.as_bool()).unwrap_or(true);
     let mut parsed = Vec::with_capacity(docs.len());
@@ -1415,7 +1546,8 @@ async fn bulk_get(req: &Req, db: &Arc<Db>) -> Result<Response> {
             None => json!("all"),
         };
         let res = blocking(|| open_revs(&snap, id, &spec, latest, &opts));
-        let rev = d.get("rev").cloned().unwrap_or(Value::Null);
+        // A doc asked for without a rev is missing at rev "undefined".
+        let rev = d.get("rev").cloned().unwrap_or(json!("undefined"));
         let entries: Vec<Value> = match res {
             Ok(list) if !list.is_empty() => list
                 .into_iter()
@@ -1433,6 +1565,15 @@ async fn bulk_get(req: &Req, db: &Arc<Db>) -> Result<Response> {
 }
 
 // -------------------------------------------------------------- misc db ops
+
+/// couch_httpd:validate_ctype(Req, "application/json").
+pub fn require_json_ctype(req: &Req) -> Result<()> {
+    if req.content_type().split(';').next() == Some("application/json") {
+        Ok(())
+    } else {
+        Err(CouchError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "bad_content_type", "Content-Type must be application/json"))
+    }
+}
 
 fn compact(req: &Req, db: &Arc<Db>) -> Result<Response> {
     if req.method != Method::POST {

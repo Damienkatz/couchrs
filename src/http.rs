@@ -6,13 +6,14 @@ use crate::error::{CouchError, Result};
 use crate::server::Server;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-pub const VERSION: &str = "3.5.0";
+pub const VERSION: &str = "3.5.3";
+const SERVER_HEADER: &str = concat!("CouchDB/3.5.3 (couchdb-rs ", env!("CARGO_PKG_VERSION"), ")");
 
 #[derive(Clone)]
 pub struct Req {
@@ -118,6 +119,31 @@ impl Req {
     pub fn accepts(&self, ct: &str) -> bool {
         self.header("accept").map(|a| a.contains(ct)).unwrap_or(false)
     }
+
+    /// mochiweb's accepts_content_type/1: whether the Accept header (none
+    /// meaning */*) takes this type, exactly or by wildcard, at q > 0.
+    pub fn accepts_content_type(&self, ct: &str) -> bool {
+        let accept = self.header("accept").unwrap_or("*/*");
+        let main = ct.split('/').next().unwrap_or("");
+        let super_type = format!("{main}/*");
+        for item in accept.split(',') {
+            let mut parts = item.split(';').map(str::trim);
+            let ty = parts.next().unwrap_or("").to_ascii_lowercase();
+            let mut q = 1.0f64;
+            for p in parts {
+                if let Some(v) = p.strip_prefix("q=") {
+                    match v.trim().parse::<f64>() {
+                        Ok(x) => q = x,
+                        Err(_) => return false,
+                    }
+                }
+            }
+            if q > 0.0 && (ty == "*/*" || ty == ct || ty == super_type) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub fn json_response(status: StatusCode, v: &Value) -> Response {
@@ -149,7 +175,22 @@ fn decode(seg: &str) -> String {
 pub async fn handle(State(server): State<Arc<Server>>, req: Request) -> Response {
     let t0 = std::time::Instant::now();
     count_method(req.method());
-    let resp = handle_req(server, req).await;
+    let req_headers = req.headers().clone();
+    let mut resp = match crate::cors::preflight(&server, req.method(), req.headers()) {
+        Some(r) => r,
+        None => {
+            let mut r = handle_req(server.clone(), req).await;
+            crate::cors::apply(&server, &req_headers, &mut r);
+            r
+        }
+    };
+    // What chttpd adds to every response.
+    let h = resp.headers_mut();
+    h.insert(header::SERVER, HeaderValue::from_static(SERVER_HEADER));
+    if let Ok(id) = HeaderValue::from_str(&format!("{:010x}", rand::random::<u64>() & 0xff_ffff_ffff)) {
+        h.insert(HeaderName::from_static("x-couch-request-id"), id);
+    }
+    h.insert(HeaderName::from_static("x-couchdb-body-time"), HeaderValue::from_static("0"));
     if let Some(m) = crate::stats::find(&format!("couchdb.httpd_status_codes.{}", resp.status().as_u16())) {
         m.inc();
     }
@@ -185,8 +226,13 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
         .query()
         .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
         .unwrap_or_default();
-    let body = match axum::body::to_bytes(body, 4 << 30).await {
+    // [chttpd] max_http_request_size bounds a body.
+    let max = server.config.get_int("chttpd", "max_http_request_size", 4294967296usize);
+    let body = match axum::body::to_bytes(body, max).await {
         Ok(b) => b,
+        Err(e) if std::error::Error::source(&e).is_some_and(|s| s.is::<http_body_util::LengthLimitError>()) => {
+            return CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "the request entity is too large").into_response();
+        }
         Err(e) => return CouchError::bad_request(e.to_string()).into_response(),
     };
     let method = parts.method.clone();
@@ -229,8 +275,16 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
         resp.headers_mut().insert(header::SET_COOKIE, h);
     }
     if is_head {
-        let (mut parts, _) = resp.into_parts();
-        parts.headers.remove(header::CONTENT_LENGTH);
+        // The headers of a GET, its length included, and no body.
+        let (mut parts, body) = resp.into_parts();
+        match axum::body::HttpBody::size_hint(&body).exact() {
+            Some(n) => {
+                parts.headers.insert(header::CONTENT_LENGTH, HeaderValue::from(n));
+            }
+            None => {
+                parts.headers.remove(header::CONTENT_LENGTH);
+            }
+        }
         return Response::from_parts(parts, Body::empty());
     }
     resp
@@ -267,9 +321,13 @@ async fn route(req: Req) -> Result<Response> {
     let first = req.path.first().cloned();
     match first.as_deref() {
         None => welcome(&req),
+        Some("_all_dbs") if !matches!(req.method, Method::GET | Method::HEAD) => not_allowed("GET,HEAD"),
         Some("_all_dbs") => all_dbs(&req),
+        Some("_dbs_info") if !matches!(req.method, Method::GET | Method::HEAD | Method::POST) => not_allowed("GET,HEAD,POST"),
         Some("_dbs_info") => dbs_info(&req),
+        Some("_uuids") if req.method != Method::GET => not_allowed("GET"),
         Some("_uuids") => uuids(&req),
+        Some("_up") if !matches!(req.method, Method::GET | Method::HEAD) => not_allowed("GET,HEAD"),
         Some("_up") => ok_json(json!({"status": "ok", "seeds": {}})),
         Some("_session") => session(&req),
         Some("_utils") => crate::fauxton::serve(&req),
@@ -282,6 +340,7 @@ async fn route(req: Req) -> Result<Response> {
             }
             _ => not_allowed("GET,HEAD"),
         },
+        Some("_membership") if req.method != Method::GET => not_allowed("GET"),
         Some("_membership") => ok_json(json!({
             "all_nodes": ["couchdb@127.0.0.1"], "cluster_nodes": ["couchdb@127.0.0.1"]
         })),
@@ -292,14 +351,7 @@ async fn route(req: Req) -> Result<Response> {
         Some("_scheduler") => crate::replicator::http_scheduler(&req),
         Some("_db_updates") => crate::changes::db_updates(req).await,
         // Fauxton's setup page asks this; couchdb-rs is always one node.
-        Some("_cluster_setup") => match req.method {
-            Method::GET | Method::HEAD => ok_json(json!({"state": "single_node_enabled"})),
-            _ => Err(CouchError::new(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented",
-                "couchdb-rs is a single node; set the admin and bind address on its command line.",
-            )),
-        },
+        Some("_cluster_setup") => cluster_setup(&req).await,
         Some("favicon.ico") => Err(CouchError::not_found("missing")),
         // Creating one is a bad name; anything else finds no database.
         Some(s) if s.starts_with('_') && !matches!(s, "_users" | "_replicator" | "_global_changes") => {
@@ -321,17 +373,39 @@ fn welcome(req: &Req) -> Result<Response> {
     if req.method != Method::GET && req.method != Method::HEAD {
         return not_allowed("GET,HEAD");
     }
-    ok_json(json!({
+    // chttpd_misc:get_features/0: search engines, the JavaScript engine,
+    // then the features CouchDB's applications enable.
+    let mut features = Vec::new();
+    if crate::nouveau::enabled(&req.server) {
+        features.push("nouveau");
+    }
+    features.extend(["quickjs", "access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"]);
+    let mut out = json!({
         "couchdb": "Welcome",
         "version": VERSION,
         "git_sha": "rust",
         "uuid": req.server.uuid,
-        "features": ["access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"],
-        "vendor": {"name": "couchdb-rs"}
-    }))
+        "features": features,
+    });
+    let vendor: serde_json::Map<String, Value> = req.server.config.section("vendor").into_iter().map(|(k, v)| (k, json!(v))).collect();
+    if !vendor.is_empty() {
+        out["vendor"] = Value::Object(vendor);
+    }
+    ok_json(out)
 }
 
 fn all_dbs(req: &Req) -> Result<Response> {
+    ok_json(json!(db_names(req)?))
+}
+
+/// The databases _all_dbs (and GET _dbs_info) list: all_docs arguments
+/// over the database list, keys included.
+fn db_names(req: &Req) -> Result<Vec<String>> {
+    if let Some(keys) = req.q_json("keys")? {
+        let keys = keys.as_array().cloned().ok_or_else(|| CouchError::bad_request("`keys` member must be an array."))?;
+        let all: std::collections::HashSet<String> = req.server.all_dbs().into_iter().collect();
+        return Ok(keys.iter().filter_map(|k| k.as_str()).filter(|k| all.contains(*k)).map(String::from).collect());
+    }
     let mut dbs = req.server.all_dbs();
     if req.flag("descending")? {
         dbs.reverse();
@@ -352,12 +426,12 @@ fn all_dbs(req: &Req) -> Result<Response> {
     });
     let skip = req.q_u64("skip")?.unwrap_or(0) as usize;
     let limit = req.q_u64("limit")?.map(|l| l as usize).unwrap_or(usize::MAX);
-    let out: Vec<String> = dbs.into_iter().skip(skip).take(limit).collect();
-    ok_json(json!(out))
+    Ok(dbs.into_iter().skip(skip).take(limit).collect())
 }
 
 fn dbs_info(req: &Req) -> Result<Response> {
-    let names: Vec<String> = if req.method == Method::POST {
+    let get = req.method != Method::POST;
+    let names: Vec<String> = if !get {
         let b = req.json_obj_body()?;
         b.get("keys")
             .and_then(|k| k.as_array())
@@ -366,12 +440,15 @@ fn dbs_info(req: &Req) -> Result<Response> {
             .filter_map(|k| k.as_str().map(String::from))
             .collect()
     } else {
-        req.server.all_dbs()
+        db_names(req)?
     };
     let mut out = Vec::new();
     for n in names {
         match req.server.open_db(&n) {
             Ok(db) => out.push(json!({"key": n, "info": db.info()})),
+            // Listed ones that went away are left out; asked-for ones are
+            // reported missing.
+            Err(_) if get => {}
             Err(_) => out.push(json!({"key": n, "error": "not_found"})),
         }
     }
@@ -429,15 +506,25 @@ fn session(req: &Req) -> Result<Response> {
             ok_json(json!({"ok": true, "userCtx": {"name": user.name, "roles": user.roles}, "info": info}))
         }
         Method::POST => {
+            // The form, as couch_httpd_auth reads it: other content types
+            // give none.
             let creds: Value = if req.content_type().starts_with("application/x-www-form-urlencoded") {
                 let m: serde_json::Map<String, Value> = form_urlencoded::parse(&req.body)
                     .map(|(k, v)| (k.to_string(), json!(v)))
                     .collect();
                 Value::Object(m)
-            } else {
+            } else if req.content_type().starts_with("application/json") {
                 req.json_body()?
+            } else {
+                json!({})
             };
-            let name = creds.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            // extract_username/1: name, or username, or both the same.
+            let name = match (creds.get("name").and_then(Value::as_str), creds.get("username").and_then(Value::as_str)) {
+                (None, None) => return Err(CouchError::bad_request("request body must contain a username")),
+                (Some(n), None) | (None, Some(n)) => n,
+                (Some(n), Some(u)) if n == u => n,
+                _ => return Err(CouchError::bad_request("request body contains different usernames")),
+            };
             let pass = creds.get("password").and_then(|n| n.as_str()).unwrap_or("");
             let clear = crate::auth::cookie_header(config, "", false);
             match crate::auth::get_user_creds(&req.server, name).filter(|c| c.check_password(pass)) {
@@ -460,6 +547,76 @@ fn session(req: &Req) -> Result<Response> {
             Ok(redirect(r))
         }
         _ => not_allowed("GET,HEAD,POST,DELETE"),
+    }
+}
+
+/// /_cluster_setup (setup_httpd), for the one node there is: its state,
+/// and enable_single_node and finish_cluster to set it up.
+async fn cluster_setup(req: &Req) -> Result<Response> {
+    if !req.auth.user.is_server_admin() {
+        return Err(CouchError::unauthorized("You are not a server admin."));
+    }
+    let config = &req.server.config;
+    let dbs_exist = |dbs: &[String]| dbs.iter().all(|d| req.server.open_db(d).is_ok());
+    let system_dbs = vec!["_users".to_string(), "_replicator".to_string()];
+    match req.method {
+        Method::GET | Method::HEAD => {
+            let dbs: Vec<String> = req.q_json("ensure_dbs_exist")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or(system_dbs);
+            let enabled = config.get_bool("couchdb", "single_node", false) || (!config.section("admins").is_empty() && dbs_exist(&dbs));
+            ok_json(json!({"state": if enabled { "single_node_enabled" } else { "single_node_disabled" }}))
+        }
+        Method::POST => {
+            if req.content_type().split(';').next() != Some("application/json") {
+                return Err(CouchError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "bad_content_type", "Content-Type must be application/json"));
+            }
+            let body = req.json_obj_body().map_err(|_| CouchError::bad_request("Missing JSON body'"))?;
+            let s = |k: &str| body.get(k).and_then(|v| v.as_str()).map(String::from);
+            let dbs: Vec<String> = body.get("ensure_dbs_exist").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or(system_dbs);
+            let create = |dbs: &[String]| -> Result<()> {
+                for d in dbs {
+                    if req.server.open_db(d).is_err() {
+                        req.server.create_db(d)?;
+                    }
+                }
+                Ok(())
+            };
+            match body.get("action").and_then(|a| a.as_str()).unwrap_or("missing") {
+                "enable_single_node" => {
+                    let user = s("username");
+                    let pass = s("password_hash").or_else(|| s("password"));
+                    if config.section("admins").is_empty() && user.is_none() && pass.is_none() {
+                        return Err(CouchError::bad_request("Cluster setup requires admin account to be configured"));
+                    }
+                    if let (Some(u), Some(p)) = (&user, &pass) {
+                        let hashed = if s("password_hash").is_some() { p.clone() } else { crate::passwords::hash_admin_password(config, p) };
+                        config.set("admins", u, &hashed, true)?;
+                    }
+                    // Like CouchDB, the address and port take effect when
+                    // the server next starts.
+                    config.set("chttpd", "bind_address", &s("bind_address").unwrap_or_else(|| "0.0.0.0".into()), true)?;
+                    if let Some(port) = body.get("port").map(|p| p.as_str().map(String::from).unwrap_or_else(|| p.to_string())) {
+                        config.set("chttpd", "port", &port, true)?;
+                    }
+                    config.set("cluster", "n", "1", true)?;
+                    if !dbs_exist(&dbs) {
+                        create(&dbs)?;
+                    }
+                }
+                "finish_cluster" => {
+                    if dbs_exist(&dbs) {
+                        return Err(CouchError::bad_request("Cluster is already finished"));
+                    }
+                    create(&dbs)?;
+                }
+                "remove_node" => {}
+                "enable_cluster" | "add_node" | "receive_cookie" => {
+                    return Err(CouchError::bad_request("couchdb-rs runs as a single node"));
+                }
+                _ => return Err(CouchError::bad_request("Invalid Action'")),
+            }
+            Ok(json_response(StatusCode::CREATED, &json!({"ok": true})))
+        }
+        _ => not_allowed("GET,POST"),
     }
 }
 
@@ -574,17 +731,7 @@ fn node_config(req: &Req, rest: &[&str]) -> Result<Response> {
 }
 
 pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
-    let app = axum::Router::new()
-        .fallback(handle)
-        .with_state(server.clone())
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
-                .allow_credentials(true)
-                .allow_methods(tower_http::cors::AllowMethods::mirror_request())
-                .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
-                .expose_headers([header::ETAG, header::CONTENT_TYPE]),
-        );
+    let app = axum::Router::new().fallback(handle).with_state(server.clone());
     let bind = bind_addr(&server, "chttpd", "5984");
     if let Err(e) = server.ensure_system_dbs().await {
         tracing::error!("could not set up system databases: {}", e.reason);
@@ -592,6 +739,7 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
     crate::smoosh::start(&server);
     crate::ken::start(&server);
     crate::replicator::start(&server);
+    crate::changes::start_global_changes(&server);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("couchdb-rs listening on http://{bind}");
     crate::system::mark_start();

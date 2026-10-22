@@ -274,6 +274,15 @@ function __nouveau(docjson) {
   }
   return JSON.stringify({ok: out});
 }
+// A function's source compiled, as add_fun does: errors as text.
+function __compile(src) {
+  try { __eval_fun(src, __ddoc); return JSON.stringify({ok: true}); }
+  catch (e) {
+    var m = (e && e.message !== undefined) ? String(e.message) : String(e);
+    if (m.indexOf("Expression does not eval to a function") === 0) return JSON.stringify({ok: false, reason: m});
+    return JSON.stringify({ok: false, reason: String(e) + " (" + src + ")"});
+  }
+}
 function __reduce(i, kvjson, rereduce) {
   try {
     var kv = JSON.parse(kvjson);
@@ -557,6 +566,22 @@ impl JsFuns {
     pub fn index_doc(&self, doc: &Value) -> Result<Vec<Vec<Value>>> {
         let out = unwrap_ok(self.call("__nouveau", CallArgs::S(doc.to_string()))?)?;
         Ok(out.as_array().cloned().unwrap_or_default().into_iter().map(|f| f.as_array().cloned().unwrap_or_default()).collect())
+    }
+
+    /// Compile a function's source, as couch_query_servers:try_compile/4
+    /// does: Err with CouchDB's message when it doesn't.
+    pub fn try_compile(ddoc: &Value, kind: &str, view: &str, src: &str) -> Result<()> {
+        let funs = JsFuns::new(ddoc, &[], &[]);
+        let out = funs.call("__compile", CallArgs::S(src.to_string()))?;
+        if out.get("ok") == Some(&Value::Bool(true)) {
+            return Ok(());
+        }
+        let reason = out.get("reason").and_then(Value::as_str).unwrap_or("");
+        Err(CouchError::new(
+            StatusCode::BAD_REQUEST,
+            "compilation_error",
+            format!("Compilation of the {kind} function in the '{view}' view failed: {reason}"),
+        ))
     }
 
     /// `kvs` holds ([key, docid], value) pairs.

@@ -70,6 +70,13 @@ pub enum Reducer {
     Sum,
     Stats,
     ApproxCountDistinct,
+    /// _top_N and _bottom_N: the N greatest (or least) distinct values.
+    Top(usize),
+    Bottom(usize),
+    /// _first and _last: the value of the least (or greatest) key and id,
+    /// kept as [key, id, value] until finalized.
+    First,
+    Last,
     Js(JsFuns, usize),
 }
 
@@ -101,8 +108,34 @@ impl ViewSpec {
                 }
                 h.to_json()
             }
+            Reducer::Top(n) => self.ranked(kvs.iter().map(|(_, v)| v.clone()).collect(), *n, true),
+            Reducer::Bottom(n) => self.ranked(kvs.iter().map(|(_, v)| v.clone()).collect(), *n, false),
+            Reducer::First | Reducer::Last => {
+                let rows = kvs.iter().map(|(k, v)| json!([k.get(0).cloned().unwrap_or(Value::Null), k.get(1).cloned().unwrap_or(Value::Null), v]));
+                self.first_last(rows.collect(), matches!(self.reducer, Reducer::First))
+            }
             Reducer::Js(f, i) => f.reduce(*i, kvs).unwrap_or_else(red_err),
         })
+    }
+
+    /// builtin_rank_n/4: values merged in rank order, equal ones once.
+    fn ranked(&self, mut vals: Vec<Value>, n: usize, top: bool) -> Value {
+        vals.sort_by(|a, b| if top { self.cmp_key(b, a) } else { self.cmp_key(a, b) });
+        vals.dedup_by(|a, b| self.cmp_key(a, b) == Ordering::Equal);
+        vals.truncate(n);
+        Value::Array(vals)
+    }
+
+    /// builtin_first_last/3, over [key, id, value] rows.
+    fn first_last(&self, rows: Vec<Value>, first: bool) -> Value {
+        let cmp = |a: &Value, b: &Value| {
+            self.cmp_key(&a[0], &b[0]).then_with(|| a[1].as_str().unwrap_or("").cmp(b[1].as_str().unwrap_or("")))
+        };
+        let best = rows.into_iter().reduce(|acc, r| {
+            let o = cmp(&r, &acc);
+            if (first && o == Ordering::Less) || (!first && o == Ordering::Greater) { r } else { acc }
+        });
+        best.unwrap_or(json!([]))
     }
 
     pub fn rereduce_values(&self, vals: &[Value]) -> Option<Value> {
@@ -117,6 +150,14 @@ impl ViewSpec {
                     h.merge(&Hll::from_json(v));
                 }
                 h.to_json()
+            }
+            Reducer::Top(n) | Reducer::Bottom(n) => {
+                let all = vals.iter().flat_map(|v| v.as_array().cloned().unwrap_or_default()).collect();
+                self.ranked(all, *n, matches!(self.reducer, Reducer::Top(_)))
+            }
+            Reducer::First | Reducer::Last => {
+                let rows = vals.iter().filter(|v| v.as_array().is_some_and(|a| a.len() == 3)).cloned().collect();
+                self.first_last(rows, matches!(self.reducer, Reducer::First))
             }
             Reducer::Js(f, i) => f.rereduce(*i, vals).unwrap_or_else(red_err),
         })
@@ -299,6 +340,10 @@ impl Hll {
 fn finalize_red(r: &Reducer, v: Value) -> Value {
     match r {
         Reducer::ApproxCountDistinct => v.get("n").cloned().unwrap_or(json!(0)),
+        Reducer::First | Reducer::Last => match v {
+            Value::Array(mut a) if a.len() == 3 => a.pop().unwrap_or(Value::Null),
+            other => other,
+        },
         _ => v,
     }
 }
@@ -363,24 +408,107 @@ pub struct IndexDef {
 fn parse_reducer(src: &str, js_red: &mut Vec<String>, ddoc: &Value) -> Result<Reducer> {
     let _ = ddoc;
     let s = src.trim();
-    Ok(match s {
-        "_count" => Reducer::Count,
-        "_sum" => Reducer::Sum,
-        "_stats" => Reducer::Stats,
-        "_approx_count_distinct" => Reducer::ApproxCountDistinct,
-        s if s.starts_with('_') => {
-            return Err(CouchError::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_design_doc",
-                format!("Unknown builtin reduce function: {s}"),
-            ));
+    let bad = |m: String| CouchError::new(StatusCode::BAD_REQUEST, "invalid_design_doc", m);
+    // As couch_query_servers matches them: by prefix.
+    let rank = |n: &str| -> Result<usize> {
+        match n.parse::<i64>() {
+            Ok(v) if (1..=100).contains(&v) => Ok(v as usize),
+            Ok(_) => Err(bad("rank value must be between 1 and 100".into())),
+            Err(_) => Err(bad("invalid rank reducer".into())),
         }
+    };
+    Ok(match s {
+        s if s.starts_with("_count") => Reducer::Count,
+        s if s.starts_with("_sum") => Reducer::Sum,
+        s if s.starts_with("_stats") => Reducer::Stats,
+        s if s.starts_with("_approx_count_distinct") => Reducer::ApproxCountDistinct,
+        s if s.starts_with("_top_") => Reducer::Top(rank(&s[5..])?),
+        s if s.starts_with("_bottom_") => Reducer::Bottom(rank(&s[8..])?),
+        s if s.starts_with("_first") => Reducer::First,
+        s if s.starts_with("_last") => Reducer::Last,
+        s if s.starts_with('_') => return Err(bad(format!("`{s}` is not a supported reduce function."))),
         s => {
             js_red.push(s.to_string());
             // placeholder index fixed up once JsFuns exists
             Reducer::Js(JsFuns::new(&Value::Null, &[], &[]), js_red.len() - 1)
         }
     })
+}
+
+/// couch_mrview:validate/2: a design document's fields of the right
+/// types, a map function in every view, builtin reduces known, and the
+/// views' functions compiling.
+pub fn validate_ddoc(ddoc: &Value, db_partitioned: bool) -> Result<()> {
+    let invalid = |m: String| CouchError::new(StatusCode::BAD_REQUEST, "invalid_design_doc", m);
+    let query = ddoc.get("language").and_then(Value::as_str) == Some("query");
+    let map_type: &[&str] = if query { &["object"] } else { &["string"] };
+    type Path<'a> = Vec<(&'a str, &'a [&'a str])>;
+    let specs: Vec<Path> = vec![
+        vec![("filters", &["object"]), ("*", &["object", "string"])],
+        vec![("language", &["string"])],
+        vec![("lists", &["object"]), ("*", &["object", "string"])],
+        vec![("options", &["object"])],
+        vec![("options", &["object"]), ("include_design", &["boolean"])],
+        vec![("options", &["object"]), ("local_seq", &["boolean"])],
+        vec![("options", &["object"]), ("partitioned", &["boolean"])],
+        vec![("rewrites", &["string", "array"])],
+        vec![("shows", &["object"]), ("*", &["object", "string"])],
+        vec![("updates", &["object"]), ("*", &["object", "string"])],
+        vec![("validate_doc_update", &["string"])],
+        vec![("views", &["object"]), ("lib", &["object"])],
+        vec![("views", &["object"]), ("*", &["object"]), ("map", map_type)],
+        vec![("views", &["object"]), ("*", &["object"]), ("reduce", &["string"])],
+    ];
+    fn is(v: &Value, types: &[&str]) -> bool {
+        types.iter().any(|t| match *t {
+            "string" => v.is_string(),
+            "array" => v.is_array(),
+            "object" => v.is_object(),
+            "boolean" => v.is_boolean(),
+            _ => false,
+        })
+    }
+    fn check(v: &Value, path: &[(&str, &[&str])], at: &mut Vec<String>) -> std::result::Result<(), (Vec<String>, Vec<String>)> {
+        let Some(((key, types), rest)) = path.split_first() else { return Ok(()) };
+        let Some(o) = v.as_object() else { return Ok(()) };
+        let keys: Vec<&String> = if *key == "*" { o.keys().collect() } else { o.keys().filter(|k| k == key).collect() };
+        for k in keys {
+            let x = &o[k];
+            at.push(k.clone());
+            if !is(x, types) {
+                return Err((at.clone(), types.iter().map(|t| t.to_string()).collect()));
+            }
+            check(x, rest, at)?;
+            at.pop();
+        }
+        Ok(())
+    }
+    for spec in &specs {
+        if let Err((path, types)) = check(ddoc, spec, &mut Vec::new()) {
+            return Err(invalid(format!("`{}` field must have {} type", path.join("."), types.join(" or "))));
+        }
+    }
+    if let Some(views) = ddoc.get("views").and_then(Value::as_object) {
+        for (name, v) in views {
+            if name != "lib" && v.get("map").is_none() {
+                return Err(invalid(format!("View `{name}` must contain map function")));
+            }
+        }
+    }
+    let def = IndexDef::from_ddoc(ddoc, db_partitioned)?;
+    if def.language == "javascript" {
+        let views = ddoc.get("views").and_then(Value::as_object);
+        for d in &def.views {
+            let v = views.and_then(|vs| vs.get(&d.name));
+            if let Some(src) = v.and_then(|v| v.get("map")).and_then(Value::as_str) {
+                JsFuns::try_compile(ddoc, "map", &d.name, src)?;
+            }
+            if let (Reducer::Js(..), Some(src)) = (&d.reducer, &d.reduce_src) {
+                JsFuns::try_compile(ddoc, "reduce", &d.name, src)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl IndexDef {
@@ -1223,7 +1351,9 @@ pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, a
         && args.reduce == Some(true) {
             return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Reduce is invalid for map-only views."));
         }
-    if !has_reduce && (args.group || args.group_level.is_some()) {
+    // A map view, or a reduce view read with reduce=false, can't group
+    // (group_level=0 is no grouping).
+    if !(reduce && has_reduce) && (args.group || args.group_level.is_some_and(|l| l > 0)) {
         return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Invalid use of grouping on a map view."));
     }
     let reduce = reduce && has_reduce;
@@ -1504,6 +1634,7 @@ pub fn http_compact_view(req: &Req, db: &Arc<Db>, ddoc: &str) -> Result<Response
     if req.method != Method::POST {
         return not_allowed("POST");
     }
+    crate::api::require_json_ctype(req)?;
     let snap = db.snapshot();
     let ddoc = crate::changes::load_ddoc(&snap, &format!("_design/{ddoc}"))?;
     let idx = get_index(db, &ddoc, index_dir(req, db))?;

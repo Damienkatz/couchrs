@@ -75,7 +75,15 @@ impl From<serde_json::Error> for CouchError {
 
 impl IntoResponse for CouchError {
     fn into_response(self) -> Response {
-        crate::http::json_response(self.status, &self.json())
+        let mut r = crate::http::json_response(self.status, &self.json());
+        // send_method_not_allowed/2 names the methods in Allow too.
+        if self.status == StatusCode::METHOD_NOT_ALLOWED
+            && let Some(m) = self.reason.strip_prefix("Only ").and_then(|r| r.strip_suffix(" allowed"))
+            && let Ok(v) = axum::http::HeaderValue::from_str(m)
+        {
+            r.headers_mut().insert(axum::http::header::ALLOW, v);
+        }
+        r
     }
 }
 

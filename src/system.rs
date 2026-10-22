@@ -86,13 +86,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
 pub struct CountingListener(pub tokio::net::TcpListener);
 
 impl axum::serve::Listener for CountingListener {
-    type Io = Counted<tokio::net::TcpStream>;
+    type Io = Counted<crate::reqline::RequestLines<tokio::net::TcpStream>>;
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             match self.0.accept().await {
-                Ok((s, a)) => return (Counted(s), a),
+                Ok((s, a)) => return (Counted(crate::reqline::RequestLines::new(s)), a),
                 // As axum's own listener does: per-connection errors are
                 // the client's; anything else (out of file descriptors)
                 // gets a pause before trying again.

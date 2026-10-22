@@ -1363,7 +1363,7 @@ fn update_interactive(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDoc
     let body_json = serde_json::to_vec(&doc.body)?;
     let mut hash_doc = doc.clone();
     hash_doc.atts = atts.iter().map(Att::from_info).collect();
-    let new_id = new_rev_id(&hash_doc, parent.as_ref().map(|p| (p.pos, p.id.as_str())), &body_json);
+    let new_id = new_rev_id(&hash_doc, parent.as_ref().map(|p| (p.pos, p.id.as_str())));
     let leaf = write_rev(w, doc, atts, body_json)?;
     let path = match &parent {
         Some(p) => Path { start: p.pos, revs: vec![(p.id.clone(), RevVal::Missing), (new_id.clone(), RevVal::Avail(leaf))] },

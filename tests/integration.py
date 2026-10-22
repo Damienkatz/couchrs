@@ -2007,6 +2007,197 @@ def new_db_partitioned():
     return name
 
 
+def _term(v):
+    """term_to_binary(V, [{minor_version, 1}]) of JSON as EJSON, without
+    the leading 131."""
+    def b(x):
+        x = x.encode() if isinstance(x, str) else x
+        return bytes([109]) + len(x).to_bytes(4, "big") + x
+    if v is True or v is False or v is None:
+        a = {True: "true", False: "false", None: "null"}[v].encode()
+        return bytes([100]) + len(a).to_bytes(2, "big") + a
+    if isinstance(v, int) and 0 <= v <= 255:
+        return bytes([97, v])
+    if isinstance(v, int):
+        return bytes([98]) + v.to_bytes(4, "big", signed=True)
+    if isinstance(v, (str, bytes)):
+        return b(v)
+    if isinstance(v, list):
+        return (bytes([108]) + len(v).to_bytes(4, "big") + b"".join(_term(x) for x in v) + bytes([106])) if v else bytes([106])
+    if isinstance(v, dict):
+        pairs = [bytes([104, 2]) + b(k) + _term(x) for k, x in v.items()]
+        inner = (bytes([108]) + len(pairs).to_bytes(4, "big") + b"".join(pairs) + bytes([106])) if pairs else bytes([106])
+        return bytes([104, 1]) + inner
+    raise ValueError(v)
+
+
+@test
+def chttpd_parity():
+    import hashlib
+    # The welcome and what every response carries.
+    s, b, h = req("GET", "/")
+    eq((b["version"], "quickjs" in b["features"], "partitioned" in b["features"]), ("3.5.3", True, True))
+    assert h["Server"].startswith("CouchDB/3.5.3 ("), h["Server"]
+    assert len(h["X-Couch-Request-ID"]) == 10 and h["X-CouchDB-Body-Time"] == "0", dict(h)
+    # HEAD has the length of what GET sends.
+    s, body, h = req("GET", "/", raw=True)
+    s2, body2, h2 = req("HEAD", "/", raw=True)
+    eq((s2, body2, h2["Content-Length"]), (200, b"", str(len(body))))
+    # Methods not allowed are named, in Allow too.
+    for path, allowed in [("/_all_dbs", "GET,HEAD"), ("/_uuids", "GET"), ("/_up", "GET,HEAD"), ("/_membership", "GET"),
+                          ("/_dbs_info", "GET,HEAD,POST"), ("/_db_updates", "GET")]:
+        s, b, h = req("PUT", path, {})
+        eq((s, b, h["Allow"]), (405, {"error": "method_not_allowed", "reason": f"Only {allowed} allowed"}, allowed), path)
+    eq(req("POST", "/_session", {})[:2], (400, {"error": "bad_request", "reason": "request body must contain a username"}))
+    eq(req("POST", "/_session", {"name": "a", "username": "b"})[:2],
+       (400, {"error": "bad_request", "reason": "request body contains different usernames"}))
+    eq(req("GET", "/_cluster_setup")[:2], (200, {"state": "single_node_enabled"}))
+    eq(req("POST", "/_cluster_setup", {"action": "finish_cluster"})[:2], (400, {"error": "bad_request", "reason": "Cluster is already finished"}))
+    # No _global_changes database, no _db_updates; with one, databases'
+    # creations, updates and deletions.
+    if req("GET", "/_global_changes")[0] == 404:
+        eq(req("GET", "/_db_updates")[:2], (404, {"error": "not_found", "reason": "Database does not exist."}))
+        eq(req("PUT", "/_global_changes")[0], 201)
+        try:
+            db = new_db()
+            eq(req("PUT", f"/{db}/x", {})[0], 201)
+            req("DELETE", f"/{db}")
+            def events():
+                rows = req("GET", "/_db_updates")[1]["results"]
+                got = sorted(r["type"] for r in rows if r["db_name"] == db)
+                return got if got == ["created", "deleted", "updated"] else None
+            assert _wait(events, secs=20), req("GET", "/_db_updates")[1]
+            s, b, _ = req("GET", "/_db_updates?feed=longpoll&limit=1")
+            eq((s, len(b["results"]), sorted(b)), (200, 1, ["last_seq", "results"]))
+            eq(req("GET", "/_db_updates?limit=x")[:2], (400, {"error": "bad_request", "reason": "invalid_integer"}))
+        finally:
+            req("DELETE", "/_global_changes")
+
+    db = new_db()
+    try:
+        # Revision ids as couch_db:new_revid/1 makes them.
+        body = {"a": 1, "b": [1, "x", None, True, {}], "c": {"d": "é"}}
+        rev = req("PUT", f"/{db}/r", body)[1]["rev"]
+        want = hashlib.md5(bytes([131]) + _term([False, 0, 0, body, []])).hexdigest()
+        eq(rev, "1-" + want)
+        body2 = {"a": 2}
+        rev2 = req("PUT", f"/{db}/r?rev={rev}", body2)[1]["rev"]
+        eq(rev2, "2-" + hashlib.md5(bytes([131]) + _term([False, 1, bytes.fromhex(want), body2, []])).hexdigest())
+
+        # With attachments=true, a client taking multipart/related (or
+        # anything) gets the attachments in parts.
+        doc = {"x": 1, "_attachments": {"b.bin": {"content_type": "application/octet-stream", "data": "AAEC"}}}
+        eq(req("PUT", f"/{db}/m", doc)[0], 201)
+        s, body, h = req("GET", f"/{db}/m?attachments=true", headers={"Accept": "*/*"}, raw=True)
+        eq((s, h["Content-Type"].split(";")[0], h["Content-Length"]), (200, "multipart/related", str(len(body))))
+        boundary = h["Content-Type"].split('boundary="')[1].rstrip('"')
+        assert body.endswith(f"\r\n--{boundary}--".encode()), body
+        assert b'Content-Disposition: attachment; filename="b.bin"\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\n\r\n\x00\x01\x02' in body, body
+        assert b'"follows":true' in body
+        eq(req("GET", f"/{db}/m?attachments=true")[1]["_attachments"]["b.bin"]["data"], "AAEC")
+        s, body, h = req("GET", f"/{db}/m?open_revs=all", headers={"Accept": "*/*"}, raw=True)
+        eq(h["Content-Type"].split(";")[0], "multipart/mixed")
+
+        # Size limits, as CouchDB enforces them.
+        c, np = "/_node/_local/_config", {"X-Couch-Persist": "false"}
+        limits = {"couchdb/max_document_size": "100", "couchdb/max_attachment_size": "10", "couchdb/max_document_id_length": "5",
+                  "chttpd/max_http_request_size": "2000"}
+        before = {k: req("GET", f"{c}/{k}")[1] for k in limits}
+        try:
+            for k, v in limits.items():
+                req("PUT", f"{c}/{k}", v, headers=np)
+            # (A PUT's id is the URL's, after this check: the reason is empty.)
+            eq(req("PUT", f"/{db}/big", {"x": "y" * 200})[:2], (413, {"error": "document_too_large", "reason": ""}))
+            eq(req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": "ok"}, {"_id": "big2", "x": "y" * 200}]})[:2],
+               (413, {"error": "document_too_large", "reason": "big2"}))
+            eq(req("PUT", f"/{db}/longid1", {})[:2], (400, {"error": "illegal_docid", "reason": "Document id is too long"}))
+            eq(req("PUT", f"/{db}/a/f.bin", b"0123456789abc", headers={"Content-Type": "application/octet-stream"})[:2],
+               (413, {"error": "attachment_too_large", "reason": "f.bin"}))
+            eq(req("PUT", f"/{db}/b", {"_attachments": {"g.bin": {"content_type": "application/octet-stream",
+                                                                  "data": base64.b64encode(b"0123456789abc").decode()}}})[:2],
+               (413, {"error": "attachment_too_large", "reason": "g.bin"}))
+            eq(req("PUT", f"/{db}/c", {"x": "y" * 3000})[:2], (413, {"error": "too_large", "reason": "the request entity is too large"}))
+        finally:
+            for k, v in before.items():
+                if isinstance(v, str):
+                    req("PUT", f"{c}/{k}", v, headers=np)
+                else:
+                    req("DELETE", f"{c}/{k}", headers=np)
+
+        # CORS: off by default; on, for its origins.
+        origin = {"Origin": "http://example.com"}
+        assert "Access-Control-Allow-Origin" not in req("GET", f"/{db}", headers=origin)[2]
+        c, np = "/_node/_local/_config", {"X-Couch-Persist": "false"}
+        old = {k: req("GET", f"{c}/{k}")[1] for k in ("chttpd/enable_cors", "cors/origins", "cors/credentials")}
+        try:
+            req("PUT", f"{c}/chttpd/enable_cors", "true", headers=np)
+            req("PUT", f"{c}/cors/origins", "http://example.com", headers=np)
+            req("PUT", f"{c}/cors/credentials", "true", headers=np)
+            s, b, h = req("GET", f"/{db}", headers=origin)
+            eq((h["Access-Control-Allow-Origin"], h["Access-Control-Allow-Credentials"], h["Access-Control-Expose-Headers"]),
+               ("http://example.com", "true",
+                "content-type, cache-control, accept-ranges, etag, server, x-couch-request-id, x-couch-update-newrev, x-couchdb-body-time"))
+            assert "Access-Control-Allow-Origin" not in req("GET", f"/{db}", headers={"Origin": "http://EXAMPLE.com"})[2]
+            pre = dict(origin, **{"Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "Content-Type, Accept"})
+            s, b, h = req("OPTIONS", f"/{db}", headers=pre, raw=True)
+            eq((s, h["Access-Control-Allow-Origin"], h["Access-Control-Allow-Headers"], h["Access-Control-Max-Age"],
+                h["Access-Control-Allow-Methods"]),
+               (204, "http://example.com", "Content-Type, Accept", "600", "CONNECT, COPY, DELETE, GET, HEAD, OPTIONS, POST, PUT, TRACE"))
+            # Asking for headers it doesn't allow: no preflight, just OPTIONS.
+            s, b, h = req("OPTIONS", f"/{db}", headers=dict(pre, **{"Access-Control-Request-Headers": "X-Foo"}))
+            eq((s, h["Allow"]), (405, "DELETE,GET,HEAD,POST"))
+        finally:
+            for k, v in old.items():
+                if isinstance(v, str):
+                    req("PUT", f"{c}/{k}", v, headers=np)
+                else:
+                    req("DELETE", f"{c}/{k}", headers=np)
+        assert "Access-Control-Allow-Origin" not in req("GET", f"/{db}", headers=origin)[2]
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
+def view_parity():
+    db = new_db()
+    try:
+        docs = [{"_id": f"d{i}", "g": "ab"[i % 2], "n": i, "v": [5, 3, 9, 3, 1, 7][i]} for i in range(6)]
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": docs})[0], 201)
+        views = {"top": {"map": "function(d){ emit([d.g, d.n], d.v); }", "reduce": "_top_2"},
+                 "bottom": {"map": "function(d){ emit([d.g, d.n], d.v); }", "reduce": "_bottom_3"},
+                 "first": {"map": "function(d){ emit([d.g, d.n], d.v); }", "reduce": "_first"},
+                 "last": {"map": "function(d){ emit([d.g, d.n], d.v); }", "reduce": "_last"}}
+        eq(req("PUT", f"/{db}/_design/r", {"views": views})[0], 201)
+        v = lambda name, q="": req("GET", f"/{db}/_design/r/_view/{name}{q}")[1]["rows"]
+        # The new builtin reduces (3.5): distinct top and bottom values, and
+        # the first and last rows' values.
+        eq(v("top"), [{"key": None, "value": [9, 7]}])
+        eq(v("bottom", "?group_level=1"), [{"key": ["a"], "value": [1, 5, 9]}, {"key": ["b"], "value": [3, 7]}])
+        eq(v("first", "?group_level=1"), [{"key": ["a"], "value": 5}, {"key": ["b"], "value": 3}])
+        eq(v("last"), [{"key": None, "value": 7}])
+        eq(req("GET", f"/{db}/_design/r/_view/top?reduce=false&group=true")[:2],
+           (400, {"error": "query_parse_error", "reason": "Invalid use of grouping on a map view."}))
+
+        # Design documents are checked as couch_mrview checks them.
+        bad = lambda views: req("PUT", f"/{db}/_design/bad", {"views": views})[:2]
+        inv = lambda r: (400, {"error": "invalid_design_doc", "reason": r})
+        eq(bad({"x": {"map": 7}}), inv("`views.x.map` field must have string type"))
+        eq(bad({"x": {"reduce": "_sum"}}), inv("View `x` must contain map function"))
+        eq(bad({"x": {"map": "function(d){}", "reduce": "_bogus"}}), inv("`_bogus` is not a supported reduce function."))
+        eq(bad({"x": {"map": "function(d){}", "reduce": "_top_0"}}), inv("rank value must be between 1 and 100"))
+        eq(bad({"x": {"map": "function(d){}", "reduce": "_top_x"}}), inv("invalid rank reducer"))
+        eq(req("PUT", f"/{db}/_design/bad", {"views": "no"})[:2], inv("`views` field must have object type"))
+        eq(req("PUT", f"/{db}/_design/bad", {"options": {"partitioned": 1}})[:2], inv("`options.partitioned` field must have boolean type"))
+        s, b = bad({"x": {"map": "function(doc){ emit( }"}})
+        eq((s, b["error"]), (400, "compilation_error"))
+        assert b["reason"].startswith("Compilation of the map function in the 'x' view failed: ") and b["reason"].endswith(" (function(doc){ emit( })"), b
+        s, b = bad({"x": {"map": "function(d){}", "reduce": "function(k, v) { return ; ]"}})
+        eq((s, b["error"]), (400, "compilation_error"))
+        assert b["reason"].startswith("Compilation of the reduce function in the 'x' view failed: "), b
+    finally:
+        req("DELETE", f"/{db}")
+
+
 def main():
     failed = 0
     try:

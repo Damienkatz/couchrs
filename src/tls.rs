@@ -105,13 +105,13 @@ pub async fn listen(bind: &str, cfg: Arc<rustls::ServerConfig>) -> std::io::Resu
 }
 
 impl axum::serve::Listener for TlsListener {
-    type Io = crate::system::Counted<TlsStream<TcpStream>>;
+    type Io = crate::system::Counted<crate::reqline::RequestLines<TlsStream<TcpStream>>>;
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             if let Some((s, a)) = self.rx.recv().await {
-                return (crate::system::Counted::new(s), a);
+                return (crate::system::Counted::new(crate::reqline::RequestLines::new(s)), a);
             }
             // The accept loop ended; nothing more will come.
             std::future::pending::<()>().await;
