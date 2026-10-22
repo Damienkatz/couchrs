@@ -920,7 +920,7 @@ fn render_response(resp: &Value, default_code: StatusCode) -> Response {
                 .unwrap_or(default_code);
             let headers = o.get("headers").and_then(|h| h.as_object()).cloned().unwrap_or_default();
             if let Some(j) = o.get("json") {
-                (code, headers, serde_json::to_vec(j).unwrap(), "application/json")
+                (code, headers, crate::json::to_vec(j), "application/json")
             } else if let Some(b) = o.get("base64").and_then(|b| b.as_str()) {
                 use base64::Engine;
                 (code, headers, doc::B64.decode(b).unwrap_or_default(), "application/binary")
@@ -1017,7 +1017,7 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
                 [other, view] => crate::views::view_json(req, db, &format!("_design/{other}"), view, &args)?,
                 _ => return Err(CouchError::not_found("missing")),
             };
-            let rows = match result.as_object_mut().and_then(|o| o.remove("rows")) {
+            let rows = match result.as_object_mut().and_then(|o| o.shift_remove("rows")) {
                 Some(Value::Array(r)) => r,
                 _ => Vec::new(),
             };
@@ -1055,7 +1055,7 @@ pub fn run_rewrite(req: &Req, ddoc: &Value, src: &str) -> Result<Value> {
     let mut jreq = js_req(req, &db, None);
     if let Some(o) = jreq.as_object_mut() {
         for k in ["info", "form", "uuid", "id"] {
-            o.remove(k);
+            o.shift_remove(k);
         }
     }
     let funs = JsFuns::new(ddoc, &[src.to_string()], &[]);

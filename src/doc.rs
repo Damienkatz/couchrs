@@ -317,16 +317,24 @@ pub fn parse_rev(s: &str) -> Result<(u64, String)> {
 /// couch_doc:validate_docid, with its errors.
 pub fn validate_docid(id: &str) -> Result<()> {
     let illegal = |reason: &str| Err(CouchError::new(StatusCode::BAD_REQUEST, "illegal_docid", reason));
-    if id.is_empty() {
-        return illegal("Document id must not be empty");
+    match id {
+        "" => illegal("Document id must not be empty"),
+        "_design/" => illegal("Illegal document id `_design/`"),
+        "_local/" => illegal("Illegal document id `_local/`"),
+        _ if id.starts_with('_') && !id.starts_with("_design/") && !id.starts_with("_local/") => {
+            illegal("Only reserved document ids may start with underscore.")
+        }
+        _ => Ok(()),
     }
-    if id == "_local/" {
-        return Err(CouchError::bad_request("Invalid _local document id."));
+}
+
+/// A document id from a request path, as chttpd_db checks one.
+pub fn validate_path_docid(id: &str) -> Result<()> {
+    match id {
+        "_local/" => Err(CouchError::bad_request("Invalid _local document id.")),
+        "_design/" => Err(CouchError::new(StatusCode::BAD_REQUEST, "illegal_docid", "Only reserved document ids may start with underscore.")),
+        _ => validate_docid(id),
     }
-    if id == "_design/" || (id.starts_with('_') && !id.starts_with("_design/") && !id.starts_with("_local/")) {
-        return illegal("Only reserved document ids may start with underscore.");
-    }
-    Ok(())
 }
 
 /// A partition name (couch_partition:validate_partition).

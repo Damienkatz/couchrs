@@ -323,7 +323,7 @@ async fn find_logs(rep: &Rep, server: &Server, source: &Client, target: &Client)
                     // Migrate it to the new id.
                     let mut m = doc.clone();
                     m.insert("_id".into(), json!(new_id));
-                    m.remove("_rev");
+                    m.shift_remove("_rev");
                     if rep.options.use_checkpoints && let Ok(rev) = db.update_doc(&Value::Object(m.clone()), false).await {
                         m.insert("_rev".into(), json!(rev));
                         tracing::info!("Migrated replication checkpoint. Db:{} {id} -> {new_id}", db.ep.uri());

@@ -116,7 +116,7 @@ fn strip_credentials(v: &Value) -> Value {
         Value::Object(o) => {
             let mut o = o.clone();
             o.remove("headers");
-            o.remove("auth");
+            o.shift_remove("auth");
             if let Some(Value::String(u)) = o.get("url").cloned() {
                 o.insert("url".into(), strip_url_userinfo(&u));
             }
@@ -529,7 +529,7 @@ async fn update_rep_doc(server: &Server, db: &str, doc_id: &str, kvs: Vec<(&str,
         for (k, v) in &kvs {
             match v {
                 None => {
-                    new.remove(*k);
+                    new.shift_remove(*k);
                 }
                 Some(v) if *k == "_replication_state" => {
                     if new.get(*k) != Some(v) {
@@ -585,8 +585,8 @@ async fn update_failed(server: &Server, db: &str, doc: &str, reason: &str) {
 pub fn completed(db: String, doc: String, start: SystemTime, info: Value) {
     let Some(server) = PROCESSOR.get().and_then(|p| p.server.upgrade()) else { return };
     let mut stats = info.as_object().cloned().unwrap_or_default();
-    stats.remove("source_seq");
-    stats.remove("through_seq");
+    stats.shift_remove("source_seq");
+    stats.shift_remove("through_seq");
     stats.insert("start_time".into(), json!(iso(start)));
     tokio::spawn(async move {
         update_rep_doc(&server, &db, &doc, vec![
@@ -643,7 +643,7 @@ fn info_from_doc(db: &str, doc: &Map<String, Value>, server: &Server) -> Map<Str
     let (state, info, errors, start) = match state {
         Some("completed") => {
             let mut s = doc.get("_replication_stats").and_then(Value::as_object).cloned().unwrap_or_default();
-            let start = s.remove("start_time").unwrap_or(Value::Null);
+            let start = s.shift_remove("start_time").unwrap_or(Value::Null);
             (json!("completed"), Value::Object(s), 0, start)
         }
         Some("failed") => {

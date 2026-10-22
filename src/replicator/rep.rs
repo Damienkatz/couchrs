@@ -316,7 +316,7 @@ fn parse_endpoint(v: &Value, proxy: &str, opts: &Options, server: &Server) -> Re
     }
     let basic = auth_creds.or(url_creds).or(header_creds);
     let mut auth_props = auth;
-    auth_props.remove("basic");
+    auth_props.shift_remove("basic");
     let proxy_url = if proxy.is_empty() {
         None
     } else {
@@ -578,6 +578,7 @@ pub fn doc_user_ctx(doc: &Map<String, Value>) -> UserCtx {
 // ------------------------------------------------------ replication ids
 
 /// An Erlang term, enough of them for replication ids.
+#[derive(Clone, Debug)]
 pub enum Term {
     Atom(&'static str),
     /// A list of bytes, as Erlang strings are.
@@ -643,6 +644,12 @@ impl Term {
                 out.extend_from_slice(&f.to_bits().to_be_bytes());
             }
             Term::List(l) if l.is_empty() => out.push(106),
+            // A list of bytes is written as a string.
+            Term::List(l) if l.len() <= 65535 && l.iter().all(|t| matches!(t, Term::Int(i) if (0..=255).contains(i))) => {
+                out.push(107);
+                out.extend_from_slice(&(l.len() as u16).to_be_bytes());
+                out.extend(l.iter().map(|t| if let Term::Int(i) = t { *i as u8 } else { 0 }));
+            }
             Term::List(l) => {
                 out.push(108);
                 out.extend_from_slice(&(l.len() as u32).to_be_bytes());

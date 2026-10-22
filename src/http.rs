@@ -146,8 +146,13 @@ impl Req {
     }
 }
 
+/// mochiweb_util:parse_qs/1: pairs separated by & or ;.
+pub fn parse_qs(q: &str) -> Vec<(String, String)> {
+    q.split(['&', ';']).flat_map(|seg| form_urlencoded::parse(seg.as_bytes()).into_owned()).collect()
+}
+
 pub fn json_response(status: StatusCode, v: &Value) -> Response {
-    let mut body = serde_json::to_vec(v).unwrap();
+    let mut body = crate::json::to_vec(v);
     body.push(b'\n');
     Response::builder()
         .status(status)
@@ -224,7 +229,7 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
     let query: Vec<(String, String)> = parts
         .uri
         .query()
-        .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+        .map(parse_qs)
         .unwrap_or_default();
     // [chttpd] max_http_request_size bounds a body.
     let max = server.config.get_int("chttpd", "max_http_request_size", 4294967296usize);

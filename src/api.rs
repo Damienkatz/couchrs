@@ -69,18 +69,7 @@ pub async fn db_request(req: Req) -> Result<Response> {
             Method::PUT => ok_json(json!({"ok": true})),
             _ => not_allowed("GET,PUT"),
         },
-        ["_find"] => crate::mango::http_find(&req, &db).await,
-        ["_explain"] => crate::mango::http_explain(&req, &db).await,
-        ["_index"] => crate::mango::http_index(&req, &db).await,
-        ["_index", "_bulk_delete"] => crate::mango::http_index_bulk_delete(&req, &db).await,
-        ["_index", ddoc, kind, iname] => {
-            let (d, k, n) = (ddoc.to_string(), kind.to_string(), iname.to_string());
-            crate::mango::http_delete_index(&req, &db, &d, &k, &n).await
-        }
-        ["_index", "_design", ddoc, kind, iname] => {
-            let (d, k, n) = (format!("_design/{ddoc}"), kind.to_string(), iname.to_string());
-            crate::mango::http_delete_index(&req, &db, &d, &k, &n).await
-        }
+        ["_find" | "_explain" | "_index", ..] => crate::mango::handle(&req, &db, &r, None).await,
         ["_partition", p, rest @ ..] => {
             let (p, rest): (String, Vec<String>) = (p.to_string(), rest.iter().map(|s| s.to_string()).collect());
             partition_request(&req, &db, &p, &rest).await
@@ -153,8 +142,17 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
                 Some(_) => return Err(CouchError::bad_request("Invalid `partitioned` parameter")),
             };
             let db = req.server.create_db_with(name, &props)?;
+            // chttpd_auth_cache's listener writes the validator when it
+            // next starts, five seconds after the database went away.
             if crate::auth::is_users_db(&req.server.config, name) {
-                crate::server::ensure_auth_ddoc(&db).await?;
+                let (server, name) = (req.server.clone(), name.to_string());
+                drop(db);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    if let Ok(db) = server.open_db(&name) {
+                        let _ = crate::server::ensure_auth_ddoc(&db).await;
+                    }
+                });
             }
             let r = json_response(StatusCode::CREATED, &json!({"ok": true}));
             Ok(with_header(r, header::LOCATION, &format!("/{name}")))
@@ -219,7 +217,7 @@ fn check_doc_limits(config: &crate::config::Config, docs: &[Doc]) -> Result<()> 
     let max_att = max_attachment_size(config);
     for d in docs {
         check_docid_length(config, &d.id)?;
-        if serde_json::to_vec(&d.body).map(|b| b.len() as u64).unwrap_or(0) > max_doc {
+        if crate::json::to_vec(&d.body).len() as u64 > max_doc {
             return Err(CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "document_too_large", d.id.clone()));
         }
         for a in &d.atts {
@@ -559,7 +557,7 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
         let (fdi, ri) = match r {
             Ok(x) => x,
             Err(missing) => {
-                let j = serde_json::to_vec(&json!({"missing": missing}))?;
+                let j = crate::json::to_vec(&json!({"missing": missing}));
                 pieces.push(Piece::Data(Bytes::from(format!(
                     "Content-Type: application/json; error=\"true\"\r\n\r\n{}\r\n",
                     String::from_utf8_lossy(&j)
@@ -579,7 +577,7 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
                     .collect()
             })
             .unwrap_or_default();
-        let doc_bytes = serde_json::to_vec(&doc)?;
+        let doc_bytes = crate::json::to_vec(&doc);
         if follows.is_empty() {
             pieces.push(Piece::Data(Bytes::from(b"Content-Type: application/json\r\n\r\n".to_vec())));
             pieces.push(Piece::Data(Bytes::from(doc_bytes)));
@@ -737,7 +735,7 @@ fn doc_multipart(snap: &Snapshot, rev: &RevInfo, doc: &Value, etag: &str) -> Res
     let body = blocking(|| snap.read_body(rev.val.leaf().map(|l| l.ptr).unwrap_or_default()))?;
     let boundary = hex::encode(uuid::Uuid::new_v4().as_bytes());
     let mut pieces = vec![Piece::Data(Bytes::from(format!("--{boundary}\r\nContent-Type: application/json\r\n\r\n")))];
-    pieces.push(Piece::Data(Bytes::from(serde_json::to_vec(doc)?)));
+    pieces.push(Piece::Data(Bytes::from(crate::json::to_vec(doc))));
     pieces.push(Piece::Data(Bytes::from(format!("\r\n--{boundary}"))));
     let mut len: u64 = 0;
     for name in follows {
@@ -847,7 +845,7 @@ async fn parse_multipart_doc(req: &Req) -> Result<Doc> {
 }
 
 async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
-    validate_docid(id)?;
+    crate::doc::validate_path_docid(id)?;
     check_docid_length(&req.server.config, id)?;
     let mut doc = if req.content_type().starts_with("multipart/related") {
         parse_multipart_doc(req).await?
@@ -1300,8 +1298,7 @@ async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[Str
             }
             ok_json(json!({"results": results}))
         }
-        ["_find"] => crate::mango::http_find_in(req, db, Some(partition)).await,
-        ["_explain"] => crate::mango::http_explain_in(req, db, Some(partition)).await,
+        [first @ ("_find" | "_explain"), ..] => crate::mango::handle(req, db, &[first], Some(partition)).await,
         ["_design", ddoc, "_nouveau", rest @ ..] => {
             crate::nouveau::http_search(req, db, &format!("_design/{ddoc}"), rest, Some(partition)).await
         }
@@ -1656,12 +1653,13 @@ async fn revs_limit(req: &Req, db: &Arc<Db>) -> Result<Response> {
     match req.method {
         Method::GET => ok_json(json!(db.snapshot().header.revs_limit)),
         Method::PUT => {
-            crate::auth::check_db_admin(&req.auth.user, &db.snapshot().security())?;
+            // fabric:set_revs_limit/3 takes only a positive integer.
             let n = req
                 .json_body()?
                 .as_u64()
                 .filter(|n| *n > 0)
-                .ok_or_else(|| CouchError::bad_request("Rev limit has to be an integer"))?;
+                .ok_or_else(|| CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, "unknown_error", "function_clause").with_ref())?;
+            crate::auth::check_db_admin(&req.auth.user, &db.snapshot().security())?;
             db.set_revs_limit(n).await?;
             ok_json(json!({"ok": true}))
         }

@@ -787,7 +787,10 @@ impl Index {
         if fdi.deleted || (fdi.id.starts_with("_design/") && !self.def.include_design) {
             return Ok(vec![Vec::new(); n]);
         }
+        // couch_index_updater opens documents with their conflicts.
         let opts = DocOpts {
+            conflicts: true,
+            deleted_conflicts: true,
             local_seq: self.def.local_seq,
             ..Default::default()
         };

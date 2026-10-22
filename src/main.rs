@@ -13,6 +13,7 @@ pub mod fauxton;
 pub mod file;
 pub mod http;
 pub mod js;
+pub mod json;
 pub mod jwt;
 pub mod ken;
 pub mod keytree;

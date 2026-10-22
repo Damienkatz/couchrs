@@ -481,6 +481,171 @@ def mango():
 
 
 @test
+def mango_35():
+    """Mango as CouchDB 3.5 has it: the index chosen and why (explain),
+    fallback, covering indexes, bookmarks as term_to_binary writes them,
+    statistics as shard and coordinator count them, and mango_error's
+    messages, Erlang term formatting and all."""
+    db = new_db()
+    find = lambda body: req("POST", f"/{db}/_find", body)
+    explain = lambda body: req("POST", f"/{db}/_explain", body)[1]
+    mids = lambda b: [d["_id"] for d in b["docs"]]
+    try:
+        docs = [{"_id": f"d{i:02}", "a": i, "b": i % 3, "c": {"d": i % 4}} for i in range(12)]
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": docs})[0], 201)
+        # Names derive from the definition and options (gen_name/2).
+        eq(req("POST", f"/{db}/_index", {"index": {"fields": ["a"]}})[1],
+           {"result": "created", "id": "_design/7095fd2321a986309496ad2ac9c3498246175757", "name": "7095fd2321a986309496ad2ac9c3498246175757"})
+        eq(req("POST", f"/{db}/_index", {"index": {"fields": ["a", "b"]}, "ddoc": "ab"})[1]["name"], "c9960e6f9106f2e6dc9f3a2e480cd379e12dd8f9")
+        eq(req("POST", f"/{db}/_index", {"index": {"fields": ["b"]}, "name": "bi", "ddoc": "bdd"})[1]["result"], "created")
+        pidx = {"index": {"fields": ["c.d"], "partial_filter_selector": {"a": {"$gt": 1}}}, "name": "cp", "ddoc": "cp"}
+        eq(req("POST", f"/{db}/_index", pidx)[1]["result"], "created")
+        view = req("GET", f"/{db}/_design/cp")[1]["views"]["cp"]
+        eq(view, {"map": {"fields": {"c.d": "asc"}, "partial_filter_selector": {"a": {"$gt": 1}}}, "reduce": "_count",
+                  "options": {"def": {"fields": ["c.d"], "partial_filter_selector": {"a": {"$gt": 1}}}}})
+
+        ex = explain({"selector": {"a": {"$gt": 1}, "b": 2}, "fields": ["a", "_id"], "sort": [{"a": "desc"}], "r": 2, "stale": "ok"})
+        eq(ex["index"]["ddoc"], "_design/ab")
+        eq(ex["opts"], {"use_index": [], "bookmark": "nil", "limit": 25, "skip": 0, "sort": {"a": "desc"}, "fields": ["a", "_id"],
+                        "partition": "", "r": 2, "conflicts": False, "stale": "ok", "update": True, "stable": False,
+                        "execution_stats": False, "allow_fallback": True})
+        eq(ex["mrargs"], {"include_docs": False, "view_type": "map", "reduce": False, "partition": None, "start_key": ["<MAX>"],
+                          "end_key": [1, 2], "direction": "rev", "stable": True, "update": False, "conflicts": "undefined"})
+        eq(ex["covering"], True)
+        eq([(c["index"]["name"], c["analysis"]) for c in ex["index_candidates"]], [
+            ("cp", {"usable": False, "reasons": [{"name": "is_partial"}], "ranking": 3, "covering": False}),
+            ("bi", {"usable": False, "reasons": [{"name": "sort_order_mismatch"}], "ranking": 2, "covering": False}),
+            ("7095fd2321a986309496ad2ac9c3498246175757", {"usable": True, "reasons": [{"name": "less_overlap"}], "ranking": 1, "covering": True}),
+            ("_all_docs", {"usable": False, "reasons": [{"name": "field_mismatch"}], "ranking": 2, "covering": None})])
+        eq([h for h in ex["selector_hints"] if h["type"] == "json"], [{"type": "json", "indexable_fields": ["a", "b"], "unindexable_fields": []}])
+        ex = explain({"selector": {"z": 1}})
+        eq((ex["index"]["name"], ex["mrargs"]["start_key"], ex["mrargs"]["end_key"]), ("_all_docs", None, "<MAX>"))
+        eq(explain({"selector": {"$and": []}})["mrargs"]["start_key"], None)
+
+        # use_index that can't serve: a warning, or without fallback, an error.
+        b = find({"selector": {"b": 1}, "use_index": "cp"})[1]
+        eq((mids(b), b["warning"]), (["d01", "d04", "d07", "d10"], "_design/cp was not used because it does not contain a valid index for this query."))
+        eq(find({"selector": {"b": 1}, "use_index": ["cp", "x"], "allow_fallback": False})[:2], (400, {"error": "invalid_index",
+           "reason": "_design/cp, x specified by `use_index` could not be found or it is not suitable."}))
+        eq(find({"selector": {"z": 1}, "allow_fallback": False})[:2],
+           (400, {"error": "invalid_index", "reason": "You must specify an index with the `use_index` parameter."}))
+        eq(find({"selector": {"s": 1}, "sort": ["s"]})[:2],
+           (400, {"error": "no_usable_index", "reason": "No index exists for this sort, try indexing by the sort fields."}))
+
+        # The scan stops at the first match past the limit; a covering
+        # index reads no documents.
+        b = find({"selector": {"a": {"$gt": 1}}, "limit": 2, "execution_stats": True, "fields": ["_id", "a"]})[1]
+        eq((b["docs"], b["execution_stats"]["total_keys_examined"], b["execution_stats"]["total_docs_examined"]),
+           ([{"_id": "d02", "a": 2}, {"_id": "d03", "a": 3}], 4, 0))
+        b = find({"selector": {"a": {"$gt": 1}}, "r": 2, "limit": 1, "execution_stats": True})[1]
+        eq((b["execution_stats"]["total_docs_examined"], b["execution_stats"]["total_quorum_docs_examined"]), (0, 3))
+        # _all_docs drops the design docs that match, and what was counted for them.
+        b = find({"selector": {"_id": {"$gt": None}}, "execution_stats": True, "fields": ["_id"]})[1]
+        eq((len(b["docs"]), b["execution_stats"]["total_keys_examined"]), (12, 12))
+
+        # Paging: the bookmark is the last row's key and id.
+        b1 = find({"selector": {"a": {"$gte": 3}}, "limit": 3})[1]
+        eq((mids(b1), b1["bookmark"]), (["d03", "d04", "d05"], "g2wAAAACaAJkAA5zdGFydGtleV9kb2NpZG0AAAADZDA1aAJkAAhzdGFydGtleWsAAQVq"))
+        b2 = find({"selector": {"a": {"$gte": 3}}, "limit": 3, "bookmark": b1["bookmark"], "execution_stats": True})[1]
+        eq((mids(b2), b2["execution_stats"]["total_keys_examined"]), (["d06", "d07", "d08"], 4))
+        b = find({"selector": {"_id": {"$gt": "d05"}}, "limit": 2})[1]
+        eq(b["bookmark"], "g1AAAAA2eJzLYWBgYMpgSmHgKy5JLCrJTq2MT8lPzkzJBYozpxiYg6Q4YFIwwSwAhAoOUQ")
+        eq(mids(find({"selector": {"_id": {"$gt": "d05"}}, "limit": 2, "bookmark": b["bookmark"]})[1]), ["d08", "d09"])
+
+        # The response as mango_httpd streams it.
+        eq(req("POST", f"/{db}/_find", {"selector": {"a": {"$gt": 100}}}, raw=True)[1], b'{"docs":[\r\n],\r\n"bookmark": "nil"}\r\n\n')
+        eq(req("POST", f"/{db}/_find", {"selector": {"$or": []}}, raw=True)[1], b'{"docs":[\r\n]}\r\n\n')
+        raw = req("POST", f"/{db}/_find", {"selector": {"a": 3}, "fields": ["a"]}, raw=True)[1]
+        assert raw.startswith(b'{"docs":[\r\n{"a":3}\r\n],\r\n"bookmark": "g2wAAAACaAJk') and raw.endswith(b'"}\r\n\n'), raw
+
+        errors = [
+            ({"selector": {"b": 1}, "bogus": 1}, 400, "invalid_key", "Invalid key bogus for this request."),
+            ({"selector": [1]}, 400, "invalid_selector_json", "Selector must be a JSON object, not: [1]"),
+            ({"selector": {"b": 1}, "skip": "x"}, 400, "invalid_non_neg_integer", "<<120>> is not an integer greater than or equal to zero"),
+            ({"selector": {"b": 1}, "limit": 1.5}, 400, "invalid_non_neg_integer", "1.5 is not an integer greater than or equal to zero"),
+            ({"selector": {"b": 1}, "sort": [{"a": "up"}]}, 400, "invalid_sort_field", 'Invalid sort field: {[{<<"a">>,<<"up">>}]}'),
+            ({"selector": {"b": 1}, "sort": "x"}, 400, "invalid_sort_json", 'Sort must be an array of sort specs, not: <<"x">>'),
+            ({"selector": {"b": 1}, "fields": [1]}, 400, "invalid_field", "Invalid JSON for field spec: 1"),
+            ({"selector": {"b": 1}, "use_index": "a/b/c/d"}, 400, "invalid_index_name", "Invalid index name: <<97,47,98,47,99,47,100>>"),
+            ({"selector": {"a": {"$in": {"x": 1}}}}, 400, "bad_arg", "Bad argument for operator $in: {[{<<120>>,1}]}"),
+            ({"selector": {"a": {"$size": 1.0}}}, 400, "bad_arg", "Bad argument for operator $size: 1.0"),
+            ({"selector": {"a": {"$default": 1}}}, 400, "bad_field", "Invalid field normalization on selector: {[{<<36,100,101,102,97,117,108,116>>,1}]}"),
+            ({"selector": {"$eq": 1}}, 400, "invalid_selector", "One or more conditions is missing a field name."),
+            ({"selector": {"a..b": 1}}, 400, "invalid_field_name", "Invalid field name: a..b"),
+            ({"selector": {"b": 1}, "bookmark": "xyz"}, 400, "invalid_bookmark", 'Invalid bookmark value: "xyz"'),
+            ({"selector": {"b": 1}, "partition": "x"}, 400, "query_parse_error", "`partition` parameter is not supported on this db"),
+            ({"selector": {"b": 1}, "stale": "x"}, 500, "unknown_error", "Unknown Error: mango_opts :: {invalid_ok_or_false_value,<<120>>}"),
+            ({"selector": {"b": 1}, "bookmark": 5}, 500, "unknown_error", "Unknown Error: mango_opts :: {invalid_bookmark,5}"),
+            ({"selector": {"a": {"$mod": [0, 1]}}}, 500, "unknown_error", "badarith"),
+            # mango_idx_view:is_text_search/1 has no clause for null.
+            ({"selector": {"a": {"$in": [None]}}}, 500, "unknown_error", "function_clause"),
+        ]
+        for body, status, error, reason in errors:
+            s, b, _ = find(body)
+            eq((s, b["error"], b["reason"], "ref" in b), (status, error, reason, status == 500), json.dumps(body))
+
+        # Creating and deleting indexes.
+        eq(req("POST", f"/{db}/_index", dict(pidx, name="cp2"))[1]["result"], "created")
+        eq(req("POST", f"/{db}/_index", dict(pidx, name="cp2"))[1]["result"], "exists")
+        eq(req("POST", f"/{db}/_index", {"index": {"fields": ["z"]}, "ddoc": "cp", "name": "z", "partitioned": False})[:2],
+           (400, {"error": "invalid_partitioned_option", "reason": "Requested partitioned option does not match existing value on design document _design/cp"}))
+        eq(req("PUT", f"/{db}/_design/js", {"views": {"v": {"map": "function(d){}"}}})[0], 201)
+        eq(req("POST", f"/{db}/_index", {"index": {"fields": ["a"]}, "ddoc": "js"})[:2],
+           (400, {"error": "invalid_ddoc_lang", "reason": "Existing design doc has an invalid language: false"}))
+        for body, error, reason in [
+            ({"index": [1]}, "invalid_index", "JSON indexes must be an object, not: [1]"),
+            ({"index": {"fields": ["a"], "selector": {}}}, "invalid_key", "Invalid key selector for this request."),
+            ({"index": {}}, "missing_required_key", "Missing required key: fields"),
+            ({"index": {"fields": ["a"]}, "type": 5}, "invalid_string", "Invalid string: 5"),
+            ({"index": {"fields": ["a"]}, "type": "geo"}, "invalid_index", "Invalid type for index: geo"),
+            ({"index": {"fields": ["a"]}, "name": ""}, "invalid_empty_string", "Index name or ddoc cannot be empty string"),
+            ({"index": {"fields": ["a"]}, "ddoc": "_design/"}, "illegal_docid", "Illegal document id `_design/`"),
+        ]:
+            eq(req("POST", f"/{db}/_index", body)[:2], (400, {"error": error, "reason": reason}), json.dumps(body))
+        # mochiweb separates query parameters by ";" too.
+        r = urllib.request.Request(f"{BASE}/{db}/_index?limit=2;skip=1", headers={"Authorization": "Basic " + base64.b64encode(CREDS.encode()).decode()} if CREDS else {})
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            listed = json.loads(resp.read())["indexes"]
+        eq([i["name"] for i in listed], ["7095fd2321a986309496ad2ac9c3498246175757", "c9960e6f9106f2e6dc9f3a2e480cd379e12dd8f9"])
+        s, b, _ = req("GET", f"/{db}/_index?limit=0")
+        eq((s, b["error"], b["reason"]), (500, "invalid_list_index_params", "Index parameter ranges: limit > 1, skip > 0"))
+        eq(req("DELETE", f"/{db}/_index/cp/json/cp")[:2], (200, {"ok": True}))
+        # Each design doc's one index, the results in reverse.
+        eq(req("POST", f"/{db}/_index/_bulk_delete", {"docids": ["bdd", "nope", "cp"]})[1],
+           {"success": [{"id": "_design/cp", "ok": True}, {"id": "_design/bdd", "ok": True}], "fail": [{"id": "_design/nope", "error": "not_found"}]})
+        eq((req("GET", f"/{db}/_design/bdd")[0], req("GET", f"/{db}/_design/cp")[0]), (404, 404))
+        for path in ["a", "a/b", "a/b/c/d"]:
+            eq(req("PUT", f"/{db}/_index/{path}", {})[:2], (404, {"error": "not_found", "reason": "missing"}))
+        eq(req("GET", f"/{db}/_index/x/json/y")[0], 405)
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
+def encoding_parity():
+    """JSON and terms as CouchDB writes them: floats in Erlang's shortest
+    form, lists of bytes as strings in revision hashes; and the documents
+    a view's map function sees have their conflicts."""
+    db = new_db()
+    try:
+        s, b, _ = req("PUT", f"/{db}/f", {"v": [1000.0, 100.0, 1e21, 0.00001, 120000.0, 0.002, 1.5], "a": [1, 2, 3], "b": [300, "s"]})
+        eq(b["rev"], "1-aa6405c3ac2f779bee1b86d51c1876c1")
+        raw = req("GET", f"/{db}/f", raw=True)[1]
+        assert b'"v":[1.0e3,100.0,1.0e21,1.0e-5,1.2e5,0.002,1.5]' in raw, raw
+        eq(req("POST", f"/{db}", {"_id": "_design/"})[:2], (400, {"error": "illegal_docid", "reason": "Illegal document id `_design/`"}))
+        eq(req("PUT", f"/{db}/_design/", {})[:2], (400, {"error": "illegal_docid", "reason": "Only reserved document ids may start with underscore."}))
+        s, b, _ = req("PUT", f"/{db}/_revs_limit", "x")
+        eq((s, b["error"], b["reason"]), (500, "unknown_error", "function_clause"))
+        req("PUT", f"/{db}/c", {"x": 1})
+        req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": "c", "_rev": "1-23202479633c2b380f79507a776743d5", "x": 2}], "new_edits": False})
+        ddoc = {"views": {"conf": {"map": "function(doc) { if (doc._conflicts) emit(doc._id, doc._conflicts.length); }"}}}
+        eq(req("PUT", f"/{db}/_design/v", ddoc)[0], 201)
+        eq(req("GET", f"/{db}/_design/v/_view/conf")[1]["rows"], [{"id": "c", "key": "c", "value": 1}])
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
 def compaction_preserves_data():
     db = new_db()
     for i in range(20):
@@ -1952,7 +2117,6 @@ def _nouveau_enabled():
         s, b, _ = req("POST", f"/{db}/_index", {"type": "nouveau", "index": {"fields": fields}})
         eq((s, b["result"]), (200, "created"))
         ddoc, name = b["id"], b["name"]
-        eq(req("POST", f"/{db}/_index", {"type": "nouveau", "index": {"fields": fields}})[1]["result"], "exists")
         stored = req("GET", f"/{db}/{ddoc}")[1]
         eq((stored["language"], stored["nouveau"][name]["lucene_version"]), ("query", 10))
         listed = [i for i in req("GET", f"/{db}/_index")[1]["indexes"] if i["type"] == "nouveau"]
@@ -1966,13 +2130,21 @@ def _nouveau_enabled():
         eq(mids(find({"sort": [{"bar:number": "asc"}], "selector": {"bar": {"$gt": 5}}})[1]), ["doc3", "doc4", "doc2"])
         eq(mids(find({"sort": [{"foo:string": "asc"}], "selector": {"bar": {"$gte": 0}}})[1]), ["doc3", "doc1", "doc4", "doc2"])
         eq(mids(find({"selector": {"bar": {"$gt": 5}}, "fields": ["_id"], "limit": 1, "skip": 1})[1]), ["doc3"])
-        # The bookmark pages on.
+        # A bookmark is ignored (mango_cursor_nouveau:get_bookmark/1 wants
+        # a list, and is given a string).
         b = find({"selector": {"bar": {"$gt": 5}}, "limit": 2})[1]
-        eq(mids(find({"selector": {"bar": {"$gt": 5}}, "bookmark": b["bookmark"]})[1]), ["doc4"])
+        eq(mids(find({"selector": {"bar": {"$gt": 5}}, "bookmark": b["bookmark"]})[1]), ["doc2", "doc3", "doc4"])
         ex = req("POST", f"/{db}/_explain", {"selector": {"bar": {"$gt": 5}}})[1]
         eq((ex["index"]["type"], ex["query"], ex["partition"], ex["sort"]), ("nouveau", "(bar_3anumber:{5 TO *])", None, None))
         # A field the index lacks: another index serves it.
         eq(find({"selector": {"qux": "a"}})[1]["warning"], "No matching index found, create an index to optimize query time.")
+        # Only a new design doc's index is given a lucene_version, so the
+        # same index differs from it once, and is saved without one: a
+        # Lucene 9 index, which can't be made.
+        eq(req("POST", f"/{db}/_index", {"type": "nouveau", "index": {"fields": fields}})[1]["result"], "created")
+        eq(req("POST", f"/{db}/_index", {"type": "nouveau", "index": {"fields": fields}})[1]["result"], "exists")
+        s, b = find({"selector": {"bar": {"$gt": 5}}})[:2]
+        eq((s, b["error"]), (500, "nouveau_search_error"))
         eq(req("DELETE", f"/{db}/_index/{ddoc}/nouveau/{name}")[:2], (200, {"ok": True}))
         eq(req("GET", f"/{db}/{ddoc}")[0], 404)
     finally:

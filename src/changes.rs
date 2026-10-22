@@ -279,7 +279,7 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
             let pend = if args.descending { 0 } else { pending(&snap, last) };
             let mut out = json!({"results": rows, "last_seq": last_seq, "pending": pend});
             if args.db_updates {
-                out.as_object_mut().map(|o| o.remove("pending"));
+                out.as_object_mut().map(|o| o.shift_remove("pending"));
             }
             Ok(json_response(StatusCode::OK, &out))
         }
@@ -296,7 +296,7 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
                     let pend = pending(&snap, last);
                     let mut out = json!({"results": rows, "last_seq": snap.seq_str(last), "pending": pend});
                     if args.db_updates {
-                        out.as_object_mut().map(|o| o.remove("pending"));
+                        out.as_object_mut().map(|o| o.shift_remove("pending"));
                     }
                     return Ok(json_response(StatusCode::OK, &out));
                 }
@@ -306,7 +306,7 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
                     let snap = db.snapshot();
                     let mut out = json!({"results": [], "last_seq": snap.seq_str(args.since), "pending": 0});
                     if args.db_updates {
-                        out.as_object_mut().map(|o| o.remove("pending"));
+                        out.as_object_mut().map(|o| o.shift_remove("pending"));
                     }
                     return Ok(json_response(StatusCode::OK, &out));
                 }
@@ -347,7 +347,7 @@ fn continuous_stream(
             let (rows, last) = match res {
                 Ok(r) => r,
                 Err(e) => {
-                    yield Ok(Bytes::from(format!("{}\n", e.json())));
+                    yield Ok(Bytes::from(format!("{}\n", crate::json::to_string(&e.json()))));
                     break;
                 }
             };
@@ -358,9 +358,9 @@ fn continuous_stream(
                 remaining -= 1;
                 if eventsource {
                     let id = row["seq"].as_str().unwrap_or("").to_string();
-                    yield Ok(Bytes::from(format!("data: {row}\nid: {id}\n\n")));
+                    yield Ok(Bytes::from(format!("data: {}\nid: {id}\n\n", crate::json::to_string(&row))));
                 } else {
-                    yield Ok(Bytes::from(format!("{row}\n")));
+                    yield Ok(Bytes::from(format!("{}\n", crate::json::to_string(&row))));
                 }
             }
             since = last;
