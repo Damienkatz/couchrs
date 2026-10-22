@@ -1,0 +1,657 @@
+<meta charset="utf-8">
+<title>CouchDB on AWS</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: one reading column; each benchmark is a figure (chart + table view)
+   under a short heading. Summary ratio chart first, detail after. */
+:root {
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11,11,11,0.10);
+  --erlang: #2a78d6;
+  --rust: #eb6834;
+  --rocks: #1baf7a;
+  --hybrid: #eda100;
+  --inline: #e87ba4;
+  --good: #006300;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --erlang: #3987e5; --rust: #d95926; --rocks: #199e70; --hybrid: #c98500; --inline: #d55181; --good: #0ca30c; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --erlang: #3987e5; --rust: #d95926; --rocks: #199e70; --hybrid: #c98500; --inline: #d55181; --good: #0ca30c; color-scheme: dark;
+}
+body {
+  background: var(--page); color: var(--ink); font: 15px/1.55 var(--font);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+main { max-width: 980px; margin: 0 auto; padding-block: 40px 64px; display: grid; gap: 40px; }
+header { display: grid; gap: 12px; }
+.eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+h1 { font-size: clamp(28px, 4.5vw, 40px); line-height: 1.15; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+h2 { font-size: 22px; margin: 0; text-wrap: balance; }
+h3 { font-size: 15px; margin: 0; }
+p { margin: 0; max-width: 68ch; color: var(--ink-2); }
+.facts { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; color: var(--ink-2); }
+.facts b { color: var(--ink); font-variant-numeric: tabular-nums; }
+section { display: grid; gap: 16px; }
+.figure { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 18px 18px 12px; display: grid; gap: 10px; min-width: 0; }
+.figrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; }
+.fighead { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 16px; }
+.sub { font-size: 12.5px; color: var(--muted); }
+.legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg text { font-family: var(--font); }
+.tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+.rowlabel { font-size: 12.5px; fill: var(--ink-2); }
+.val { font-size: 11.5px; fill: var(--ink-2); font-variant-numeric: tabular-nums; }
+.ratio-lbl { font-size: 12px; fill: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.hit { fill: transparent; cursor: default; }
+.hit:focus { outline: none; }
+.bar { transition: opacity .12s; }
+.hovered .bar:not(.on) { opacity: .45; }
+details { font-size: 13px; }
+summary { cursor: pointer; color: var(--muted); width: fit-content; }
+summary:focus-visible, .hit:focus-visible { outline: 2px solid var(--erlang); outline-offset: 2px; }
+.tablewrap { overflow-x: auto; margin-top: 8px; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; min-width: 100%; }
+th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 500; }
+.alltable th:nth-child(2), .alltable td:nth-child(2) { text-align: left; color: var(--ink-2); }
+#tip { position: fixed; pointer-events: none; z-index: 20; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--ring); border-radius: 8px; padding: 8px 10px; font-size: 12.5px;
+  box-shadow: 0 4px 18px rgba(0,0,0,.12); display: grid; gap: 3px; min-width: 150px; }
+#tip .t { color: var(--muted); font-size: 11.5px; }
+#tip .r { display: grid; grid-template-columns: 12px 1fr auto; gap: 8px; align-items: center; }
+#tip .k { height: 2px; border-radius: 1px; }
+#tip .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+ul.notes { margin: 0; padding-left: 18px; color: var(--ink-2); display: grid; gap: 6px; max-width: 76ch; }
+code { font-family: var(--mono); font-size: 0.92em; }
+.seg { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; padding: 2px; gap: 2px; background: var(--surface); width: fit-content; }
+.seg button { font: inherit; font-size: 13px; color: var(--ink-2); background: transparent; border: 0; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--grid); color: var(--ink); font-weight: 600; }
+.seg button:focus-visible { outline: 2px solid var(--erlang); outline-offset: 1px; }
+.ctlrow { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; font-size: 13px; color: var(--muted); }
+.warn { color: var(--ink); background: color-mix(in srgb, var(--rust) 12%, transparent); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
+@media (prefers-reduced-motion: reduce) { .bar { transition: none; } }
+</style>
+
+<main>
+  <header>
+    <div class="eyebrow">Stress benchmark · same machine, same data, same replicator</div>
+    <h1>Apache CouchDB 3.5.3 (Erlang) vs couchdb-rs, on AWS</h1>
+    <p id="intro"></p>
+    <div class="facts" id="facts"></div>
+    <div class="legend" aria-hidden="true" id="legend"></div>
+    <div id="partial" class="warn" hidden></div>
+  </header>
+
+  <section>
+    <h2>Summary</h2>
+    <p>How many times faster couchdb-rs is than CouchDB on each headline measure. Right of 1× means couchdb-rs is faster; left means CouchDB is faster.</p>
+    <div class="figure" id="fig-summary"></div>
+    <div class="figure" id="fig-summary-rocks" hidden></div>
+    <div class="figure" id="fig-summary-hybrid" hidden></div>
+  </section>
+
+  <section>
+    <h2>Bulk load</h2>
+    <p id="load-text"></p>
+    <div class="figrow"><div class="figure" id="fig-load-mb"></div><div class="figure" id="fig-load-docs"></div></div>
+  </section>
+
+  <section>
+    <h2>Writes</h2>
+    <p>Single-document PUTs of exact sizes, written into the loaded database. Docs up to 64 KB are JSON; larger ones carry the bytes as one attachment, uploaded as <code>multipart/related</code>.</p>
+    <div class="figrow"><div class="figure" id="fig-put-ops"></div><div class="figure" id="fig-put-mb"></div></div>
+  </section>
+
+  <section>
+    <h2>Reads</h2>
+    <p>Random GETs of documents (or their attachment) drawn from the loaded dataset in each size band. The dataset is larger than RAM, so many reads go to disk.</p>
+    <div class="figrow"><div class="figure" id="fig-get-ops"></div><div class="figure" id="fig-get-mb"></div></div>
+  </section>
+
+  <section>
+    <h2>Deletes</h2>
+    <p>Deleting the documents created by the write test, with their current revision.</p>
+    <div class="figure" id="fig-del"></div>
+  </section>
+
+  <section>
+    <h2>Latency</h2>
+    <p>Per-request latency from the client's side, measured for every operation in the tests above. Mean and nearest-rank percentiles; lower is better.</p>
+    <div class="ctlrow"><span id="pct-label">Show</span>
+      <div class="seg" role="group" aria-labelledby="pct-label" id="pct">
+        <button type="button" id="pct-mean" data-k="mean_ms" aria-pressed="false">mean</button>
+        <button type="button" id="pct-p50" data-k="p50_ms" aria-pressed="false">p50</button>
+        <button type="button" id="pct-p90" data-k="p90_ms" aria-pressed="false">p90</button>
+        <button type="button" id="pct-p99" data-k="p99_ms" aria-pressed="true">p99</button>
+      </div>
+    </div>
+    <div class="figrow"><div class="figure" id="fig-lat-put"></div><div class="figure" id="fig-lat-get"></div></div>
+    <div class="figrow"><div class="figure" id="fig-lat-del"></div><div class="figure" id="fig-lat-view"></div></div>
+    <div class="figure" id="fig-lat-all"></div>
+  </section>
+
+  <section>
+    <h2>Views</h2>
+    <p>A JavaScript map function (<code>emit([doc.band, doc.group], doc.size)</code>) with the built-in <code>_sum</code> reduce, built over every document, then queried. Both servers run map functions in QuickJS.</p>
+    <div class="figrow"><div class="figure" id="fig-view-build"></div><div class="figure" id="fig-view-q"></div></div>
+  </section>
+
+  <section id="scale-section" hidden>
+    <h2>Connection scaling</h2>
+    <p id="scale-text"></p>
+    <div class="figrow"><div class="figure" id="fig-scale-rps"></div><div class="figure" id="fig-scale-mem"></div></div>
+    <div class="figrow"><div class="figure" id="fig-scale-get"></div><div class="figure" id="fig-scale-put"></div></div>
+    <div class="figure" id="fig-scale-att"></div>
+    <div class="figure" id="fig-scale-table"></div>
+  </section>
+
+  <section id="vc-section" hidden>
+    <h2>View compaction</h2>
+    <p id="vc-text">Incremental index updates followed by view compaction. 200,000 small documents are inserted, updated three times and then deleted, and the index is brought up to date after each round, so it ends with the rows it started with plus whatever dead space incremental updates leave. Then the index is compacted. CouchDB's background indexer updates its index while the churn is written, so its index update times are not shown.</p>
+    <div class="figrow"><div class="figure" id="fig-vc-update"></div><div class="figure" id="fig-vc-time"></div></div>
+    <div class="figrow"><div class="figure" id="fig-vc-ram"></div><div class="figure" id="fig-vc-disk"></div></div>
+    <div class="figure" id="fig-vc-sizes"></div>
+  </section>
+
+  <section>
+    <h2>Replication</h2>
+    <p>One full replication of the loaded database into a new database on the same server, driven by CouchDB's own replicator in both cases. That replicator talks to couchdb-rs over HTTP, so this also shows the two interoperate.</p>
+    <div class="figure" id="fig-repl-time"></div>
+    <div class="figrow"><div class="figure" id="fig-repl-mb"></div><div class="figure" id="fig-repl-docs"></div></div>
+  </section>
+
+  <section>
+    <h2>Compaction</h2>
+    <p id="compact-text">Compacting the loaded database: copying the live documents and attachments into a new file and rebuilding its indexes, then swapping it in.</p>
+    <div class="figrow"><div class="figure" id="fig-compact-time"></div><div class="figure" id="fig-compact-rate"></div></div>
+    <div class="figrow"><div class="figure" id="fig-compact-ram"></div><div class="figure" id="fig-compact-disk"></div></div>
+    <div class="figure" id="fig-compact-sizes"></div>
+  </section>
+
+  <section>
+    <h2>Disk</h2>
+    <div class="figrow"><div class="figure" id="fig-disk-db"></div><div class="figure" id="fig-disk-idx"></div></div>
+    <div class="figure" id="fig-disk-ratio"></div>
+  </section>
+
+  <section>
+    <h2>Method</h2>
+    <ul class="notes" id="method"></ul>
+  </section>
+</main>
+<div id="tip" hidden></div>
+
+<script id="data" type="application/json">{"results": {"rust": {"compact": {"active_bytes_after": 55010089970, "active_bytes_before": 55033425849, "dead_bytes_after": 55841990, "file_bytes_after": 55065931960, "file_bytes_before": 66836385973, "live_mb_per_sec": 495.8832973200297, "reclaimed_bytes": 11770454013, "secs": 110.933540749, "resources": {"samples": 115, "duration_secs": 115.64395642280579, "rss_start_bytes": 6230016, "rss_peak_bytes": 388157440, "disk_start_bytes": 67054047609, "disk_peak_bytes": 122659691738, "disk_peak_extra_bytes": 55605644129, "disk_peak_at_secs": 112.60329365730286, "free_min_bytes": 3598035755008, "t0_unix": 1792647649.4646094, "footprint_start_bytes": 4175872, "footprint_peak_bytes": 386103296}}, "delete": {"100B": {"bytes": 0, "errors": 0, "max_ms": 19.261658, "mb_per_sec": 0.0, "mean_ms": 1.4923535451999976, "ops": 5000, "ops_per_sec": 10405.830035267938, "p50_ms": 1.47967, "p90_ms": 1.844252, "p95_ms": 1.926203, "p99_ms": 2.237066, "secs": 0.480499872}, "100KB": {"bytes": 0, "errors": 0, "max_ms": 2.092222, "mb_per_sec": 0.0, "mean_ms": 1.2357594116666664, "ops": 3000, "ops_per_sec": 12577.213505099946, "p50_ms": 1.1804059999999998, "p90_ms": 1.583048, "p95_ms": 1.731801, "p99_ms": 1.95643, "secs": 0.238526602}, "100MB": {"bytes": 0, "errors": 0, "max_ms": 2.160475, "mb_per_sec": 0.0, "mean_ms": 1.9015295999999997, "ops": 20, "ops_per_sec": 5152.64849997385, "p50_ms": 2.063791, "p90_ms": 2.138361, "p95_ms": 2.1406340000000004, "p99_ms": 2.160475, "secs": 0.003881499}, "10KB": {"bytes": 0, "errors": 0, "max_ms": 5.1168949999999995, "mb_per_sec": 0.0, "mean_ms": 1.645262366599998, "ops": 5000, "ops_per_sec": 9480.175202662873, "p50_ms": 1.623701, "p90_ms": 2.116835, "p95_ms": 2.204662, "p99_ms": 2.425098, "secs": 0.527416413}, "10MB": {"bytes": 0, "errors": 0, "max_ms": 2.104171, "mb_per_sec": 0.0, "mean_ms": 1.612125389999999, "ops": 200, "ops_per_sec": 9311.117008151885, "p50_ms": 1.599088, "p90_ms": 1.969952, "p95_ms": 2.0178610000000003, "p99_ms": 2.089408, "secs": 0.0214797}, "1GB": {"bytes": 0, "errors": 0, "max_ms": 2.594169, "mb_per_sec": 0.0, "mean_ms": 2.1826245, "ops": 4, "ops_per_sec": 1523.584903863697, "p50_ms": 2.2851239999999997, "p90_ms": 2.594169, "p95_ms": 2.594169, "p99_ms": 2.594169, "secs": 0.002625387}, "1KB": {"bytes": 0, "errors": 0, "max_ms": 4.911143, "mb_per_sec": 0.0, "mean_ms": 1.5107188724000011, "ops": 5000, "ops_per_sec": 10265.952032392512, "p50_ms": 1.499027, "p90_ms": 1.872445, "p95_ms": 1.96066, "p99_ms": 2.2511699999999997, "secs": 0.487046889}, "1MB": {"bytes": 0, "errors": 0, "max_ms": 5.0674470000000005, "mb_per_sec": 0.0, "mean_ms": 1.3037382460000024, "ops": 1000, "ops_per_sec": 11971.348397256124, "p50_ms": 1.251571, "p90_ms": 1.658159, "p95_ms": 1.782674, "p99_ms": 4.308066, "secs": 0.083532779}}, "get": {"100B": {"avg_doc_bytes": 388, "band": "1e2", "bytes": 2166795, "concurrency": 16, "errors": 0, "max_ms": 4.071418, "mb_per_sec": 14.650037794182776, "mean_ms": 0.4349074548, "ops": 5000, "ops_per_sec": 33805.777182850194, "p50_ms": 0.362165, "p90_ms": 0.790411, "p95_ms": 0.87354, "p99_ms": 1.3502690000000002, "secs": 0.147903714}, "100KB": {"avg_doc_bytes": 393662, "band": "1e5", "bytes": 1180988949, "concurrency": 16, "errors": 0, "max_ms": 73.172979, "mb_per_sec": 1547.4603264082714, "mean_ms": 4.057897950333333, "ops": 3000, "ops_per_sec": 3930.926689158049, "p50_ms": 3.288863, "p90_ms": 7.523356, "p95_ms": 9.44752, "p99_ms": 14.179827, "secs": 0.763178822}, "100MB": {"avg_doc_bytes": 500864507, "band": "1e8", "bytes": 10017290149, "concurrency": 4, "errors": 0, "max_ms": 2420.5376539999997, "mb_per_sec": 1532.3810623152206, "mean_ms": 1201.1605951, "ops": 20, "ops_per_sec": 3.059472251521424, "p50_ms": 1004.81174, "p90_ms": 2236.668885, "p95_ms": 2412.051138, "p99_ms": 2420.5376539999997, "secs": 6.537075141}, "10KB": {"avg_doc_bytes": 39282, "band": "1e4", "bytes": 196595163, "concurrency": 16, "errors": 0, "max_ms": 3.931532, "mb_per_sec": 1137.2913991529217, "mean_ms": 0.5338917724, "ops": 5000, "ops_per_sec": 28924.70449928927, "p50_ms": 0.443304, "p90_ms": 0.877194, "p95_ms": 1.025355, "p99_ms": 1.618652, "secs": 0.172862613}, "10MB": {"avg_doc_bytes": 37326922, "band": "1e7", "bytes": 7465384430, "concurrency": 8, "errors": 0, "max_ms": 1593.560978, "mb_per_sec": 1547.4745748162695, "mean_ms": 190.15257324, "ops": 200, "ops_per_sec": 41.45733121519288, "p50_ms": 115.826197, "p90_ms": 422.297632, "p95_ms": 640.578412, "p99_ms": 993.697569, "secs": 4.824237213}, "1KB": {"avg_doc_bytes": 3897, "band": "1e3", "bytes": 19713813, "concurrency": 16, "errors": 0, "max_ms": 3.181515, "mb_per_sec": 124.60175995303288, "mean_ms": 0.4694054985999993, "ops": 5000, "ops_per_sec": 31602.653416929767, "p50_ms": 0.415244, "p90_ms": 0.842731, "p95_ms": 0.960822, "p99_ms": 1.271331, "secs": 0.158214563}, "1MB": {"avg_doc_bytes": 3885492, "band": "1e6", "bytes": 3885492543, "concurrency": 16, "errors": 0, "max_ms": 310.089649, "mb_per_sec": 1550.3423681029276, "mean_ms": 39.905114231000034, "ops": 1000, "ops_per_sec": 399.00793810452245, "p50_ms": 27.106397, "p90_ms": 82.83742600000001, "p95_ms": 121.880508, "p99_ms": 214.170137, "secs": 2.506215803}}, "load": {"attachment_docs": 91510, "bands": {"1e2": {"bytes": 1000000099, "docs": 2560333}, "1e3": {"bytes": 4000004487, "docs": 1024214}, "1e4": {"bytes": 10000051309, "docs": 255765}, "1e5": {"bytes": 15000224033, "docs": 38583}, "1e6": {"bytes": 20005163650, "docs": 5101}, "1e7": {"bytes": 25013540439, "docs": 640}, "1e8": {"bytes": 25225888261, "docs": 59}}, "bytes": 100244872278, "doc_count_after": 3884695, "docs": 3884695, "docs_per_sec": 11855.251592876511, "errors": 0, "file_bytes_after": 61812306071, "json_docs": 3793185, "mb_per_sec": 305.92573722041556, "secs": 327.677145404}, "put": {"100B": {"bytes": 500000, "concurrency": 16, "errors": 0, "max_ms": 5.3791, "mb_per_sec": 1.1565847142428576, "mean_ms": 1.3360559988000018, "ops": 5000, "ops_per_sec": 11565.847142428576, "p50_ms": 1.304961, "p90_ms": 1.68904, "p95_ms": 1.784711, "p99_ms": 2.217972, "secs": 0.432307287}, "100KB": {"bytes": 300000000, "concurrency": 16, "errors": 0, "max_ms": 6.716166, "mb_per_sec": 520.0591828043443, "mean_ms": 3.0183999083333353, "ops": 3000, "ops_per_sec": 5200.5918280434435, "p50_ms": 3.008654, "p90_ms": 3.549093, "p95_ms": 3.736293, "p99_ms": 4.239254, "secs": 0.576857423}, "100MB": {"bytes": 2000000000, "concurrency": 4, "errors": 0, "max_ms": 1361.247744, "mb_per_sec": 368.6106854851583, "mean_ms": 1083.66887705, "ops": 20, "ops_per_sec": 3.686106854851583, "p50_ms": 1076.419629, "p90_ms": 1108.711724, "p95_ms": 1111.448992, "p99_ms": 1361.247744, "secs": 5.425778684}, "10KB": {"bytes": 50000000, "concurrency": 16, "errors": 0, "max_ms": 5.7115730000000005, "mb_per_sec": 72.32353759810847, "mean_ms": 2.124756651599999, "ops": 5000, "ops_per_sec": 7232.353759810847, "p50_ms": 2.098471, "p90_ms": 2.534479, "p95_ms": 2.67384, "p99_ms": 2.95673, "secs": 0.691337864}, "10MB": {"bytes": 2000000000, "concurrency": 8, "errors": 0, "max_ms": 172.342842, "mb_per_sec": 663.8986102354459, "mean_ms": 118.069588965, "ops": 200, "ops_per_sec": 66.38986102354458, "p50_ms": 117.754741, "p90_ms": 136.300725, "p95_ms": 144.498468, "p99_ms": 157.45459300000002, "secs": 3.012508189}, "1GB": {"bytes": 4000000000, "concurrency": 2, "errors": 0, "max_ms": 10348.197417, "mb_per_sec": 194.21115557268504, "mean_ms": 10298.05343925, "ops": 4, "ops_per_sec": 0.19421115557268503, "p50_ms": 10248.230667, "p90_ms": 10348.197417, "p95_ms": 10348.197417, "p99_ms": 10348.197417, "secs": 20.596139229}, "1KB": {"bytes": 5000000, "concurrency": 16, "errors": 0, "max_ms": 3.760645, "mb_per_sec": 11.118910483223914, "mean_ms": 1.3831925607999984, "ops": 5000, "ops_per_sec": 11118.910483223914, "p50_ms": 1.37016, "p90_ms": 1.759397, "p95_ms": 1.844511, "p99_ms": 2.029655, "secs": 0.449684347}, "1MB": {"bytes": 1000000000, "concurrency": 16, "errors": 0, "max_ms": 28.147093, "mb_per_sec": 1019.3118320232325, "mean_ms": 15.585045277999985, "ops": 1000, "ops_per_sec": 1019.3118320232325, "p50_ms": 15.097033, "p90_ms": 20.044452, "p95_ms": 21.152978, "p99_ms": 26.169438, "secs": 0.981054049}}, "replicate": {"doc_write_failures": 0, "docs_per_sec": 3995.763379634834, "docs_written": 3903920, "error": null, "mb_per_sec": 103.01671636799507, "ok": true, "reason": null, "secs": 972.203714514, "source_docs": 3884696, "source_external_bytes": 100153234310, "target_docs": 3884696}, "scale": {"att_bytes": 4000, "doc_bytes": 1000, "measure_secs": 60, "per_host": 15000, "pool_docs": 100000, "steps": [{"clients": 15000, "connect_errors": 0, "connected": 15000, "generator_cpu_cores": 0.4634363203092201, "hosts": 1, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 13.774082919660653, "mean_ms": 1.0559625036089815, "ops": 405239, "ops_per_sec": 6752.449852422012, "p50_ms": 0.8958576156361382, "p90_ms": 2.0580039498663734, "p95_ms": 2.4595052266806654, "p99_ms": 3.376373616782864}, "get_att": {"max_ms": 14.049564578053866, "mean_ms": 1.0682404276638908, "ops": 405178, "ops_per_sec": 6751.4334165878545, "p50_ms": 0.913774767948861, "p90_ms": 2.099164028863701, "p95_ms": 2.5086953312142786, "p99_ms": 3.376373616782864}, "put": {"max_ms": 3008.2187395117253, "mean_ms": 2192.431888447463, "ops": 405504, "ops_per_sec": 6756.8655162917075, "p50_ms": 2191.3243475340278, "p90_ms": 2779.129122985154, "p95_ms": 2834.7117054448568, "p99_ms": 2949.2340583448295}}, "ops_per_sec": 20260.748785301574, "secs": 60.013625996, "server_cpu_cores": 3.5183219264263697, "server_footprint_bytes": 877747200.0, "timeouts": 0, "window_end_unix": 1792648019.700543, "window_start_unix": 1792647959.6868975}, {"clients": 30000, "connect_errors": 0, "connected": 30000, "generator_cpu_cores": 0.43936414516094746, "hosts": 2, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 17.126340824003655, "mean_ms": 1.1117423845978212, "ops": 381037, "ops_per_sec": 6349.05738145319, "p50_ms": 0.9320502633078384, "p90_ms": 2.183970255629794, "p95_ms": 2.610046622595335, "p99_ms": 3.6546953869812864}, "get_att": {"max_ms": 16.790530219611423, "mean_ms": 1.1267160372114489, "ops": 381388, "ops_per_sec": 6354.905945085829, "p50_ms": 0.9506912685739952, "p90_ms": 2.22764966074239, "p95_ms": 2.662247555047242, "p99_ms": 3.6546953869812864}, "put": {"max_ms": 5342.129275815051, "mean_ms": 4671.314135788816, "ops": 380672, "ops_per_sec": 6342.975541778223, "p50_ms": 4743.657916862814, "p90_ms": 5237.381642955932, "p95_ms": 5237.381642955932, "p99_ms": 5342.129275815051}}, "ops_per_sec": 19046.93886831724, "secs": 60.014735591, "server_cpu_cores": 3.5025510232485484, "server_footprint_bytes": 1514810368.0, "timeouts": 0, "window_end_unix": 1792648099.717896, "window_start_unix": 1792648039.7031322}, {"clients": 45000, "connect_errors": 0, "connected": 45000, "generator_cpu_cores": 0.4413250516203634, "hosts": 3, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 25.448841550066014, "mean_ms": 1.186781602620488, "ops": 370618, "ops_per_sec": 6175.606071443827, "p50_ms": 0.9890991958243847, "p90_ms": 2.3639996411771103, "p95_ms": 2.825198403396574, "p99_ms": 4.0350790183096334}, "get_att": {"max_ms": 23.51079586370199, "mean_ms": 1.2020616168529517, "ops": 371116, "ops_per_sec": 6183.904243209848, "p50_ms": 1.008881179740872, "p90_ms": 2.3639996411771103, "p95_ms": 2.825198403396574, "p99_ms": 3.9559598218721903}, "put": {"max_ms": 7938.123086377109, "mean_ms": 7203.775439899708, "ops": 371712, "ops_per_sec": 6193.835388536249, "p50_ms": 7333.598704584966, "p90_ms": 7782.473614095203, "p95_ms": 7782.473614095203, "p99_ms": 7938.123086377109}}, "ops_per_sec": 18553.345703189923, "secs": 60.013219061, "server_cpu_cores": 3.596452699805874, "server_footprint_bytes": 2228423680.0, "timeouts": 0, "window_end_unix": 1792648179.7336307, "window_start_unix": 1792648119.7203832}, {"clients": 60000, "connect_errors": 0, "connected": 60000, "generator_cpu_cores": 0.4108803358845027, "hosts": 4, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 28.659528967488548, "mean_ms": 1.2817830421377185, "ops": 360010, "ops_per_sec": 5998.803075240332, "p50_ms": 1.0706327789904517, "p90_ms": 2.558869237838564, "p95_ms": 3.0580856102171046, "p99_ms": 4.367699297559576}, "get_att": {"max_ms": 31.0219958448612, "mean_ms": 1.2974269364824835, "ops": 359208, "ops_per_sec": 5985.439446267963, "p50_ms": 1.0920454345702606, "p90_ms": 2.610046622595335, "p95_ms": 3.119247322421447, "p99_ms": 4.367699297559576}, "put": {"max_ms": 10683.668527674767, "mean_ms": 9888.17864319585, "ops": 360192, "ops_per_sec": 6001.835719221593, "p50_ms": 9870.058302475756, "p90_ms": 10474.184831053693, "p95_ms": 10474.184831053693, "p99_ms": 10474.184831053693}}, "ops_per_sec": 17986.078240729887, "secs": 60.013638635, "server_cpu_cores": 3.6635294117647064, "server_footprint_bytes": 2769972224.0, "timeouts": 0, "window_end_unix": 1792648259.7502935, "window_start_unix": 1792648199.736628}, {"clients": 75000, "connect_errors": 0, "connected": 75000, "generator_cpu_cores": 0.4270615878746453, "hosts": 5, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 32.27528447699359, "mean_ms": 1.274284757991087, "ops": 374511, "ops_per_sec": 6240.136346340843, "p50_ms": 1.0706327789904517, "p90_ms": 2.558869237838564, "p95_ms": 3.0580856102171046, "p99_ms": 4.198096210649343}, "get_att": {"max_ms": 31.64243576175841, "mean_ms": 1.2932923817990005, "ops": 373474, "ops_per_sec": 6222.857758018589, "p50_ms": 1.0920454345702606, "p90_ms": 2.610046622595335, "p95_ms": 3.0580856102171046, "p99_ms": 4.198096210649343}, "put": {"max_ms": 12767.97286304818, "mean_ms": 11978.00130823474, "ops": 373248, "ops_per_sec": 6219.092125462342, "p50_ms": 12031.545995740871, "p90_ms": 12517.620453968804, "p95_ms": 12517.620453968804, "p99_ms": 12767.97286304818}}, "ops_per_sec": 18682.086229821776, "secs": 60.016477079, "server_cpu_cores": 3.804088582940492, "server_footprint_bytes": 3372739584.0, "timeouts": 0, "window_end_unix": 1792648339.7697916, "window_start_unix": 1792648279.7532763}, {"clients": 90000, "connect_errors": 0, "connected": 90000, "generator_cpu_cores": 0.4048712782107887, "hosts": 6, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 41.75152199922138, "mean_ms": 1.3291545571130414, "ops": 357913, "ops_per_sec": 5963.870488401316, "p50_ms": 1.113886343261666, "p90_ms": 2.662247555047242, "p95_ms": 3.1816322688698757, "p99_ms": 4.367699297559576}, "get_att": {"max_ms": 40.932864705119, "mean_ms": 1.3449208382460276, "ops": 356220, "ops_per_sec": 5935.660189426807, "p50_ms": 1.1361640701268987, "p90_ms": 2.662247555047242, "p95_ms": 3.1816322688698757, "p99_ms": 4.367699297559576}, "put": {"max_ms": 15875.369428194219, "mean_ms": 14918.59325767229, "ops": 356608, "ops_per_sec": 5942.12539675233, "p50_ms": 14959.715181372754, "p90_ms": 15875.369428194219, "p95_ms": 15875.369428194219, "p99_ms": 15875.369428194219}}, "ops_per_sec": 17841.656074580453, "secs": 60.013543335, "server_cpu_cores": 3.7509306321102613, "server_footprint_bytes": 3959327744.0, "timeouts": 0, "window_end_unix": 1792648419.7863011, "window_start_unix": 1792648359.772731}], "warm_secs": 15}, "server": {"bands": [{"band": 2, "share": 0.01}, {"band": 3, "share": 0.04}, {"band": 4, "share": 0.1}, {"band": 5, "share": 0.15}, {"band": 6, "share": 0.2}, {"band": 7, "share": 0.25}, {"band": 8, "share": 0.25}], "dataset_bytes": 100244872278, "dataset_docs": 3884695, "json_max_bytes": 65536, "seed": 42, "url": "http://172.31.3.104:5984", "welcome": {"couchdb": "Welcome", "features": ["access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"], "git_sha": "rust", "uuid": "b7090b4529bd42139df55ad9e316c921", "vendor": {"name": "couchdb-rs"}, "version": "3.5.0"}}, "view": {"build_secs": 34.818789068, "docs_indexed": 3884696, "docs_per_sec": 111568.95756521892, "index_file_bytes": 213442715, "queries": {"group_level1_reduce": {"bytes": 116500, "errors": 0, "max_ms": 1.331017, "mb_per_sec": 2.671124318413335, "mean_ms": 0.6738462299999999, "ops": 500, "ops_per_sec": 11464.052868726758, "p50_ms": 0.690362, "p90_ms": 0.962501, "p95_ms": 1.035559, "p99_ms": 1.291903, "secs": 0.043614593}, "include_docs_limit10": {"bytes": 190441630, "errors": 0, "max_ms": 5.350027, "mb_per_sec": 1059.0798146670677, "mean_ms": 1.396191740999998, "ops": 2000, "ops_per_sec": 11122.356122104897, "p50_ms": 1.13287, "p90_ms": 2.542397, "p95_ms": 2.781671, "p99_ms": 3.364728, "secs": 0.179818015}, "key_lookup_limit20": {"bytes": 4278293, "errors": 0, "max_ms": 6.841963000000001, "mb_per_sec": 21.022870589496936, "mean_ms": 0.6018135973999978, "ops": 5000, "ops_per_sec": 24569.22724728874, "p50_ms": 0.558496, "p90_ms": 0.942261, "p95_ms": 1.035, "p99_ms": 1.295881, "secs": 0.203506604}, "key_reduce": {"bytes": 119785, "errors": 0, "max_ms": 1.422643, "mb_per_sec": 1.309806582075224, "mean_ms": 0.4461256573333328, "ops": 3000, "ops_per_sec": 32803.93827462263, "p50_ms": 0.323128, "p90_ms": 0.8850439999999999, "p95_ms": 0.98253, "p99_ms": 1.173129, "secs": 0.091452434}}, "reduce_expected": 100244872278, "reduce_total": 100244872278, "request_timeouts_during_build": 0, "rows": 3884695}, "view_compact": {"active_bytes_after": 213442110, "active_bytes_before": 213442110, "active_bytes_start": 213441849, "churn_docs": 200000, "churn_rounds": [{"active_bytes": 218130984, "file_bytes": 240799903, "index_docs_per_sec": 43668.49524545786, "index_update_secs": 4.579960882, "write_secs": 4.639808639}, {"active_bytes": 218135943, "file_bytes": 273563809, "index_docs_per_sec": 26676.90412425498, "index_update_secs": 7.49712182, "write_secs": 6.51498523}, {"active_bytes": 218133057, "file_bytes": 306147487, "index_docs_per_sec": 26008.558570827336, "index_update_secs": 7.689776404, "write_secs": 7.537823347}, {"active_bytes": 218129996, "file_bytes": 338833567, "index_docs_per_sec": 26351.293500647454, "index_update_secs": 7.589760252, "write_secs": 8.347712646}, {"active_bytes": 213442110, "file_bytes": 357707932, "index_docs_per_sec": 52038.414410942314, "index_update_secs": 3.843314641, "write_secs": 9.058903224}], "ended_unix": 1792647912.6399252, "file_bytes_after": 213432906, "file_bytes_before": 357707932, "file_bytes_start": 213446814, "live_mb_per_sec": 17.633886054801412, "reclaimed_bytes": 144275026, "secs": 12.10408808, "started_unix": 1792647900.534951, "resources": {"rss_before_bytes": 7501496320.0, "rss_peak_bytes": 9938317312.0, "disk_before_bytes": 55834326364.0, "disk_peak_bytes": 56045330720.0, "footprint_before_bytes": 7499330560.0, "footprint_peak_bytes": 9969755136.0, "rss_peak_extra_bytes": 2436820992.0, "disk_peak_extra_bytes": 211004356.0, "footprint_peak_extra_bytes": 2470424576.0}}}, "erlang": {"compact": {"active_bytes_after": 36627680718, "active_bytes_before": 36685079873, "dead_bytes_after": 19256102, "file_bytes_after": 36646936820, "file_bytes_before": 46676156648, "live_mb_per_sec": 52.740778906703795, "reclaimed_bytes": 10029219828, "secs": 694.485016666, "resources": {"samples": 691, "duration_secs": 699.5055439472198, "rss_start_bytes": 142487552, "rss_peak_bytes": 194195456, "disk_start_bytes": 48679106534, "disk_peak_bytes": 86389932049, "disk_peak_extra_bytes": 37710825515, "disk_peak_at_secs": 696.4647617340088, "free_min_bytes": 3629263454208, "t0_unix": 1792651181.2578757, "footprint_start_bytes": 123713536, "footprint_peak_bytes": 175327232}}, "delete": {"100B": {"bytes": 0, "errors": 0, "max_ms": 10.493812, "mb_per_sec": 0.0, "mean_ms": 5.4881830721999965, "ops": 5000, "ops_per_sec": 2887.542540352314, "p50_ms": 5.4692, "p90_ms": 5.8558580000000005, "p95_ms": 5.957527, "p99_ms": 6.271986, "secs": 1.731576221}, "100KB": {"bytes": 0, "errors": 0, "max_ms": 8.680497, "mb_per_sec": 0.0, "mean_ms": 5.80340262066667, "ops": 3000, "ops_per_sec": 2726.330889003812, "p50_ms": 5.780917, "p90_ms": 6.169733, "p95_ms": 6.297645, "p99_ms": 6.8563979999999995, "secs": 1.100380006}, "100MB": {"bytes": 0, "errors": 0, "max_ms": 15.736327, "mb_per_sec": 0.0, "mean_ms": 13.952642649999998, "ops": 20, "ops_per_sec": 826.2685649636101, "p50_ms": 15.650076999999998, "p90_ms": 15.701968, "p95_ms": 15.71311, "p99_ms": 15.736327, "secs": 0.024205205}, "10KB": {"bytes": 0, "errors": 0, "max_ms": 7.779631, "mb_per_sec": 0.0, "mean_ms": 5.529080683199995, "ops": 5000, "ops_per_sec": 2862.195617002158, "p50_ms": 5.522843, "p90_ms": 5.82604, "p95_ms": 5.89738, "p99_ms": 6.165023000000001, "secs": 1.746910648}, "10MB": {"bytes": 0, "errors": 0, "max_ms": 10.506626, "mb_per_sec": 0.0, "mean_ms": 7.613645655, "ops": 200, "ops_per_sec": 2019.7750723945455, "p50_ms": 7.564775999999999, "p90_ms": 8.358531000000001, "p95_ms": 8.960772, "p99_ms": 9.059225, "secs": 0.099020927}, "1GB": {"bytes": 0, "errors": 0, "max_ms": 29.105305, "mb_per_sec": 0.0, "mean_ms": 24.78441325, "ops": 4, "ops_per_sec": 137.42278342633134, "p50_ms": 29.063144, "p90_ms": 29.105305, "p95_ms": 29.105305, "p99_ms": 29.105305, "secs": 0.029107255}, "1KB": {"bytes": 0, "errors": 0, "max_ms": 8.548858, "mb_per_sec": 0.0, "mean_ms": 5.4739174136000015, "ops": 5000, "ops_per_sec": 2894.449281615923, "p50_ms": 5.470046999999999, "p90_ms": 5.811223, "p95_ms": 5.939262, "p99_ms": 6.226304, "secs": 1.72744433}, "1MB": {"bytes": 0, "errors": 0, "max_ms": 8.938332, "mb_per_sec": 0.0, "mean_ms": 6.151120700999999, "ops": 1000, "ops_per_sec": 2557.4413670698486, "p50_ms": 6.091743, "p90_ms": 6.556246, "p95_ms": 6.900336, "p99_ms": 7.999638, "secs": 0.391015807}}, "get": {"100B": {"avg_doc_bytes": 388, "band": "1e2", "bytes": 2166795, "concurrency": 16, "errors": 0, "max_ms": 2.821863, "mb_per_sec": 3.746510740430584, "mean_ms": 1.8121414963999996, "ops": 5000, "ops_per_sec": 8645.281949678176, "p50_ms": 1.816057, "p90_ms": 2.132989, "p95_ms": 2.259604, "p99_ms": 2.428486, "secs": 0.578350137}, "100KB": {"avg_doc_bytes": 393662, "band": "1e5", "bytes": 1180988949, "concurrency": 16, "errors": 0, "max_ms": 13.035602, "mb_per_sec": 1034.459410983443, "mean_ms": 6.0576482703333205, "ops": 3000, "ops_per_sec": 2627.7792316161026, "p50_ms": 5.347574, "p90_ms": 10.006958, "p95_ms": 10.943982, "p99_ms": 11.947298, "secs": 1.141648417}, "100MB": {"avg_doc_bytes": 500864507, "band": "1e8", "bytes": 10017290149, "concurrency": 4, "errors": 0, "max_ms": 6205.310902, "mb_per_sec": 548.5002701035354, "mean_ms": 3175.7002605, "ops": 20, "ops_per_sec": 1.095107083742185, "p50_ms": 2710.227885, "p90_ms": 5654.9595469999995, "p95_ms": 5680.871443, "p99_ms": 6205.310902, "secs": 18.263054177}, "10KB": {"avg_doc_bytes": 39282, "band": "1e4", "bytes": 196595163, "concurrency": 16, "errors": 0, "max_ms": 4.134047, "mb_per_sec": 315.6332329108492, "mean_ms": 1.9679647070000028, "ops": 5000, "ops_per_sec": 8027.492337409369, "p50_ms": 1.866173, "p90_ms": 2.6484859999999997, "p95_ms": 2.906751, "p99_ms": 3.309396, "secs": 0.622859517}, "10MB": {"avg_doc_bytes": 37326922, "band": "1e7", "bytes": 7465384430, "concurrency": 8, "errors": 0, "max_ms": 806.896522, "mb_per_sec": 943.3068308898064, "mean_ms": 306.4733793849999, "ops": 200, "ops_per_sec": 25.271487081069356, "p50_ms": 254.163305, "p90_ms": 579.048681, "p95_ms": 693.145738, "p99_ms": 779.430382, "secs": 7.914057426}, "1KB": {"avg_doc_bytes": 3897, "band": "1e3", "bytes": 19713813, "concurrency": 16, "errors": 0, "max_ms": 3.006535, "mb_per_sec": 34.358846633442994, "mean_ms": 1.800172258999999, "ops": 5000, "ops_per_sec": 8714.40918949647, "p50_ms": 1.794321, "p90_ms": 2.164751, "p95_ms": 2.273672, "p99_ms": 2.524081, "secs": 0.573762362}, "1MB": {"avg_doc_bytes": 3885492, "band": "1e6", "bytes": 3885492543, "concurrency": 16, "errors": 0, "max_ms": 135.886741, "mb_per_sec": 1163.1315002752428, "mean_ms": 52.89444488499998, "ops": 1000, "ops_per_sec": 299.352395456455, "p50_ms": 45.305521, "p90_ms": 104.022872, "p95_ms": 115.486427, "p99_ms": 127.133354, "secs": 3.340544506}}, "load": {"attachment_docs": 91510, "bands": {"1e2": {"bytes": 1000000099, "docs": 2560333}, "1e3": {"bytes": 4000004487, "docs": 1024214}, "1e4": {"bytes": 10000051309, "docs": 255765}, "1e5": {"bytes": 15000224033, "docs": 38583}, "1e6": {"bytes": 20005163650, "docs": 5101}, "1e7": {"bytes": 25013540439, "docs": 640}, "1e8": {"bytes": 25225888261, "docs": 59}}, "bytes": 100244872278, "doc_count_after": 3884695, "docs": 3884695, "docs_per_sec": 1580.0673240571812, "errors": 0, "file_bytes_after": 43514536155, "json_docs": 3793185, "mb_per_sec": 40.77376656101788, "secs": 2458.562961751}, "put": {"100B": {"bytes": 500000, "concurrency": 16, "errors": 0, "max_ms": 6.728852, "mb_per_sec": 0.3823762229850376, "mean_ms": 4.130426707000001, "ops": 5000, "ops_per_sec": 3823.762229850376, "p50_ms": 4.092195, "p90_ms": 4.47952, "p95_ms": 4.638406000000001, "p99_ms": 5.613245999999999, "secs": 1.307612686}, "100KB": {"bytes": 300000000, "concurrency": 16, "errors": 0, "max_ms": 23.460725, "mb_per_sec": 88.90853232684954, "mean_ms": 17.925929810999982, "ops": 3000, "ops_per_sec": 889.0853232684955, "p50_ms": 17.886443, "p90_ms": 19.779222, "p95_ms": 20.187379, "p99_ms": 21.079167, "secs": 3.374254328}, "100MB": {"bytes": 2000000000, "concurrency": 4, "errors": 0, "max_ms": 12303.382993, "mb_per_sec": 38.273800187625625, "mean_ms": 9891.473617749998, "ops": 20, "ops_per_sec": 0.3827380018762563, "p50_ms": 9646.491393, "p90_ms": 10562.067509, "p95_ms": 11580.229661, "p99_ms": 12303.382993, "secs": 52.255067179}, "10KB": {"bytes": 50000000, "concurrency": 16, "errors": 0, "max_ms": 7.006977, "mb_per_sec": 33.13913532709298, "mean_ms": 4.721886877000002, "ops": 5000, "ops_per_sec": 3313.913532709298, "p50_ms": 4.721534999999999, "p90_ms": 5.101934, "p95_ms": 5.197189, "p99_ms": 5.3937029999999995, "secs": 1.508790121}, "10MB": {"bytes": 2000000000, "concurrency": 8, "errors": 0, "max_ms": 1368.125549, "mb_per_sec": 68.35797981463332, "mean_ms": 1145.5355137500003, "ops": 200, "ops_per_sec": 6.835797981463331, "p50_ms": 1107.710241, "p90_ms": 1315.618408, "p95_ms": 1331.941267, "p99_ms": 1355.537732, "secs": 29.257739995}, "1GB": {"bytes": 4000000000, "concurrency": 2, "errors": 0, "max_ms": 99851.686781, "mb_per_sec": 20.195791748547684, "mean_ms": 94306.946638, "ops": 4, "ops_per_sec": 0.020195791748547683, "p50_ms": 89690.722714, "p90_ms": 99851.686781, "p95_ms": 99851.686781, "p99_ms": 99851.686781, "secs": 198.061063899}, "1KB": {"bytes": 5000000, "concurrency": 16, "errors": 0, "max_ms": 6.516768, "mb_per_sec": 3.7854794792901263, "mean_ms": 4.160321837000003, "ops": 5000, "ops_per_sec": 3785.4794792901266, "p50_ms": 4.10537, "p90_ms": 4.532861, "p95_ms": 4.76915, "p99_ms": 5.783143, "secs": 1.320836641}, "1MB": {"bytes": 1000000000, "concurrency": 16, "errors": 0, "max_ms": 166.180552, "mb_per_sec": 115.38611923853496, "mean_ms": 137.70271648899995, "ops": 1000, "ops_per_sec": 115.38611923853496, "p50_ms": 134.385559, "p90_ms": 150.675111, "p95_ms": 153.074623, "p99_ms": 157.12700900000002, "secs": 8.666553712}}, "replicate": {"doc_write_failures": 0, "docs_per_sec": 2316.7021284449393, "docs_written": 3903920, "error": null, "mb_per_sec": 24.198853251905735, "ok": true, "reason": null, "secs": 1676.821526731, "source_docs": 3884696, "source_external_bytes": 40577158055, "target_docs": 3884696}, "scale": {"att_bytes": 4000, "doc_bytes": 1000, "measure_secs": 60, "per_host": 15000, "pool_docs": 100000, "steps": [{"clients": 15000, "connect_errors": 0, "connected": 15000, "generator_cpu_cores": 0.1316732230717873, "hosts": 1, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 1258.6409423621283, "mean_ms": 372.53838065627457, "ops": 105657, "ops_per_sec": 1760.4946081943876, "p50_ms": 157.35618571328448, "p90_ms": 972.9703858433363, "p95_ms": 1032.5239572200353, "p99_ms": 1117.6371372654303}, "get_att": {"max_ms": 2106.2325524164053, "mean_ms": 934.075506653426, "ops": 105735, "ops_per_sec": 1761.7942720069052, "p50_ms": 916.8517254330316, "p90_ms": 1727.844293516507, "p95_ms": 1833.602187034065, "p99_ms": 1945.8333096980457}, "put": {"max_ms": 10067.459468525274, "mean_ms": 7223.0103615680555, "ops": 105532, "ops_per_sec": 1758.4118136230454, "p50_ms": 7333.598704584966, "p90_ms": 9118.40821735725, "p95_ms": 9486.79190933848, "p99_ms": 9870.058302475756}}, "ops_per_sec": 5280.7006938243385, "secs": 60.015520359, "server_cpu_cores": 6.065092753612245, "server_footprint_bytes": 2053432320.0, "timeouts": 0, "window_end_unix": 1792652392.7517982, "window_start_unix": 1792652332.7362564}, {"clients": 30000, "connect_errors": 0, "connected": 30000, "generator_cpu_cores": 0.07864508865427623, "hosts": 2, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 2567.4857286069123, "mean_ms": 745.005466827503, "ops": 60517, "ops_per_sec": 1008.3470562592557, "p50_ms": 333.95684291625986, "p90_ms": 1907.6797153902417, "p95_ms": 2024.4449754098475, "p99_ms": 2191.3243475340278}, "get_att": {"max_ms": 4382.406669128173, "mean_ms": 1889.2134559706085, "ops": 60153, "ops_per_sec": 1002.28201125573, "p50_ms": 1870.2742307747467, "p90_ms": 3455.4977512311025, "p95_ms": 3667.001857588455, "p99_ms": 3891.4517072877293}, "put": {"max_ms": 39475.872843660356, "mean_ms": 28406.95119693994, "ops": 60587, "ops_per_sec": 1009.5134110676261, "p50_ms": 25033.85837008607, "p90_ms": 38701.836121235654, "p95_ms": 39475.872843660356, "p99_ms": 39475.872843660356}}, "ops_per_sec": 3020.142478582612, "secs": 60.016042715, "server_cpu_cores": 4.110714272379992, "server_footprint_bytes": 3839652864.0, "timeouts": 0, "window_end_unix": 1792652472.7715032, "window_start_unix": 1792652412.7554178}, {"clients": 45000, "connect_errors": 0, "connected": 45000, "generator_cpu_cores": 0.055355420442553815, "hosts": 3, "http_errors": 45000, "io_errors": 0, "ops": {"get": {"max_ms": 737.3899550946962, "mean_ms": 72.32706995248093, "ops": 45245, "ops_per_sec": 753.892716925062, "p50_ms": 2.411279634000652, "p90_ms": 290.72952881851785, "p95_ms": 496.2423011005685, "p99_ms": 593.0554862813246}, "get_att": {"max_ms": 2106.2325524164053, "mean_ms": 836.1698649911426, "ops": 45160, "ops_per_sec": 752.4764083619361, "p50_ms": 737.3899550946962, "p90_ms": 1833.602187034065, "p95_ms": 1870.2742307747467, "p99_ms": 1907.6797153902417}, "put": {"max_ms": 0.0, "mean_ms": 0.0, "ops": 0, "ops_per_sec": 0.0, "p50_ms": 0.0, "p90_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0}}, "ops_per_sec": 1506.369125286998, "secs": 60.015170573, "server_cpu_cores": 3.5550084832082827, "server_footprint_bytes": 7552578560.0, "timeouts": 0, "window_end_unix": 1792652552.7900321, "window_start_unix": 1792652492.7748168}, {"clients": 60000, "connect_errors": 0, "connected": 60000, "generator_cpu_cores": 0.07372621639988687, "hosts": 4, "http_errors": 60000, "io_errors": 0, "ops": {"get": {"max_ms": 160.50330942755016, "mean_ms": 5.982651158173395, "ops": 60440, "ops_per_sec": 1007.0642372762247, "p50_ms": 2.0580039498663734, "p90_ms": 7.604270202340077, "p95_ms": 27.00651424366245, "p99_ms": 99.78835635640529}, "get_att": {"max_ms": 486.5120599025182, "mean_ms": 166.9185480670146, "ops": 60166, "ops_per_sec": 1002.4987905354291, "p50_ms": 9.64405328775427, "p90_ms": 432.0087862818905, "p95_ms": 440.6489620075284, "p99_ms": 467.6202036740851}, "put": {"max_ms": 0.0, "mean_ms": 0.0, "ops": 0, "ops_per_sec": 0.0, "p50_ms": 0.0, "p90_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0}}, "ops_per_sec": 2009.5630278116537, "secs": 60.016032506, "server_cpu_cores": 4.598469391484222, "server_footprint_bytes": 11323433984.0, "timeouts": 0, "window_end_unix": 1792652632.8088818, "window_start_unix": 1792652572.7928069}, {"clients": 75000, "connect_errors": 0, "connected": 75000, "generator_cpu_cores": 0.09114123383917183, "hosts": 5, "http_errors": 75023, "io_errors": 0, "ops": {"get": {"max_ms": 166.98764312842314, "mean_ms": 7.864838825224546, "ops": 74261, "ops_per_sec": 1237.3774167826805, "p50_ms": 2.183970255629794, "p90_ms": 17.46886764048373, "p95_ms": 46.09705394372281, "p99_ms": 101.78412348353339}, "get_att": {"max_ms": 432.0087862818905, "mean_ms": 123.67803915077269, "ops": 74609, "ops_per_sec": 1243.1759832043606, "p50_ms": 40.130259514822555, "p90_ms": 347.4486993700767, "p95_ms": 361.48562682462773, "p99_ms": 407.0915280339863}, "put": {"max_ms": 0.0, "mean_ms": 0.0, "ops": 0, "ops_per_sec": 0.0, "p50_ms": 0.0, "p90_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0}}, "ops_per_sec": 2480.5533999870413, "secs": 60.014833787, "server_cpu_cores": 5.243170303540379, "server_footprint_bytes": 19407860736.0, "timeouts": 0, "window_end_unix": 1792652712.8259006, "window_start_unix": 1792652652.8110251}, {"clients": 90000, "connect_errors": 0, "connected": 90000, "generator_cpu_cores": 0.11055887298890182, "hosts": 6, "http_errors": 90023, "io_errors": 0, "ops": {"get": {"max_ms": 273.96092831802804, "mean_ms": 12.008150555377137, "ops": 90299, "ops_per_sec": 1504.668129033746, "p50_ms": 2.7154925061481867, "p90_ms": 37.07415669802582, "p95_ms": 69.8677532153476, "p99_ms": 139.7277897233723}, "get_att": {"max_ms": 547.8915983809319, "mean_ms": 145.84779729595056, "ops": 90309, "ops_per_sec": 1504.8347607936807, "p50_ms": 112.37789680870752, "p90_ms": 407.0915280339863, "p95_ms": 440.6489620075284, "p99_ms": 496.2423011005685}, "put": {"max_ms": 0.0, "mean_ms": 0.0, "ops": 0, "ops_per_sec": 0.0, "p50_ms": 0.0, "p90_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0}}, "ops_per_sec": 3009.5028898274268, "secs": 60.012569056, "server_cpu_cores": 5.936518756839144, "server_footprint_bytes": 25411724288.0, "timeouts": 0, "window_end_unix": 1792652792.8408039, "window_start_unix": 1792652732.8282032}], "warm_secs": 15}, "server": {"bands": [{"band": 2, "share": 0.01}, {"band": 3, "share": 0.04}, {"band": 4, "share": 0.1}, {"band": 5, "share": 0.15}, {"band": 6, "share": 0.2}, {"band": 7, "share": 0.25}, {"band": 8, "share": 0.25}], "dataset_bytes": 100244872278, "dataset_docs": 3884695, "json_max_bytes": 65536, "seed": 42, "url": "http://172.31.0.38:5984", "welcome": {"couchdb": "Welcome", "features": ["quickjs", "access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"], "git_sha": "7a1f97558", "uuid": "0c942a91f0101568dbeded292e37ebee", "vendor": {"name": "The Apache Software Foundation"}, "version": "3.5.3"}}, "view": {"build_secs": 358.956232966, "docs_indexed": 3884696, "docs_per_sec": 10822.199597709605, "index_file_bytes": 2001707928, "queries": {"group_level1_reduce": {"bytes": 124500, "errors": 0, "max_ms": 8.333077, "mb_per_sec": 0.2746834666869716, "mean_ms": 7.193023469999999, "ops": 500, "ops_per_sec": 1103.1464525581189, "p50_ms": 7.215339999999999, "p90_ms": 7.707455, "p95_ms": 7.838035, "p99_ms": 8.183848000000001, "secs": 0.453248976}, "include_docs_limit10": {"bytes": 190485630, "errors": 0, "max_ms": 9.052988999999998, "mb_per_sec": 222.65100703343415, "mean_ms": 6.812432882500006, "ops": 2000, "ops_per_sec": 2337.719722305921, "p50_ms": 6.754001, "p90_ms": 7.674356, "p95_ms": 7.973722, "p99_ms": 8.496576000000001, "secs": 0.855534554}, "key_lookup_limit20": {"bytes": 4440777, "errors": 0, "max_ms": 4.472506999999999, "mb_per_sec": 7.694959922953381, "mean_ms": 1.8395111273999971, "ops": 5000, "ops_per_sec": 8663.97921236912, "p50_ms": 1.801241, "p90_ms": 2.147099, "p95_ms": 2.354088, "p99_ms": 2.820717, "secs": 0.577102031}, "key_reduce": {"bytes": 131785, "errors": 0, "max_ms": 4.07169, "mb_per_sec": 0.33633741673865614, "mean_ms": 2.0739597070000064, "ops": 3000, "ops_per_sec": 7656.503017915304, "p50_ms": 2.002615, "p90_ms": 2.746933, "p95_ms": 2.938178, "p99_ms": 3.286529, "secs": 0.391823786}}, "reduce_expected": 100244872278, "reduce_total": 100244872278, "request_timeouts_during_build": 5, "rows": 3884695}, "view_compact": {"active_bytes_after": 174548094, "active_bytes_before": 187343028, "active_bytes_start": 187343028, "churn_docs": 200000, "churn_rounds": [{"active_bytes": 191016928, "file_bytes": 2022469067, "index_docs_per_sec": 422215.3236929613, "index_update_secs": 0.47369195, "write_secs": 15.926870502}, {"active_bytes": 191027063, "file_bytes": 2046870620, "index_docs_per_sec": 453551.5015837281, "index_update_secs": 0.440964255, "write_secs": 39.44340862}, {"active_bytes": 191026945, "file_bytes": 2073097213, "index_docs_per_sec": 377573.9470835097, "index_update_secs": 0.529697564, "write_secs": 42.177770957}, {"active_bytes": 191030379, "file_bytes": 2099859280, "index_docs_per_sec": 401488.3437886552, "index_update_secs": 0.498146467, "write_secs": 49.676491886}, {"active_bytes": 187343028, "file_bytes": 2103876303, "index_docs_per_sec": 2091464.7740862493, "index_update_secs": 0.09562676, "write_secs": 49.207089382}], "ended_unix": 1792652246.9942672, "file_bytes_after": 174698667, "file_bytes_before": 2103876303, "file_bytes_start": 2002903211, "live_mb_per_sec": 5.926239700346057, "reclaimed_bytes": 1929177636, "secs": 29.45343132, "started_unix": 1792652217.5391424, "resources": {"rss_before_bytes": 359550976.0, "rss_peak_bytes": 338759680.0, "disk_before_bytes": 39068637664.0, "disk_peak_bytes": 39243725737.0, "footprint_before_bytes": 338340864.0, "footprint_peak_bytes": 318225408.0, "rss_peak_extra_bytes": -20791296.0, "disk_peak_extra_bytes": 175088073.0, "footprint_peak_extra_bytes": -20115456.0}}}, "hybrid": {"compact": {"active_bytes_after": 55423352289, "active_bytes_before": 55217099547, "dead_bytes_after": 5173973425, "file_bytes_after": 60597325714, "file_bytes_before": 60567142304, "live_mb_per_sec": 333.3147327558377, "reclaimed_bytes": 0, "secs": 166.279335542, "resources": {"samples": 171, "duration_secs": 172.6598436832428, "rss_start_bytes": 15343616, "rss_peak_bytes": 231784448, "disk_start_bytes": 61843028351, "disk_peak_bytes": 112872975048, "disk_peak_extra_bytes": 51029946697, "disk_peak_at_secs": 169.6133165359497, "free_min_bytes": 3607813558272, "t0_unix": 1792647611.742448, "footprint_start_bytes": 13337600, "footprint_peak_bytes": 229655552}}, "delete": {"100B": {"bytes": 0, "errors": 0, "max_ms": 14.759752, "mb_per_sec": 0.0, "mean_ms": 1.3754587918000016, "ops": 5000, "ops_per_sec": 11277.600192540212, "p50_ms": 1.063573, "p90_ms": 1.455114, "p95_ms": 1.6100070000000002, "p99_ms": 12.723033, "secs": 0.443356735}, "100KB": {"bytes": 0, "errors": 0, "max_ms": 1.900058, "mb_per_sec": 0.0, "mean_ms": 1.0455564590000026, "ops": 3000, "ops_per_sec": 14589.610523392696, "p50_ms": 1.029016, "p90_ms": 1.379733, "p95_ms": 1.478015, "p99_ms": 1.642722, "secs": 0.205625777}, "100MB": {"bytes": 0, "errors": 0, "max_ms": 1.336718, "mb_per_sec": 0.0, "mean_ms": 1.1784531, "ops": 20, "ops_per_sec": 7485.060754366877, "p50_ms": 1.263589, "p90_ms": 1.317783, "p95_ms": 1.319394, "p99_ms": 1.336718, "secs": 0.002671989}, "10KB": {"bytes": 0, "errors": 0, "max_ms": 2.291945, "mb_per_sec": 0.0, "mean_ms": 1.402852767599999, "ops": 5000, "ops_per_sec": 11010.9245195927, "p50_ms": 1.406637, "p90_ms": 1.791995, "p95_ms": 1.903127, "p99_ms": 2.117223, "secs": 0.454094476}, "10MB": {"bytes": 0, "errors": 0, "max_ms": 1.7320129999999998, "mb_per_sec": 0.0, "mean_ms": 1.092950489999999, "ops": 200, "ops_per_sec": 13429.271151152425, "p50_ms": 1.04237, "p90_ms": 1.432033, "p95_ms": 1.511812, "p99_ms": 1.70018, "secs": 0.014892841}, "1GB": {"bytes": 0, "errors": 0, "max_ms": 1.820572, "mb_per_sec": 0.0, "mean_ms": 1.6384884999999998, "ops": 4, "ops_per_sec": 2195.370402894376, "p50_ms": 1.77758, "p90_ms": 1.820572, "p95_ms": 1.820572, "p99_ms": 1.820572, "secs": 0.001822016}, "1KB": {"bytes": 0, "errors": 0, "max_ms": 1.916704, "mb_per_sec": 0.0, "mean_ms": 1.0970759616000014, "ops": 5000, "ops_per_sec": 13967.49422170351, "p50_ms": 1.0961949999999998, "p90_ms": 1.450763, "p95_ms": 1.530091, "p99_ms": 1.66989, "secs": 0.357974016}, "1MB": {"bytes": 0, "errors": 0, "max_ms": 1.890721, "mb_per_sec": 0.0, "mean_ms": 1.114724109999999, "ops": 1000, "ops_per_sec": 13654.043512542015, "p50_ms": 1.135716, "p90_ms": 1.440038, "p95_ms": 1.515268, "p99_ms": 1.631238, "secs": 0.073238378}}, "get": {"100B": {"avg_doc_bytes": 388, "band": "1e2", "bytes": 2166795, "concurrency": 16, "errors": 0, "max_ms": 1.374658, "mb_per_sec": 14.582043698060309, "mean_ms": 0.4430043130000001, "ops": 5000, "ops_per_sec": 33648.877023577006, "p50_ms": 0.364846, "p90_ms": 0.831244, "p95_ms": 0.925342, "p99_ms": 1.123631, "secs": 0.148593369}, "100KB": {"avg_doc_bytes": 393662, "band": "1e5", "bytes": 1180988949, "concurrency": 16, "errors": 0, "max_ms": 217.157136, "mb_per_sec": 1337.864195374634, "mean_ms": 4.092637994, "ops": 3000, "ops_per_sec": 3398.501391162384, "p50_ms": 3.638546, "p90_ms": 7.076655000000001, "p95_ms": 8.14851, "p99_ms": 11.699527, "secs": 0.882742025}, "100MB": {"avg_doc_bytes": 500864507, "band": "1e8", "bytes": 10017290149, "concurrency": 4, "errors": 0, "max_ms": 2528.912504, "mb_per_sec": 1536.2477416842307, "mean_ms": 1215.3251205, "ops": 20, "ops_per_sec": 3.0671922622458734, "p50_ms": 1019.072676, "p90_ms": 2101.715191, "p95_ms": 2220.47398, "p99_ms": 2528.912504, "secs": 6.520621562}, "10KB": {"avg_doc_bytes": 39282, "band": "1e4", "bytes": 196595163, "concurrency": 16, "errors": 0, "max_ms": 1.240803, "mb_per_sec": 1428.694660410836, "mean_ms": 0.4283728710000012, "ops": 5000, "ops_per_sec": 36335.95655684661, "p50_ms": 0.405804, "p90_ms": 0.6042829999999999, "p95_ms": 0.6808460000000001, "p99_ms": 0.8966080000000001, "secs": 0.137604744}, "10MB": {"avg_doc_bytes": 37326922, "band": "1e7", "bytes": 7465384430, "concurrency": 8, "errors": 0, "max_ms": 1042.318308, "mb_per_sec": 1548.8481210819298, "mean_ms": 189.97698157, "ops": 200, "ops_per_sec": 41.494128952229445, "p50_ms": 142.819113, "p90_ms": 386.332686, "p95_ms": 519.7065699999999, "p99_ms": 754.144801, "secs": 4.819958993}, "1KB": {"avg_doc_bytes": 3897, "band": "1e3", "bytes": 19713813, "concurrency": 16, "errors": 0, "max_ms": 1.862389, "mb_per_sec": 120.22848581129098, "mean_ms": 0.4929972650000002, "ops": 5000, "ops_per_sec": 30493.46308887352, "p50_ms": 0.43584, "p90_ms": 0.843541, "p95_ms": 0.93253, "p99_ms": 1.238802, "secs": 0.163969569}, "1MB": {"avg_doc_bytes": 3885492, "band": "1e6", "bytes": 3885492543, "concurrency": 16, "errors": 0, "max_ms": 308.317364, "mb_per_sec": 1550.260241076212, "mean_ms": 39.84364613000007, "ops": 1000, "ops_per_sec": 398.9868012664494, "p50_ms": 29.44139, "p90_ms": 82.663511, "p95_ms": 110.163701, "p99_ms": 167.85260499999998, "secs": 2.506348573}}, "load": {"attachment_docs": 91510, "bands": {"1e2": {"bytes": 1000000099, "docs": 2560333}, "1e3": {"bytes": 4000004487, "docs": 1024214}, "1e4": {"bytes": 10000051309, "docs": 255765}, "1e5": {"bytes": 15000224033, "docs": 38583}, "1e6": {"bytes": 20005163650, "docs": 5101}, "1e7": {"bytes": 25013540439, "docs": 640}, "1e8": {"bytes": 25225888261, "docs": 59}}, "bytes": 100244872278, "doc_count_after": 3884695, "docs": 3884695, "docs_per_sec": 14094.060059411266, "errors": 0, "file_bytes_after": 59341709061, "json_docs": 3793185, "mb_per_sec": 363.698372854019, "secs": 275.626397477}, "put": {"100B": {"bytes": 500000, "concurrency": 16, "errors": 0, "max_ms": 1.705183, "mb_per_sec": 1.633311089596266, "mean_ms": 0.9377289712000008, "ops": 5000, "ops_per_sec": 16333.110895962662, "p50_ms": 0.913208, "p90_ms": 1.270968, "p95_ms": 1.34605, "p99_ms": 1.52136, "secs": 0.306126618}, "100KB": {"bytes": 300000000, "concurrency": 16, "errors": 0, "max_ms": 24.515433, "mb_per_sec": 519.6495887114677, "mean_ms": 3.0267813446666625, "ops": 3000, "ops_per_sec": 5196.495887114677, "p50_ms": 2.695317, "p90_ms": 3.422331, "p95_ms": 3.739415, "p99_ms": 20.07471, "secs": 0.577312109}, "100MB": {"bytes": 2000000000, "concurrency": 4, "errors": 0, "max_ms": 1482.024211, "mb_per_sec": 351.54752410980376, "mean_ms": 1119.00896665, "ops": 20, "ops_per_sec": 3.5154752410980374, "p50_ms": 1094.736734, "p90_ms": 1186.917319, "p95_ms": 1305.835634, "p99_ms": 1482.024211, "secs": 5.689131235}, "10KB": {"bytes": 50000000, "concurrency": 16, "errors": 0, "max_ms": 2.872564, "mb_per_sec": 89.21120508722544, "mean_ms": 1.7165071142000004, "ops": 5000, "ops_per_sec": 8921.120508722543, "p50_ms": 1.722831, "p90_ms": 2.1070529999999996, "p95_ms": 2.258322, "p99_ms": 2.500472, "secs": 0.560467712}, "10MB": {"bytes": 2000000000, "concurrency": 8, "errors": 0, "max_ms": 199.174214, "mb_per_sec": 574.4007851511903, "mean_ms": 137.60185556500002, "ops": 200, "ops_per_sec": 57.44007851511903, "p50_ms": 133.880615, "p90_ms": 178.091762, "p95_ms": 181.737033, "p99_ms": 192.513886, "secs": 3.481889391}, "1GB": {"bytes": 4000000000, "concurrency": 2, "errors": 0, "max_ms": 10041.36421, "mb_per_sec": 199.39715376170815, "mean_ms": 10025.976033, "ops": 4, "ops_per_sec": 0.19939715376170816, "p50_ms": 10019.056245, "p90_ms": 10041.36421, "p95_ms": 10041.36421, "p99_ms": 10041.36421, "secs": 20.060466885}, "1KB": {"bytes": 5000000, "concurrency": 16, "errors": 0, "max_ms": 1.891858, "mb_per_sec": 14.67827997695874, "mean_ms": 1.0437860809999968, "ops": 5000, "ops_per_sec": 14678.27997695874, "p50_ms": 1.041509, "p90_ms": 1.3708870000000002, "p95_ms": 1.462777, "p99_ms": 1.626569, "secs": 0.340639367}, "1MB": {"bytes": 1000000000, "concurrency": 16, "errors": 0, "max_ms": 72.38109800000001, "mb_per_sec": 563.7260957318597, "mean_ms": 28.276043779, "ops": 1000, "ops_per_sec": 563.7260957318597, "p50_ms": 21.645266, "p90_ms": 51.399765, "p95_ms": 56.789244, "p99_ms": 62.82388, "secs": 1.773911138}}, "replicate": {"doc_write_failures": 0, "docs_per_sec": 3955.974451043901, "docs_written": 3903920, "error": null, "mb_per_sec": 101.99089867515332, "ok": true, "reason": null, "secs": 981.982074979, "source_docs": 3884696, "source_external_bytes": 100153234310, "target_docs": 3884696}, "scale": {"att_bytes": 4000, "doc_bytes": 1000, "measure_secs": 60, "per_host": 15000, "pool_docs": 100000, "steps": [{"clients": 15000, "connect_errors": 0, "connected": 15000, "generator_cpu_cores": 0.5517175610098901, "hosts": 1, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 17.46886764048373, "mean_ms": 0.9882630702108718, "ops": 497601, "ops_per_sec": 8291.282795816012, "p50_ms": 0.8610703725837547, "p90_ms": 1.9393030865451197, "p95_ms": 2.317646707036382, "p99_ms": 3.119247322421447}, "get_att": {"max_ms": 18.53810209102246, "mean_ms": 0.9856479712454292, "ops": 498286, "ops_per_sec": 8302.696616759165, "p50_ms": 0.8610703725837547, "p90_ms": 1.9012775358285487, "p95_ms": 2.2722026539572378, "p99_ms": 3.0580856102171046}, "put": {"max_ms": 2467.7871286110267, "mean_ms": 1787.021252015416, "ops": 497664, "ops_per_sec": 8292.332534092535, "p50_ms": 1727.844293516507, "p90_ms": 2325.4509281978903, "p95_ms": 2371.9599467618477, "p99_ms": 2419.3991456970857}}, "ops_per_sec": 24886.311946667716, "secs": 60.014959356, "server_cpu_cores": 4.098469391078745, "server_footprint_bytes": 1252377600.0, "timeouts": 0, "window_end_unix": 1792648051.6386225, "window_start_unix": 1792647991.623643}, {"clients": 30000, "connect_errors": 0, "connected": 30000, "generator_cpu_cores": 0.5061588832599703, "hosts": 2, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 18.53810209102246, "mean_ms": 1.0404645320912704, "ops": 454298, "ops_per_sec": 7569.755445686643, "p50_ms": 0.913774767948861, "p90_ms": 2.0176509312415423, "p95_ms": 2.411279634000652, "p99_ms": 3.2452649142472727}, "get_att": {"max_ms": 19.28704141549977, "mean_ms": 1.0393675051168447, "ops": 453893, "ops_per_sec": 7563.007119795921, "p50_ms": 0.913774767948861, "p90_ms": 2.0176509312415423, "p95_ms": 2.411279634000652, "p99_ms": 3.1816322688698757}, "put": {"max_ms": 4559.45589856095, "mean_ms": 3921.7524352107357, "ops": 455168, "ops_per_sec": 7584.251849451897, "p50_ms": 3969.2807414334834, "p90_ms": 4382.406669128173, "p95_ms": 4470.054802510736, "p99_ms": 4559.45589856095}}, "ops_per_sec": 22717.014414934463, "secs": 60.014884663, "server_cpu_cores": 3.994077824511719, "server_footprint_bytes": 1889485824.0, "timeouts": 0, "window_end_unix": 1792648131.6557422, "window_start_unix": 1792648071.640825}, {"clients": 45000, "connect_errors": 0, "connected": 45000, "generator_cpu_cores": 0.4773400922343636, "hosts": 3, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 24.460632016595554, "mean_ms": 1.0678451229077974, "ops": 429631, "ops_per_sec": 7159.053514343418, "p50_ms": 0.9320502633078384, "p90_ms": 2.0580039498663734, "p95_ms": 2.4595052266806654, "p99_ms": 3.376373616782864}, "get_att": {"max_ms": 23.981011780976033, "mean_ms": 1.0698640804792163, "ops": 428533, "ops_per_sec": 7140.757253694747, "p50_ms": 0.9320502633078384, "p90_ms": 2.0580039498663734, "p95_ms": 2.4595052266806654, "p99_ms": 3.310170212532219}, "put": {"max_ms": 6910.6138519356855, "mean_ms": 6227.626749049136, "ops": 428032, "ops_per_sec": 7132.408959901501, "p50_ms": 6384.338998146256, "p90_ms": 6642.266293671364, "p95_ms": 6775.111619544793, "p99_ms": 6910.6138519356855}}, "ops_per_sec": 21432.219727939664, "secs": 60.012262674, "server_cpu_cores": 3.9067226890756293, "server_footprint_bytes": 2463312896.0, "timeouts": 0, "window_end_unix": 1792648211.6696193, "window_start_unix": 1792648151.657328}, {"clients": 60000, "connect_errors": 0, "connected": 60000, "generator_cpu_cores": 0.4715636584436505, "hosts": 4, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 29.817373937775084, "mean_ms": 1.0755264652271452, "ops": 427920, "ops_per_sec": 7130.626615168288, "p50_ms": 0.9320502633078384, "p90_ms": 2.099164028863701, "p95_ms": 2.5086953312142786, "p99_ms": 3.376373616782864}, "get_att": {"max_ms": 28.659528967488548, "mean_ms": 1.0781416387585472, "ops": 428788, "ops_per_sec": 7145.090496038464, "p50_ms": 0.9320502633078384, "p90_ms": 2.0580039498663734, "p95_ms": 2.4595052266806654, "p99_ms": 3.310170212532219}, "put": {"max_ms": 9118.40821735725, "mean_ms": 8305.865799099458, "ops": 427520, "ops_per_sec": 7123.961232278805, "p50_ms": 8258.823259066743, "p90_ms": 8939.615899369854, "p95_ms": 9118.40821735725, "p99_ms": 9118.40821735725}}, "ops_per_sec": 21399.678343485557, "secs": 60.01155622, "server_cpu_cores": 3.8988095269712537, "server_footprint_bytes": 3043945472.0, "timeouts": 0, "window_end_unix": 1792648291.6847975, "window_start_unix": 1792648231.6732116}, {"clients": 75000, "connect_errors": 0, "connected": 75000, "generator_cpu_cores": 0.47779875065495814, "hosts": 5, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 35.63452200886757, "mean_ms": 1.0973517579337055, "ops": 420579, "ops_per_sec": 7008.001408898965, "p50_ms": 0.9320502633078384, "p90_ms": 2.099164028863701, "p95_ms": 2.5086953312142786, "p99_ms": 3.4439010891185196}, "get_att": {"max_ms": 33.57920596986413, "mean_ms": 1.0950803514376997, "ops": 419420, "ops_per_sec": 6988.689285295756, "p50_ms": 0.9320502633078384, "p90_ms": 2.099164028863701, "p95_ms": 2.5086953312142786, "p99_ms": 3.4439010891185196}, "put": {"max_ms": 11115.288736192826, "mean_ms": 10728.768914661217, "ops": 419856, "ops_per_sec": 6995.954242923883, "p50_ms": 10897.341898228264, "p90_ms": 11115.288736192826, "p95_ms": 11115.288736192826, "p99_ms": 11115.288736192826}}, "ops_per_sec": 20992.644937118603, "secs": 60.014114647, "server_cpu_cores": 3.912690345859309, "server_footprint_bytes": 3603434496.0, "timeouts": 0, "window_end_unix": 1792648371.7014878, "window_start_unix": 1792648311.6873307}, {"clients": 90000, "connect_errors": 0, "connected": 90000, "generator_cpu_cores": 0.47324865033173896, "hosts": 6, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 36.34721244904492, "mean_ms": 1.1116429557694858, "ops": 414985, "ops_per_sec": 6914.894878897826, "p50_ms": 0.9320502633078384, "p90_ms": 2.1411473094409743, "p95_ms": 2.558869237838564, "p99_ms": 3.5830346931189085}, "get_att": {"max_ms": 35.63452200886757, "mean_ms": 1.110058582770115, "ops": 413398, "ops_per_sec": 6888.450698571282, "p50_ms": 0.9506912685739952, "p90_ms": 2.099164028863701, "p95_ms": 2.5086953312142786, "p99_ms": 3.4439010891185196}, "put": {"max_ms": 13820.464444970627, "mean_ms": 12957.609076169456, "ops": 413184, "ops_per_sec": 6884.884816662095, "p50_ms": 13283.798966715327, "p90_ms": 13549.474946049631, "p95_ms": 13820.464444970627, "p99_ms": 13820.464444970627}}, "ops_per_sec": 20688.230394131202, "secs": 60.013204433, "server_cpu_cores": 3.906506858884082, "server_footprint_bytes": 4155715584.0, "timeouts": 0, "window_end_unix": 1792648451.7169142, "window_start_unix": 1792648391.70368}], "warm_secs": 15}, "server": {"bands": [{"band": 2, "share": 0.01}, {"band": 3, "share": 0.04}, {"band": 4, "share": 0.1}, {"band": 5, "share": 0.15}, {"band": 6, "share": 0.2}, {"band": 7, "share": 0.25}, {"band": 8, "share": 0.25}], "dataset_bytes": 100244872278, "dataset_docs": 3884695, "json_max_bytes": 65536, "seed": 42, "url": "http://172.31.9.207:5984", "welcome": {"couchdb": "Welcome", "features": ["access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"], "git_sha": "rust", "uuid": "d98b6ae1db48456cb27cdd4437f0b7a7", "vendor": {"name": "couchdb-rs"}, "version": "3.5.0"}}, "view": {"build_secs": 38.833095633, "docs_indexed": 3884696, "docs_per_sec": 100035.70245115412, "index_file_bytes": 213442715, "queries": {"group_level1_reduce": {"bytes": 116500, "errors": 0, "max_ms": 1.39086, "mb_per_sec": 2.4693142661293384, "mean_ms": 0.7284229640000013, "ops": 500, "ops_per_sec": 10597.91530527613, "p50_ms": 0.749006, "p90_ms": 1.0207739999999998, "p95_ms": 1.1349859999999998, "p99_ms": 1.285758, "secs": 0.04717909}, "include_docs_limit10": {"bytes": 190441630, "errors": 0, "max_ms": 4.055271, "mb_per_sec": 1082.0585953350776, "mean_ms": 1.3669451609999987, "ops": 2000, "ops_per_sec": 11363.67710500144, "p50_ms": 1.117148, "p90_ms": 2.427566, "p95_ms": 2.652894, "p99_ms": 3.157105, "secs": 0.175999369}, "key_lookup_limit20": {"bytes": 4278293, "errors": 0, "max_ms": 1.975195, "mb_per_sec": 19.204096255740033, "mean_ms": 0.6622806778000009, "ops": 5000, "ops_per_sec": 22443.643125587747, "p50_ms": 0.6710480000000001, "p90_ms": 1.001294, "p95_ms": 1.100012, "p99_ms": 1.290942, "secs": 0.222780231}, "key_reduce": {"bytes": 119785, "errors": 0, "max_ms": 1.361001, "mb_per_sec": 1.1105083824586237, "mean_ms": 0.5357493833333341, "ops": 3000, "ops_per_sec": 27812.540362949203, "p50_ms": 0.496363, "p90_ms": 0.856236, "p95_ms": 0.934658, "p99_ms": 1.119044, "secs": 0.107865012}}, "reduce_expected": 100244872278, "reduce_total": 100244872278, "request_timeouts_during_build": 0, "rows": 3884695}, "view_compact": {"active_bytes_after": 213441532, "active_bytes_before": 213442110, "active_bytes_start": 213441849, "churn_docs": 200000, "churn_rounds": [{"active_bytes": 218130984, "file_bytes": 240799903, "index_docs_per_sec": 41747.736282645914, "index_update_secs": 4.790678916, "write_secs": 5.125509581}, {"active_bytes": 218135943, "file_bytes": 273563809, "index_docs_per_sec": 24882.58761620796, "index_update_secs": 8.037749252, "write_secs": 6.310418678}, {"active_bytes": 218133057, "file_bytes": 306147487, "index_docs_per_sec": 24975.90781473148, "index_update_secs": 8.007716936, "write_secs": 8.69502314}, {"active_bytes": 218129996, "file_bytes": 338833567, "index_docs_per_sec": 24355.579977685804, "index_update_secs": 8.211670598, "write_secs": 10.604020895}, {"active_bytes": 213442110, "file_bytes": 357707932, "index_docs_per_sec": 49660.132915837385, "index_update_secs": 4.027375447, "write_secs": 12.01450424}], "ended_unix": 1792647944.2663918, "file_bytes_after": 213442715, "file_bytes_before": 357707932, "file_bytes_start": 213446814, "live_mb_per_sec": 13.87272292726556, "reclaimed_bytes": 144265217, "secs": 15.385698476, "started_unix": 1792647928.8799355, "resources": {"rss_before_bytes": 8031031296.0, "rss_peak_bytes": 8139116544.0, "disk_before_bytes": 56907408441.0, "disk_peak_bytes": 57123473946.0, "footprint_before_bytes": 8028905472.0, "footprint_peak_bytes": 8136990720.0, "rss_peak_extra_bytes": 108085248.0, "disk_peak_extra_bytes": 216065505.0, "footprint_peak_extra_bytes": 108085248.0}}}, "hybrid_inline": {"compact": {"active_bytes_after": 55414584410, "active_bytes_before": 55216684348, "dead_bytes_after": 5144610907, "file_bytes_after": 60559195317, "file_bytes_before": 60567132440, "live_mb_per_sec": 332.0301005457191, "reclaimed_bytes": 7937123, "secs": 166.896267293, "resources": {"samples": 171, "duration_secs": 172.8743896484375, "rss_start_bytes": 15298560, "rss_peak_bytes": 281223168, "disk_start_bytes": 61851741509, "disk_peak_bytes": 112671809538, "disk_peak_extra_bytes": 50820068029, "disk_peak_at_secs": 169.82278609275818, "free_min_bytes": 3607814545408, "t0_unix": 1792647613.6156678, "footprint_start_bytes": 13292544, "footprint_peak_bytes": 279094272}}, "delete": {"100B": {"bytes": 0, "errors": 0, "max_ms": 14.721454, "mb_per_sec": 0.0, "mean_ms": 1.2013126352, "ops": 5000, "ops_per_sec": 12819.80822413004, "p50_ms": 0.872015, "p90_ms": 1.232623, "p95_ms": 1.429866, "p99_ms": 12.371821, "secs": 0.390021435}, "100KB": {"bytes": 0, "errors": 0, "max_ms": 1.439029, "mb_per_sec": 0.0, "mean_ms": 0.6462456979999994, "ops": 3000, "ops_per_sec": 23466.63162316344, "p50_ms": 0.6260330000000001, "p90_ms": 0.889002, "p95_ms": 0.970616, "p99_ms": 1.093583, "secs": 0.1278411}, "100MB": {"bytes": 0, "errors": 0, "max_ms": 0.984992, "mb_per_sec": 0.0, "mean_ms": 0.8609650999999999, "ops": 20, "ops_per_sec": 12023.277064396672, "p50_ms": 0.936697, "p90_ms": 0.954934, "p95_ms": 0.964747, "p99_ms": 0.984992, "secs": 0.00166344}, "10KB": {"bytes": 0, "errors": 0, "max_ms": 1.93445, "mb_per_sec": 0.0, "mean_ms": 1.0289990445999964, "ops": 5000, "ops_per_sec": 14925.647053367416, "p50_ms": 1.017451, "p90_ms": 1.2796420000000002, "p95_ms": 1.37202, "p99_ms": 1.545096, "secs": 0.334993852}, "10MB": {"bytes": 0, "errors": 0, "max_ms": 1.310585, "mb_per_sec": 0.0, "mean_ms": 0.7052334099999998, "ops": 200, "ops_per_sec": 20732.75141337758, "p50_ms": 0.698378, "p90_ms": 0.8794690000000001, "p95_ms": 0.902831, "p99_ms": 1.07957, "secs": 0.009646573}, "1GB": {"bytes": 0, "errors": 0, "max_ms": 1.277412, "mb_per_sec": 0.0, "mean_ms": 1.24403975, "ops": 4, "ops_per_sec": 3127.3552894523687, "p50_ms": 1.238806, "p90_ms": 1.277412, "p95_ms": 1.277412, "p99_ms": 1.277412, "secs": 0.001279036}, "1KB": {"bytes": 0, "errors": 0, "max_ms": 12.756332, "mb_per_sec": 0.0, "mean_ms": 1.2324083999999982, "ops": 5000, "ops_per_sec": 12496.12498288312, "p50_ms": 0.886324, "p90_ms": 1.389074, "p95_ms": 1.558685, "p99_ms": 11.171969, "secs": 0.400124039}, "1MB": {"bytes": 0, "errors": 0, "max_ms": 1.195944, "mb_per_sec": 0.0, "mean_ms": 0.6743028889999994, "ops": 1000, "ops_per_sec": 22139.17081277988, "p50_ms": 0.6527689999999999, "p90_ms": 0.919152, "p95_ms": 0.981719, "p99_ms": 1.114986, "secs": 0.04516881}}, "get": {"100B": {"avg_doc_bytes": 388, "band": "1e2", "bytes": 2166795, "concurrency": 16, "errors": 0, "max_ms": 1.163212, "mb_per_sec": 21.862256709313336, "mean_ms": 0.2831062623999998, "ops": 5000, "ops_per_sec": 50448.37354090565, "p50_ms": 0.2102, "p90_ms": 0.510466, "p95_ms": 0.689531, "p99_ms": 0.899879, "secs": 0.099111223}, "100KB": {"avg_doc_bytes": 393662, "band": "1e5", "bytes": 1180988949, "concurrency": 16, "errors": 0, "max_ms": 77.824235, "mb_per_sec": 1527.8965892006706, "mean_ms": 4.057509199999997, "ops": 3000, "ops_per_sec": 3881.2300246189784, "p50_ms": 3.3938319999999997, "p90_ms": 7.603669, "p95_ms": 9.807952, "p99_ms": 14.379654, "secs": 0.772950838}, "100MB": {"avg_doc_bytes": 500864507, "band": "1e8", "bytes": 10017290149, "concurrency": 4, "errors": 0, "max_ms": 6323.406673, "mb_per_sec": 1532.9233765604529, "mean_ms": 1226.86395565, "ops": 20, "ops_per_sec": 3.0605550079099593, "p50_ms": 766.070041, "p90_ms": 1710.526509, "p95_ms": 2653.213283, "p99_ms": 6323.406673, "secs": 6.534762469}, "10KB": {"avg_doc_bytes": 39282, "band": "1e4", "bytes": 196595163, "concurrency": 16, "errors": 0, "max_ms": 1.550467, "mb_per_sec": 1428.8449331650422, "mean_ms": 0.42724723379999896, "ops": 5000, "ops_per_sec": 36339.778440150185, "p50_ms": 0.389527, "p90_ms": 0.6265809999999999, "p95_ms": 0.744371, "p99_ms": 1.046848, "secs": 0.137590272}, "10MB": {"avg_doc_bytes": 37326922, "band": "1e7", "bytes": 7465384430, "concurrency": 8, "errors": 0, "max_ms": 1589.979324, "mb_per_sec": 1550.9635487824255, "mean_ms": 190.3141425, "ops": 200, "ops_per_sec": 41.55080192655063, "p50_ms": 128.395295, "p90_ms": 383.229455, "p95_ms": 545.6990529999999, "p99_ms": 963.489618, "secs": 4.813384838}, "1KB": {"avg_doc_bytes": 3897, "band": "1e3", "bytes": 19713813, "concurrency": 16, "errors": 0, "max_ms": 1.559038, "mb_per_sec": 191.61694637313568, "mean_ms": 0.30842272680000077, "ops": 5000, "ops_per_sec": 48599.666227212285, "p50_ms": 0.24479, "p90_ms": 0.528991, "p95_ms": 0.644383, "p99_ms": 0.844619, "secs": 0.102881365}, "1MB": {"avg_doc_bytes": 3885492, "band": "1e6", "bytes": 3885492543, "concurrency": 16, "errors": 0, "max_ms": 511.227168, "mb_per_sec": 1550.376910817174, "mean_ms": 39.914588381, "ops": 1000, "ops_per_sec": 399.016828280958, "p50_ms": 24.903774, "p90_ms": 90.070398, "p95_ms": 130.00548, "p99_ms": 250.10708999999997, "secs": 2.506159964}}, "load": {"attachment_docs": 91510, "bands": {"1e2": {"bytes": 1000000099, "docs": 2560333}, "1e3": {"bytes": 4000004487, "docs": 1024214}, "1e4": {"bytes": 10000051309, "docs": 255765}, "1e5": {"bytes": 15000224033, "docs": 38583}, "1e6": {"bytes": 20005163650, "docs": 5101}, "1e7": {"bytes": 25013540439, "docs": 640}, "1e8": {"bytes": 25225888261, "docs": 59}}, "bytes": 100244872278, "doc_count_after": 3884695, "docs": 3884695, "docs_per_sec": 14093.82344452894, "errors": 0, "file_bytes_after": 59360940738, "json_docs": 3793185, "mb_per_sec": 363.6922669876234, "secs": 275.631024845}, "put": {"100B": {"bytes": 500000, "concurrency": 16, "errors": 0, "max_ms": 1.807566, "mb_per_sec": 1.652642119777148, "mean_ms": 0.9249442089999992, "ops": 5000, "ops_per_sec": 16526.42119777148, "p50_ms": 0.905858, "p90_ms": 1.259442, "p95_ms": 1.350057, "p99_ms": 1.53769, "secs": 0.302545841}, "100KB": {"bytes": 300000000, "concurrency": 16, "errors": 0, "max_ms": 30.600631, "mb_per_sec": 384.0657569736356, "mean_ms": 4.028405904999997, "ops": 3000, "ops_per_sec": 3840.657569736355, "p50_ms": 2.709446, "p90_ms": 3.664606, "p95_ms": 18.790164, "p99_ms": 27.414250000000003, "secs": 0.78111624}, "100MB": {"bytes": 2000000000, "concurrency": 4, "errors": 0, "max_ms": 1252.3581479999998, "mb_per_sec": 360.82235633021, "mean_ms": 1073.1578379500002, "ops": 20, "ops_per_sec": 3.6082235633021, "p50_ms": 1065.504086, "p90_ms": 1136.272468, "p95_ms": 1148.526715, "p99_ms": 1252.3581479999998, "secs": 5.542893795}, "10KB": {"bytes": 50000000, "concurrency": 16, "errors": 0, "max_ms": 2.664494, "mb_per_sec": 89.87406247804321, "mean_ms": 1.6962383969999997, "ops": 5000, "ops_per_sec": 8987.406247804322, "p50_ms": 1.701551, "p90_ms": 2.1099360000000003, "p95_ms": 2.239252, "p99_ms": 2.443141, "secs": 0.556334037}, "10MB": {"bytes": 2000000000, "concurrency": 8, "errors": 0, "max_ms": 239.302651, "mb_per_sec": 551.3383358506329, "mean_ms": 142.68199380500008, "ops": 200, "ops_per_sec": 55.13383358506329, "p50_ms": 132.541434, "p90_ms": 198.719539, "p95_ms": 214.802786, "p99_ms": 239.118202, "secs": 3.627536614}, "1GB": {"bytes": 4000000000, "concurrency": 2, "errors": 0, "max_ms": 9987.688619, "mb_per_sec": 200.6611508811791, "mean_ms": 9938.59918275, "ops": 4, "ops_per_sec": 0.2006611508811791, "p50_ms": 9919.834867, "p90_ms": 9987.688619, "p95_ms": 9987.688619, "p99_ms": 9987.688619, "secs": 19.934102752}, "1KB": {"bytes": 5000000, "concurrency": 16, "errors": 0, "max_ms": 3.0250749999999997, "mb_per_sec": 15.769317243314434, "mean_ms": 0.963667520999998, "ops": 5000, "ops_per_sec": 15769.317243314435, "p50_ms": 0.947864, "p90_ms": 1.273639, "p95_ms": 1.372208, "p99_ms": 1.622937, "secs": 0.317071432}, "1MB": {"bytes": 1000000000, "concurrency": 16, "errors": 0, "max_ms": 63.882265, "mb_per_sec": 610.8708172356427, "mean_ms": 26.03828850899999, "ops": 1000, "ops_per_sec": 610.8708172356427, "p50_ms": 19.867341, "p90_ms": 48.520889999999994, "p95_ms": 52.863259, "p99_ms": 63.392281, "secs": 1.637007321}}, "replicate": {"doc_write_failures": 0, "docs_per_sec": 3938.306688589545, "docs_written": 3903920, "error": null, "mb_per_sec": 101.53539751037118, "ok": true, "reason": null, "secs": 986.387375888, "source_docs": 3884696, "source_external_bytes": 100153234310, "target_docs": 3884696}, "scale": {"att_bytes": 4000, "doc_bytes": 1000, "measure_secs": 60, "per_host": 15000, "pool_docs": 100000, "steps": [{"clients": 15000, "connect_errors": 0, "connected": 15000, "generator_cpu_cores": 0.5827712925599249, "hosts": 1, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 6.238150132280987, "mean_ms": 0.7554015595135658, "ops": 525292, "ops_per_sec": 8753.06443827098, "p50_ms": 0.7063776162219495, "p90_ms": 1.3849776616832217, "p95_ms": 1.6227220697897287, "p99_ms": 2.0176509312415423}, "get_att": {"max_ms": 6.115833463020575, "mean_ms": 0.7642098656257295, "ops": 526961, "ops_per_sec": 8780.875378752606, "p50_ms": 0.7063776162219495, "p90_ms": 1.412677214916886, "p95_ms": 1.6227220697897287, "p99_ms": 2.0580039498663734}, "put": {"max_ms": 2279.853851174402, "mean_ms": 1694.399786062956, "ops": 526080, "ops_per_sec": 8766.195068049004, "p50_ms": 1660.7499937682687, "p90_ms": 2148.3572034647336, "p95_ms": 2191.3243475340278, "p99_ms": 2235.1508344847084}}, "ops_per_sec": 26300.13488507259, "secs": 60.012353811, "server_cpu_cores": 3.390427350427351, "server_footprint_bytes": 1090341888.0, "timeouts": 0, "window_end_unix": 1792648051.479449, "window_start_unix": 1792647991.4670763}, {"clients": 30000, "connect_errors": 0, "connected": 30000, "generator_cpu_cores": 0.5435752209267034, "hosts": 2, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 16.138533467523477, "mean_ms": 0.7749961993425335, "ops": 487021, "ops_per_sec": 8115.144359495381, "p50_ms": 0.7205051685463887, "p90_ms": 1.412677214916886, "p95_ms": 1.6551765111855232, "p99_ms": 2.0580039498663734}, "get_att": {"max_ms": 15.822091634826942, "mean_ms": 0.7851141092788975, "ops": 486297, "ops_per_sec": 8103.0804761797235, "p50_ms": 0.7349152719173164, "p90_ms": 1.4409307592152236, "p95_ms": 1.6551765111855232, "p99_ms": 2.099164028863701}, "put": {"max_ms": 4212.232477055146, "mean_ms": 3668.0911360081495, "ops": 486912, "ops_per_sec": 8113.328111869128, "p50_ms": 3667.001857588455, "p90_ms": 4129.639683387396, "p95_ms": 4129.639683387396, "p99_ms": 4212.232477055146}}, "ops_per_sec": 24331.55294754423, "secs": 60.01384306, "server_cpu_cores": 3.2904761931445945, "server_footprint_bytes": 1676254208.0, "timeouts": 0, "window_end_unix": 1792648131.4959593, "window_start_unix": 1792648071.4820774}, {"clients": 45000, "connect_errors": 0, "connected": 45000, "generator_cpu_cores": 0.5251462190492684, "hosts": 3, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 20.467562646459672, "mean_ms": 0.7956970753627128, "ops": 470896, "ops_per_sec": 7846.386584038509, "p50_ms": 0.7349152719173164, "p90_ms": 1.4697493743995282, "p95_ms": 1.6882800414092336, "p99_ms": 2.1411473094409743}, "get_att": {"max_ms": 21.72034122092418, "mean_ms": 0.8069578476041851, "ops": 470341, "ops_per_sec": 7837.138799911778, "p50_ms": 0.7496135773556628, "p90_ms": 1.4697493743995282, "p95_ms": 1.6882800414092336, "p99_ms": 2.1411473094409743}, "put": {"max_ms": 6259.155880535544, "mean_ms": 5692.6402034934745, "ops": 469504, "ops_per_sec": 7823.1921416882205, "p50_ms": 5669.11032452914, "p90_ms": 6136.427333858377, "p95_ms": 6259.155880535544, "p99_ms": 6259.155880535544}}, "ops_per_sec": 23506.71752563851, "secs": 60.014376676, "server_cpu_cores": 3.277871632182508, "server_footprint_bytes": 2248037376.0, "timeouts": 0, "window_end_unix": 1792648211.5139177, "window_start_unix": 1792648151.4995122}, {"clients": 60000, "connect_errors": 0, "connected": 60000, "generator_cpu_cores": 0.46366818446389946, "hosts": 4, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 27.546644528535705, "mean_ms": 0.8451631555334835, "ops": 416817, "ops_per_sec": 6944.8221423771565, "p50_ms": 0.7646058489027758, "p90_ms": 1.5291272491252694, "p95_ms": 1.756486555082167, "p99_ms": 2.2722026539572378}, "get_att": {"max_ms": 28.09757741910642, "mean_ms": 0.8558570718530524, "ops": 416475, "ops_per_sec": 6939.123888292767, "p50_ms": 0.7798979658808316, "p90_ms": 1.5291272491252694, "p95_ms": 1.79161628618381, "p99_ms": 2.317646707036382}, "put": {"max_ms": 9486.79190933848, "mean_ms": 8523.64236427221, "ops": 416768, "ops_per_sec": 6944.005725856294, "p50_ms": 8939.615899369854, "p90_ms": 9300.776381704396, "p95_ms": 9300.776381704396, "p99_ms": 9486.79190933848}}, "ops_per_sec": 20827.951756526218, "secs": 60.01838369, "server_cpu_cores": 3.1025210084033596, "server_footprint_bytes": 2835166208.0, "timeouts": 0, "window_end_unix": 1792648291.534774, "window_start_unix": 1792648231.5163643}, {"clients": 75000, "connect_errors": 0, "connected": 75000, "generator_cpu_cores": 0.47504954792520715, "hosts": 5, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 32.27528447699359, "mean_ms": 0.8713306673693606, "ops": 421236, "ops_per_sec": 7018.792018601781, "p50_ms": 0.7646058489027758, "p90_ms": 1.5291272491252694, "p95_ms": 1.79161628618381, "p99_ms": 2.317646707036382}, "get_att": {"max_ms": 31.64243576175841, "mean_ms": 0.8811739841495476, "ops": 420682, "ops_per_sec": 7009.561063084433, "p50_ms": 0.7798979658808316, "p90_ms": 1.5597097941077742, "p95_ms": 1.79161628618381, "p99_ms": 2.317646707036382}, "put": {"max_ms": 11564.346401135019, "mean_ms": 10618.501386397591, "ops": 420352, "ops_per_sec": 7004.0624794730165, "p50_ms": 10474.184831053693, "p90_ms": 11564.346401135019, "p95_ms": 11564.346401135019, "p99_ms": 11564.346401135019}}, "ops_per_sec": 21032.415561159232, "secs": 60.015455492, "server_cpu_cores": 3.1563884259290167, "server_footprint_bytes": 3434124288.0, "timeouts": 0, "window_end_unix": 1792648371.552371, "window_start_unix": 1792648311.5368812}, {"clients": 90000, "connect_errors": 0, "connected": 90000, "generator_cpu_cores": 0.4517322319342737, "hosts": 6, "http_errors": 0, "io_errors": 0, "ops": {"get": {"max_ms": 38.571952628626065, "mean_ms": 0.8822030036046216, "ops": 405313, "ops_per_sec": 6753.747731937968, "p50_ms": 0.7646058489027758, "p90_ms": 1.5597097941077742, "p95_ms": 1.79161628618381, "p99_ms": 2.317646707036382}, "get_att": {"max_ms": 38.571952628626065, "mean_ms": 0.8906524675054642, "ops": 403991, "ops_per_sec": 6731.719189794928, "p50_ms": 0.7798979658808316, "p90_ms": 1.5597097941077742, "p95_ms": 1.79161628618381, "p99_ms": 2.3639996411771103}, "put": {"max_ms": 14096.873733870036, "mean_ms": 13194.335569053297, "ops": 404224, "ops_per_sec": 6735.601678690033, "p50_ms": 13283.798966715327, "p90_ms": 13820.464444970627, "p95_ms": 13820.464444970627, "p99_ms": 14096.873733870036}}, "ops_per_sec": 20221.06860042293, "secs": 60.013049952, "server_cpu_cores": 3.1081218198879808, "server_footprint_bytes": 3963474944.0, "timeouts": 0, "window_end_unix": 1792648451.568281, "window_start_unix": 1792648391.5552018}], "warm_secs": 15}, "server": {"bands": [{"band": 2, "share": 0.01}, {"band": 3, "share": 0.04}, {"band": 4, "share": 0.1}, {"band": 5, "share": 0.15}, {"band": 6, "share": 0.2}, {"band": 7, "share": 0.25}, {"band": 8, "share": 0.25}], "dataset_bytes": 100244872278, "dataset_docs": 3884695, "json_max_bytes": 65536, "seed": 42, "url": "http://172.31.2.29:5984", "welcome": {"couchdb": "Welcome", "features": ["access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"], "git_sha": "rust", "uuid": "1833e17d95e34319b6f869f9fc41b35a", "vendor": {"name": "couchdb-rs"}, "version": "3.5.0"}}, "view": {"build_secs": 35.281595653, "docs_indexed": 3884696, "docs_per_sec": 110105.45096107874, "index_file_bytes": 213442715, "queries": {"group_level1_reduce": {"bytes": 116500, "errors": 0, "max_ms": 1.423895, "mb_per_sec": 2.2362638691549535, "mean_ms": 0.7988917320000003, "ops": 500, "ops_per_sec": 9597.699009248729, "p50_ms": 0.79962, "p90_ms": 1.090475, "p95_ms": 1.163159, "p99_ms": 1.261043, "secs": 0.05209582}, "include_docs_limit10": {"bytes": 190441630, "errors": 0, "max_ms": 3.922925, "mb_per_sec": 1087.2204648033228, "mean_ms": 1.3552417189999972, "ops": 2000, "ops_per_sec": 11417.886570318924, "p50_ms": 1.114402, "p90_ms": 2.3933829999999996, "p95_ms": 2.70019, "p99_ms": 3.233514, "secs": 0.175163765}, "key_lookup_limit20": {"bytes": 4278293, "errors": 0, "max_ms": 2.044088, "mb_per_sec": 17.631722801284962, "mean_ms": 0.7147950457999985, "ops": 5000, "ops_per_sec": 20606.02534852681, "p50_ms": 0.740266, "p90_ms": 0.96158, "p95_ms": 1.049567, "p99_ms": 1.244598, "secs": 0.242647474}, "key_reduce": {"bytes": 119785, "errors": 0, "max_ms": 1.300427, "mb_per_sec": 1.0611214550927262, "mean_ms": 0.5436930433333318, "ops": 3000, "ops_per_sec": 26575.65108551303, "p50_ms": 0.519544, "p90_ms": 0.857523, "p95_ms": 0.94241, "p99_ms": 1.1433140000000002, "secs": 0.112885287}}, "reduce_expected": 100244872278, "reduce_total": 100244872278, "request_timeouts_during_build": 0, "rows": 3884695}, "view_compact": {"active_bytes_after": 213441532, "active_bytes_before": 213442110, "active_bytes_start": 213441849, "churn_docs": 200000, "churn_rounds": [{"active_bytes": 218130984, "file_bytes": 240799903, "index_docs_per_sec": 41146.27975718188, "index_update_secs": 4.860706756, "write_secs": 5.109907965}, {"active_bytes": 218135943, "file_bytes": 273563809, "index_docs_per_sec": 25492.271351508087, "index_update_secs": 7.845515107, "write_secs": 6.301496654}, {"active_bytes": 218133057, "file_bytes": 306147487, "index_docs_per_sec": 24891.548967967847, "index_update_secs": 8.034855535, "write_secs": 8.826372632}, {"active_bytes": 218129996, "file_bytes": 338833567, "index_docs_per_sec": 25201.9751022266, "index_update_secs": 7.935885945, "write_secs": 10.511491218}, {"active_bytes": 213442110, "file_bytes": 357707932, "index_docs_per_sec": 48620.53074131488, "index_update_secs": 4.113488622, "write_secs": 11.782122141}], "ended_unix": 1792647944.7333708, "file_bytes_after": 213442715, "file_bytes_before": 357707932, "file_bytes_start": 213446814, "live_mb_per_sec": 15.114462621953736, "reclaimed_bytes": 144265217, "secs": 14.121675202, "started_unix": 1792647930.6110914, "resources": {"rss_before_bytes": 7961407488.0, "rss_peak_bytes": 8061751296.0, "disk_before_bytes": 56908980766.0, "disk_peak_bytes": 57115421922.0, "footprint_before_bytes": 7959275520.0, "footprint_peak_bytes": 8059619328.0, "rss_peak_extra_bytes": 100343808.0, "disk_peak_extra_bytes": 206441156.0, "footprint_peak_extra_bytes": 100343808.0}}}}, "generated": "2026-10-22", "machine": {"cpu": "per pair: i4i.4xlarge server (16 vCPU, local NVMe) + c7i.4xlarge load generator", "ram": "128 GB per server"}, "method": ["Servers: Apache CouchDB 3.5.3 (official apache/couchdb:3.5.3 image, Erlang/OTP 27, QuickJS) and three couchdb-rs builds, each on its own i4i.4xlarge (16 vCPU, 128 GB RAM, data on the instance's local NVMe, XFS). Each server had its own c7i.4xlarge load generator; all eight nodes were in us-east-1a in one cluster placement group, and the four pairs ran at the same time.", "Durability: Linux fdatasync for every server (CouchDB's file:datasync, couchdb-rs's sync_data, RocksDB's WAL sync).", "CouchDB: single node, q=1 (one shard, like couchdb-rs), automatic compaction (smoosh) off, connection cap raised to 200,000, Erlang port limit 262,144, listen backlog 1,024 (tokio's default, which couchdb-rs uses). All nodes: 2M open files, somaxconn 65,535, local ports 1024-65535.", "Dataset, phases and the load generator (bench/couchbench) are the same as the Mac runs: 100 GB, deterministic from a fixed seed, sizes 100 B to 1 GB, generated text.", "Replication used a CouchDB replicator: CouchDB's own for CouchDB, and a separate CouchDB container on each couchdb-rs server node (port 15984) for the couchdb-rs builds, copying each database to a new database on the same server.", "View queries and the per-size GET/PUT/DELETE tests use the same 16 (or fewer) concurrent clients as on the Mac, so across a network their rates are bounded by round trips (about 0.5 ms here) as well as by the server; compare engines within this report rather than against the Mac numbers.", "Server memory and CPU come from a monitor on the server node (resident set and, on Linux, proportional set size; CPU from /proc), matched to each measured window by wall-clock time.", "couchdb-rs (RocksDB docs + B-tree views) keeps the RocksDB document engine and replaces the RocksDB view index with couchdb-rs's B-tree view engine (append-only index file, a reduction in every node). Only the view phases were rerun for it, on the RocksDB server's loaded database; its document results in the summary are the RocksDB engine's, since the document storage code is identical.", "View compaction streams each live B-tree, already in key order, into the bottom-up builder, so every node is written once. couchdb-rs (B-tree) ran main's earlier view compaction, which collects every live row in memory and inserts them with one B-tree update."], "setting": "ran at the same time on AWS (us-east-1a, one cluster placement group), each on its own i4i.4xlarge server with its own c7i.4xlarge load generator,", "configs": "All four configurations (CouchDB; couchdb-rs with its B-tree engine; the hybrid, RocksDB documents with B-tree views; and the hybrid with point reads run inline)", "lg_note": "Each load generator is its own c7i.4xlarge in the server's availability zone; its six private addresses are the six hosts."}</script>
+<script>
+(function () {
+  const R = JSON.parse(document.getElementById('data').textContent);
+  const E = R.results.erlang || {}, S = R.results.rust || {}, K = R.results.rocksdb || {}, Hy = R.results.hybrid || {}, HI = R.results.hybrid_inline || {};
+  const SRC = { erlang: E, rust: S, rocksdb: K, hybrid: Hy, hybrid_inline: HI };
+  const SERIES = [
+    { key: 'erlang', name: 'CouchDB (Erlang)', color: 'var(--erlang)' },
+    { key: 'rust', name: 'couchdb-rs', color: 'var(--rust)' },
+  ];
+  if (R.results.rocksdb) SERIES.push({ key: 'rocksdb', name: 'couchdb-rs (RocksDB)', color: 'var(--rocks)' });
+  if (R.results.hybrid) SERIES.push({ key: 'hybrid', name: 'couchdb-rs (RocksDB docs + B-tree views)', color: 'var(--hybrid)' });
+  if (R.results.hybrid_inline) SERIES.push({ key: 'hybrid_inline', name: 'hybrid, point reads inline', color: 'var(--inline)' });
+  // One bar-chart row: f picks the value out of each server's results.
+  const row = (label, f) => { const r = { label }; for (const s of SERIES) r[s.key] = f(SRC[s.key]); return r; };
+  const tip = document.getElementById('tip');
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag, attrs, parent) => {
+    const n = document.createElementNS(NS, tag);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(n);
+    return n;
+  };
+  const h = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+
+  // ---------------------------------------------------------- formatting
+  function compact(v) {
+    if (v == null || !isFinite(v)) return '–';
+    const a = Math.abs(v);
+    if (a >= 1e9) return (v / 1e9).toFixed(a >= 1e10 ? 0 : 1) + 'B';
+    if (a >= 1e6) return (v / 1e6).toFixed(a >= 1e7 ? 0 : 1) + 'M';
+    if (a >= 1e4) return (v / 1e3).toFixed(0) + 'K';
+    if (a >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+    if (a >= 100) return v.toFixed(0);
+    if (a >= 10) return v.toFixed(1);
+    if (a >= 1) return v.toFixed(2);
+    return v.toPrecision(2);
+  }
+  function bytes(v) {
+    if (v == null) return '–';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
+    while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+    return (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)) + ' ' + u[i];
+  }
+  function dur(s) {
+    if (s == null) return '–';
+    if (s < 60) return s.toFixed(1) + ' s';
+    if (s < 3600) return (s / 60).toFixed(1) + ' min';
+    return (s / 3600).toFixed(2) + ' h';
+  }
+
+  // ------------------------------------------------------------ tooltip
+  function showTip(evt, title, rows) {
+    tip.replaceChildren(h('div', 't', title));
+    for (const r of rows) {
+      const row = h('div', 'r');
+      const k = h('span', 'k'); k.style.background = r.color || 'transparent';
+      row.append(k, h('span', null, r.name), h('span', 'v', r.value));
+      tip.appendChild(row);
+    }
+    tip.hidden = false;
+    const pad = 14, rect = tip.getBoundingClientRect();
+    let x = (evt.clientX ?? evt.x) + pad, y = (evt.clientY ?? evt.y) + pad;
+    if (x + rect.width > innerWidth - 8) x = (evt.clientX ?? evt.x) - rect.width - pad;
+    if (y + rect.height > innerHeight - 8) y = (evt.clientY ?? evt.y) - rect.height - pad;
+    tip.style.left = Math.max(8, x) + 'px'; tip.style.top = Math.max(8, y) + 'px';
+  }
+  const hideTip = () => { tip.hidden = true; };
+
+  // ---------------------------------------------------------- scales
+  function scale(min, max, x0, x1) {
+    return v => x0 + (v - min) / (max - min) * (x1 - x0);
+  }
+  function niceTicks(max) {
+    const step = Math.pow(10, Math.floor(Math.log10(max)));
+    const m = max / step;
+    const s = m <= 2 ? step / 2 : m <= 5 ? step : step * 2;
+    const ticks = []; for (let t = 0; t <= max * 1.0001; t += s) ticks.push(t);
+    if (ticks[ticks.length - 1] < max) ticks.push(ticks[ticks.length - 1] + s);
+    return ticks;
+  }
+
+  // ------------------------------------------------- grouped bar chart
+  // rows: [{label, erlang, rust}], opts: {title, sub, fmt, unit, better}
+  // Charts are drawn at their container's real width (text stays at its
+  // true pixel size) and redrawn on resize.
+  const RENDERERS = [];
+  const width = host => Math.max(280, Math.floor(host.clientWidth - 36));
+  function bars(id, rows, opts) { RENDERERS.push(() => drawBars(id, typeof rows === 'function' ? rows() : rows, typeof opts === 'function' ? opts() : opts)); }
+  function ratios(id, rows, series) { RENDERERS.push(() => drawRatios(id, rows, series)); }
+  function drawBars(id, rows, opts) {
+    const host = document.getElementById(id);
+    host.replaceChildren();
+    // Only the servers with a value in this chart get a bar and a legend entry.
+    const SER = SERIES.filter(s => rows.some(r => r[s.key] != null));
+    rows = rows.filter(r => SER.some(s => r[s.key] != null));
+    const head = h('div', 'fighead');
+    const t = h('div'); t.append(h('h3', null, opts.title), h('div', 'sub', opts.sub || ''));
+    const lg = h('div', 'legend');
+    for (const s of SER) { const sp = h('span'); const i = h('i'); i.style.background = s.color; sp.append(i, document.createTextNode(s.name)); lg.appendChild(sp); }
+    head.append(t, lg);
+    host.appendChild(head);
+    if (!rows.length) { host.appendChild(h('div', 'sub', 'No data in this run.')); return; }
+    const fmt = opts.fmt || compact;
+    const vals = rows.flatMap(r => SER.map(s => r[s.key])).filter(v => v != null && v > 0);
+    const max = Math.max(...vals);
+    const lo = 0, ticks = niceTicks(max), hi = ticks[ticks.length - 1];
+    const W = width(host), labelW = 76, valW = 50, barH = 11, gapIn = 2, rowH = SER.length * barH + (SER.length - 1) * gapIn + 14, top = 6, axisH = 22;
+    const H = top + rows.length * rowH + axisH;
+    const x0 = labelW, x1 = W - valW;
+    const sx = scale(lo, hi, x0, x1);
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': opts.title });
+    for (const tv of ticks) {
+      const x = sx(tv);
+      el('line', { x1: x, x2: x, y1: top - 2, y2: H - axisH + 2, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+      const tx = el('text', { x, y: H - 6, 'text-anchor': 'middle', class: 'tick' }, svg); tx.textContent = fmt(tv);
+    }
+    el('line', { x1: x0, x2: x0, y1: top - 2, y2: H - axisH + 2, stroke: 'var(--axis)', 'stroke-width': 1 }, svg);
+    rows.forEach((r, i) => {
+      const y = top + i * rowH + 7;
+      const g = el('g', {}, svg);
+      const lab = el('text', { x: labelW - 10, y: y + barH + 1 + 4, 'text-anchor': 'end', class: 'rowlabel' }, g); lab.textContent = r.label;
+      SER.forEach((s, si) => {
+        const v = r[s.key]; if (v == null) return;
+        const by = y + si * (barH + gapIn);
+        const xe = Math.max(sx(v), x0 + 4);
+        const w = xe - x0;
+        // 4px rounded data end, square at the baseline.
+        const rr = Math.min(4, w / 2, barH / 2);
+        const d = `M${x0},${by} H${xe - rr} Q${xe},${by} ${xe},${by + rr} V${by + barH - rr} Q${xe},${by + barH} ${xe - rr},${by + barH} H${x0} Z`;
+        el('path', { d, fill: s.color, class: 'bar' }, g);
+        const vt = el('text', { x: xe + 6, y: by + barH - 1.5, class: 'val' }, g); vt.textContent = fmt(v);
+      });
+      const hit = el('rect', { x: 0, y: y - 4, width: W, height: rowH - 6, class: 'hit', tabindex: 0 }, g);
+      const tipRows = () => {
+        const out = SER.filter(s => r[s.key] != null).map(s => ({ name: s.name, value: fmt(r[s.key]) + (opts.unit ? ' ' + opts.unit : ''), color: s.color }));
+        for (const s of SER.slice(1)) {
+          if (!r.erlang || !r[s.key]) continue;
+          const ratio = opts.better === 'lower' ? r.erlang / r[s.key] : r[s.key] / r.erlang;
+          out.push({ name: `${s.name} vs CouchDB`, value: (ratio >= 1 ? ratio.toFixed(2) + '× faster' : (1 / ratio).toFixed(2) + '× slower') });
+        }
+        return out;
+      };
+      const on = e => { svg.classList.add('hovered'); g.querySelectorAll('.bar').forEach(b => b.classList.add('on')); showTip(e, r.label, tipRows()); };
+      const off = () => { svg.classList.remove('hovered'); g.querySelectorAll('.bar').forEach(b => b.classList.remove('on')); hideTip(); };
+      hit.addEventListener('pointermove', on); hit.addEventListener('pointerleave', off);
+      hit.addEventListener('focus', () => { const b = hit.getBoundingClientRect(); on({ clientX: b.left + b.width * 0.6, clientY: b.top }); });
+      hit.addEventListener('blur', off);
+    });
+    host.appendChild(svg);
+    const others = SER.slice(1);
+    table(host, ['', ...SER.map(s => s.name), ...others.map(s => `${s.name} speed vs CouchDB`)],
+      rows.map(r => [r.label, ...SER.map(s => r[s.key] == null ? '–' : fmt(r[s.key])),
+        ...others.map(s => r.erlang && r[s.key] ? ((opts.better === 'lower' ? r.erlang / r[s.key] : r[s.key] / r.erlang).toFixed(2) + '×') : '–')]));
+  }
+
+  function table(host, header, rows) {
+    const d = h('details'); d.appendChild(h('summary', null, 'Table view'));
+    const wrap = h('div', 'tablewrap'); const tb = h('table');
+    const tr = h('tr'); header.forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+    rows.forEach(r => { const row = h('tr'); r.forEach(c => row.appendChild(h('td', null, c))); tb.appendChild(row); });
+    wrap.appendChild(tb); d.appendChild(wrap); host.appendChild(d);
+  }
+
+  // ------------------------------------------------------ ratio chart
+  function drawRatios(id, rows, series) {
+    const host = document.getElementById(id);
+    host.replaceChildren();
+    rows = rows.filter(r => isFinite(r.ratio) && r.ratio > 0);
+    const head = h('div', 'fighead');
+    const t = h('div'); t.append(h('h3', null, `${series.name} speed relative to CouchDB`), h('div', 'sub', 'each bar starts at 1× (parity)'));
+    head.append(t); host.appendChild(head);
+    if (!rows.length) { host.appendChild(h('div', 'sub', 'No comparable results yet.')); return; }
+    const rticks = niceTicks(Math.max(2, ...rows.map(r => r.ratio)));
+    const hiR = rticks[rticks.length - 1];
+    const W = width(host), labelW = W < 520 ? 140 : 180, rowH = 26, top = 10, axisH = 24, valW = W < 520 ? 92 : 110;
+    const H = top + rows.length * rowH + axisH;
+    const x0 = labelW, x1 = W - valW;
+    const sx = scale(0, hiR, x0, x1);
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'Speed ratio by benchmark' });
+    for (const tv of rticks) {
+      const x = sx(tv);
+      el('line', { x1: x, x2: x, y1: top - 4, y2: H - axisH + 2, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+      const tx = el('text', { x, y: H - 6, 'text-anchor': 'middle', class: 'tick' }, svg);
+      tx.textContent = (tv % 1 ? tv.toFixed(1) : tv.toFixed(0)) + '×';
+    }
+    // Parity line: bars to its right mean couchdb-rs is faster.
+    el('line', { x1: sx(1), x2: sx(1), y1: top - 4, y2: H - axisH + 2, stroke: 'var(--axis)', 'stroke-width': 1.5 }, svg);
+    rows.forEach((r, i) => {
+      const y = top + i * rowH + rowH / 2;
+      const g = el('g', {}, svg);
+      const lab = el('text', { x: labelW - 12, y: y + 4, 'text-anchor': 'end', class: 'rowlabel' }, g); lab.textContent = r.label;
+      const xs = sx(1), xe = sx(r.ratio);
+      const color = r.ratio >= 1 ? series.color : 'var(--erlang)';
+      const a = Math.min(xs, xe), b = Math.max(xs, xe);
+      el('rect', { x: a, y: y - 5, width: Math.max(b - a, 2), height: 10, rx: 3, fill: color, class: 'bar' }, g);
+      const lbl = r.ratio >= 1 ? r.ratio.toFixed(1) + '×' : (1 / r.ratio).toFixed(1) + '× slower';
+      const lt = el('text', { x: r.ratio >= 1 ? b + 6 : a - 6, y: y + 4, 'text-anchor': r.ratio >= 1 ? 'start' : 'end', class: 'ratio-lbl' }, g); lt.textContent = lbl;
+      const hit = el('rect', { x: 0, y: y - rowH / 2, width: W, height: rowH, class: 'hit', tabindex: 0 }, g);
+      const tipRows = () => [
+        { name: 'CouchDB (Erlang)', value: r.efmt, color: 'var(--erlang)' },
+        { name: series.name, value: r.rfmt, color: series.color },
+        { name: r.ratio >= 1 ? `${series.name} faster` : 'CouchDB faster', value: (r.ratio >= 1 ? r.ratio : 1 / r.ratio).toFixed(2) + '×' },
+      ];
+      hit.addEventListener('pointermove', e => showTip(e, r.label, tipRows()));
+      hit.addEventListener('pointerleave', hideTip);
+      hit.addEventListener('focus', () => { const bb = hit.getBoundingClientRect(); showTip({ clientX: bb.left + bb.width * 0.6, clientY: bb.top }, r.label, tipRows()); });
+      hit.addEventListener('blur', hideTip);
+    });
+    host.appendChild(svg);
+    table(host, ['Benchmark', 'CouchDB (Erlang)', series.name, `${series.name} speed`], rows.map(r => [r.label, r.efmt, r.rfmt, r.ratio.toFixed(2) + '×']));
+  }
+
+  // ------------------------------------------------------------- data
+  const g = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
+  const CLASSES = ['100B', '1KB', '10KB', '100KB', '1MB', '10MB', '100MB', '1GB'];
+  const byClass = (phase, field) => CLASSES.map(c => (row(c, d => g(d, `${phase}.${c}.${field}`))));
+
+  const srv = E.server || S.server || {};
+  const ds = srv.dataset_bytes;
+  document.getElementById('intro').textContent =
+    `${R.configs ? R.configs : R.results.hybrid ? 'All four configurations (CouchDB; couchdb-rs with its B-tree engine; couchdb-rs with RocksDB for documents and views; and couchdb-rs with RocksDB for documents and B-tree views)' : R.results.rocksdb ? 'All three servers (CouchDB, couchdb-rs with its B-tree engine, and couchdb-rs with a RocksDB engine)' : 'Both servers'} ${R.setting || 'ran on one machine, one after the other,'} against byte-identical data: ${bytes(ds)} in ${compact(srv.dataset_docs)} documents ` +
+    `sized from 100 bytes to 1 GB, filled with generated English-like text. Each was loaded, then measured for writes, reads, deletes, view indexing and queries, and replication.`;
+  const facts = document.getElementById('facts');
+  const fact = (k, v) => { const s = h('span'); s.append(document.createTextNode(k + ' '), h('b', null, v)); facts.appendChild(s); };
+  fact('Dataset', bytes(ds)); fact('Documents', compact(srv.dataset_docs));
+  fact('Machine', R.machine.cpu); fact('RAM', R.machine.ram); fact('Run', R.generated);
+  const missing = ['erlang', 'rust'].filter(k => !R.results[k]);
+  const phases = ['load', 'view', 'get', 'put', 'delete', 'replicate'];
+  const incomplete = ['erlang', 'rust', 'rocksdb'].filter(k => R.results[k] && phases.some(p => !R.results[k][p]));
+  if (missing.length || incomplete.length) {
+    const p = document.getElementById('partial'); p.hidden = false;
+    p.textContent = 'This run is still in progress: ' + [...missing.map(m => m + ' not started'), ...incomplete.map(m => m + ' partially complete')].join(', ') + '. Charts show what has finished.';
+  }
+
+  // Summary ratios (>1 = faster than CouchDB), one chart per other engine.
+  const HEADLINE = [
+    ['Bulk load (MB/s)', 'load.mb_per_sec', false, v => compact(v) + ' MB/s'],
+    ['PUT 1 KB (ops/s)', 'put.1KB.ops_per_sec', false, v => compact(v) + '/s'],
+    ['PUT 10 MB (MB/s)', 'put.10MB.mb_per_sec', false, v => compact(v) + ' MB/s'],
+    ['PUT 1 GB (MB/s)', 'put.1GB.mb_per_sec', false, v => compact(v) + ' MB/s'],
+    ['GET 1 KB (ops/s)', 'get.1KB.ops_per_sec', false, v => compact(v) + '/s'],
+    ['GET 10 MB (MB/s)', 'get.10MB.mb_per_sec', false, v => compact(v) + ' MB/s'],
+    ['DELETE 1 KB (ops/s)', 'delete.1KB.ops_per_sec', false, v => compact(v) + '/s'],
+    ['View build (docs/s)', 'view.docs_per_sec', false, v => compact(v) + '/s'],
+    ['View key lookup (q/s)', 'view.queries.key_lookup_limit20.ops_per_sec', false, v => compact(v) + '/s'],
+    ['View reduce (q/s)', 'view.queries.group_level1_reduce.ops_per_sec', false, v => compact(v) + '/s'],
+    ['Replication (time)', 'replicate.secs', true, dur],
+    ['Compaction (time)', 'compact.secs', true, dur],
+    ['View compaction (time)', 'view_compact.secs', true, dur],
+  ];
+  const ratioRows = src => HEADLINE.flatMap(([label, path, lowerBetter, f]) => {
+    const ev = g(E, path), rv = g(src, path);
+    if (!ev || !rv) return [];
+    return [{ label, ratio: lowerBetter ? ev / rv : rv / ev, efmt: f(ev), rfmt: f(rv) }];
+  });
+  ratios('fig-summary', ratioRows(S), SERIES[1]);
+  if (R.results.rocksdb) {
+    document.getElementById('fig-summary-rocks').hidden = false;
+    ratios('fig-summary-rocks', ratioRows(K), SERIES[2]);
+  }
+  if (R.results.hybrid) {
+    // The hybrid shares the RocksDB engine's document storage, so its
+    // document results are the RocksDB run's; only views were rerun.
+    document.getElementById('fig-summary-hybrid').hidden = false;
+    ratios('fig-summary-hybrid', ratioRows({ ...K, ...Hy }), SERIES.find(s => s.key === 'hybrid'));
+  }
+  const lg = document.getElementById('legend');
+  for (const sr of SERIES) { const sp = h('span'); const i = h('i'); i.style.background = sr.color; sp.append(i, document.createTextNode(sr.name)); lg.appendChild(sp); }
+
+  const loadTxt = (n, d) => d && d.load ? `${n}: ${bytes(d.load.bytes)} in ${dur(d.load.secs)}` : null;
+  document.getElementById('load-text').textContent =
+    'The whole dataset, loaded with 16 concurrent connections: small docs through _bulk_docs (1,000 per batch), large ones as streamed single-document uploads. ' +
+    [loadTxt('CouchDB', E), loadTxt('couchdb-rs', S)].filter(Boolean).join(' · ') + '.';
+  bars('fig-load-mb', [row('Throughput', d => g(d, 'load.mb_per_sec'))], { title: 'Load throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
+  bars('fig-load-docs', [row('Documents', d => g(d, 'load.docs_per_sec'))], { title: 'Load rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
+
+  bars('fig-put-ops', byClass('put', 'ops_per_sec'), { title: 'PUT operations', sub: 'ops/s by doc size · higher is better', unit: 'ops/s' });
+  bars('fig-put-mb', byClass('put', 'mb_per_sec'), { title: 'PUT throughput', sub: 'MB/s by doc size · higher is better', unit: 'MB/s' });
+  bars('fig-get-ops', byClass('get', 'ops_per_sec'), { title: 'GET operations', sub: 'ops/s by size band · higher is better', unit: 'ops/s' });
+  bars('fig-get-mb', byClass('get', 'mb_per_sec'), { title: 'GET throughput', sub: 'MB/s by size band · higher is better', unit: 'MB/s' });
+  bars('fig-del', byClass('delete', 'ops_per_sec'), { title: 'DELETE operations', sub: 'ops/s by doc size · higher is better', unit: 'ops/s' });
+
+  let PCT = 'p99_ms';
+  const PNAME = { mean_ms: 'mean', p50_ms: 'p50', p90_ms: 'p90', p99_ms: 'p99' };
+  const latOpts = what => () => ({ title: `${what} latency, ${PNAME[PCT]}`, sub: 'ms · lower is better', unit: 'ms', better: 'lower' });
+  bars('fig-lat-put', () => byClass('put', PCT), latOpts('PUT'));
+  bars('fig-lat-get', () => byClass('get', PCT), latOpts('GET'));
+  bars('fig-lat-del', () => byClass('delete', PCT), latOpts('DELETE'));
+  const QL = [['key_lookup_limit20', 'Key lookup'], ['key_reduce', 'Key + reduce'], ['group_level1_reduce', 'Group reduce'], ['include_docs_limit10', 'include_docs']];
+  bars('fig-lat-view', () => QL.map(([k, l]) => (row(l, d => g(d, `view.queries.${k}.${PCT}`)))), latOpts('View query'));
+  document.querySelectorAll('#pct button').forEach(b => b.addEventListener('click', () => {
+    PCT = b.dataset.k;
+    document.querySelectorAll('#pct button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+    renderAll();
+  }));
+
+  // Every measured operation, every statistic.
+  RENDERERS.push(() => {
+    const host = document.getElementById('fig-lat-all');
+    host.replaceChildren();
+    const head = h('div', 'fighead'); const t = h('div');
+    t.append(h('h3', null, 'All operations'), h('div', 'sub', 'throughput and latency in ms for each server'));
+    head.append(t); host.appendChild(head);
+    const wrap = h('div', 'tablewrap'); const tb = h('table', 'alltable');
+    const cols = ['Operation', 'Server', 'ops/s', 'MB/s', 'mean', 'p50', 'p90', 'p95', 'p99', 'max'];
+    const tr = h('tr'); cols.forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+    const ms = v => v == null ? '–' : v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : v.toFixed(0);
+    const ops = [];
+    for (const ph of ['put', 'get', 'delete']) for (const c of CLASSES) ops.push([`${ph.toUpperCase()} ${c}`, `${ph}.${c}`]);
+    for (const [k, l] of QL) ops.push([`View: ${l}`, `view.queries.${k}`]);
+    for (const [label, path] of ops) {
+      for (const { key, name } of SERIES) {
+        const src = SRC[key];
+        const m = g(src, path); if (!m) continue;
+        const row = h('tr');
+        [label, name, compact(m.ops_per_sec), m.bytes ? compact(m.mb_per_sec) : '–', ms(m.mean_ms), ms(m.p50_ms), ms(m.p90_ms), ms(m.p95_ms), ms(m.p99_ms), ms(m.max_ms)]
+          .forEach(c => row.appendChild(h('td', null, c)));
+        tb.appendChild(row);
+      }
+    }
+    wrap.appendChild(tb); host.appendChild(wrap);
+  });
+
+  bars('fig-view-build', [
+    row('Index build', d => g(d, 'view.docs_per_sec')),
+  ], { title: 'View build rate', sub: 'docs indexed per second · higher is better', unit: 'docs/s' });
+  const Q = [['key_lookup_limit20', 'Key lookup'], ['key_reduce', 'Key + reduce'], ['group_level1_reduce', 'Group reduce'], ['include_docs_limit10', 'include_docs']];
+  bars('fig-view-q', Q.map(([k, l]) => (row(l, d => g(d, `view.queries.${k}.ops_per_sec`)))),
+    { title: 'View queries', sub: 'queries/s · higher is better', unit: 'q/s' });
+
+  const mins = v => v == null ? null : v / 60;
+  bars('fig-repl-time', [row('Full copy', d => mins(g(d, 'replicate.secs')))],
+    { title: 'Replication time', sub: 'minutes · lower is better', unit: 'min', better: 'lower' });
+  bars('fig-repl-mb', [row('Throughput', d => g(d, 'replicate.mb_per_sec'))],
+    { title: 'Replication throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
+  bars('fig-repl-docs', [row('Documents', d => g(d, 'replicate.docs_per_sec'))],
+    { title: 'Replication rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
+
+  bars('fig-compact-time', [row('Compaction', d => mins(g(d, 'compact.secs')))],
+    { title: 'Compaction time', sub: 'minutes · lower is better', unit: 'min', better: 'lower' });
+  bars('fig-compact-rate', [row('Live data', d => g(d, 'compact.live_mb_per_sec'))],
+    { title: 'Compaction throughput', sub: 'MB/s of live data copied · higher is better', unit: 'MB/s' });
+  bars('fig-compact-ram', [row('Peak RAM', d => g(d, 'compact.resources.rss_peak_bytes'))],
+    { title: 'Peak memory during compaction', sub: 'server resident memory · lower is better', better: 'lower', fmt: bytes });
+  bars('fig-compact-disk', [row('Peak extra disk', d => g(d, 'compact.resources.disk_peak_extra_bytes'))],
+    { title: 'Peak extra disk during compaction', sub: 'growth of the data directory over its starting size · lower is better', better: 'lower', fmt: bytes });
+  RENDERERS.push(() => {
+    const host = document.getElementById('fig-compact-sizes');
+    host.replaceChildren();
+    const head = h('div', 'fighead'); const t = h('div');
+    t.append(h('h3', null, 'Sizes and resources'), h('div', 'sub', 'live data is what compaction copies; peak RAM is the server process; peak extra disk is the most the data directory grew during compaction'));
+    head.append(t); host.appendChild(head);
+    const wrap = h('div', 'tablewrap'); const tb = h('table');
+    const tr = h('tr'); ['Server', 'File before', 'Live before', 'File after', 'Reclaimed', 'Time', 'Peak RAM', 'Peak extra disk'].forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+    for (const { key, name } of SERIES) {
+      const src = SRC[key];
+      const m = g(src, 'compact'); if (!m) continue;
+      const row = h('tr');
+      [name, bytes(m.file_bytes_before), bytes(m.active_bytes_before), bytes(m.file_bytes_after), bytes(m.reclaimed_bytes), dur(m.secs), bytes(g(m, 'resources.rss_peak_bytes')), bytes(g(m, 'resources.disk_peak_extra_bytes'))]
+        .forEach(c => row.appendChild(h('td', null, c)));
+      tb.appendChild(row);
+    }
+    wrap.appendChild(tb); host.appendChild(wrap);
+  });
+
+  if (SERIES.some(s => g(SRC[s.key], 'view_compact'))) {
+    document.getElementById('vc-section').hidden = false;
+    const upd = d => { const rs = g(d, 'view_compact.churn_rounds'); return rs ? rs.reduce((a, r) => a + r.index_update_secs, 0) / rs.length : null; };
+    // CouchDB's background indexer (ken) indexes while the churn is being
+    // written, so its refresh times don't measure the update; left out.
+    bars('fig-vc-update', [row('Per round', d => d === E ? null : upd(d))],
+      { title: 'Incremental index update', sub: 'seconds to index 200,000 changed docs · lower is better', unit: 's', better: 'lower', fmt: v => v < 10 ? v.toFixed(2) : v.toFixed(0) });
+    bars('fig-vc-time', [row('Compaction', d => g(d, 'view_compact.secs'))],
+      { title: 'View compaction time', sub: 'seconds · lower is better', unit: 's', better: 'lower', fmt: v => v < 10 ? v.toFixed(2) : v.toFixed(0) });
+    bars('fig-vc-ram', [row('Peak extra memory', d => g(d, 'view_compact.resources.footprint_peak_extra_bytes'))],
+      { title: 'Extra memory during view compaction', sub: 'peak physical footprint over its level just before · lower is better', better: 'lower', fmt: bytes });
+    bars('fig-vc-disk', [row('Peak extra disk', d => g(d, 'view_compact.resources.disk_peak_extra_bytes'))],
+      { title: 'Extra disk during view compaction', sub: 'peak growth of the index directory · lower is better', better: 'lower', fmt: bytes });
+    RENDERERS.push(() => {
+      const host = document.getElementById('fig-vc-sizes');
+      host.replaceChildren();
+      const head = h('div', 'fighead'); const t = h('div');
+      t.append(h('h3', null, 'Index file sizes'), h('div', 'sub', 'start is the index before the churn; before and after bracket the compaction'));
+      head.append(t); host.appendChild(head);
+      const wrap = h('div', 'tablewrap'); const tb = h('table');
+      const tr = h('tr'); ['Server', 'File at start', 'File before', 'Live before', 'File after', 'Reclaimed', 'Time'].forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+      for (const { key, name } of SERIES) {
+        const m = g(SRC[key], 'view_compact'); if (!m) continue;
+        const r = h('tr');
+        [name, bytes(m.file_bytes_start), bytes(m.file_bytes_before), bytes(m.active_bytes_before), bytes(m.file_bytes_after), bytes(m.reclaimed_bytes), dur(m.secs)]
+          .forEach(c => r.appendChild(h('td', null, c)));
+        tb.appendChild(r);
+      }
+      wrap.appendChild(tb); host.appendChild(wrap);
+    });
+  }
+
+  if (SERIES.some(s => g(SRC[s.key], 'scale.steps'))) {
+    document.getElementById('scale-section').hidden = false;
+    const sc = SERIES.map(s => g(SRC[s.key], 'scale')).find(Boolean);
+    document.getElementById('scale-text').textContent =
+      `Simulated hosts are added one at a time, each a separate loopback source address holding ${compact(sc.per_host)} keep-alive connections, ` +
+      `up to ${compact(sc.per_host * sc.steps.length)}. Every client runs a closed loop: it sends its next request as soon as the last one answers, ` +
+      `choosing evenly among GET of a random ${compact(sc.doc_bytes)}-byte document (from ${compact(sc.pool_docs)}), PUT of its own document, and GET of a random ${compact(sc.att_bytes)}-byte attachment. ` +
+      `After each host joins, the load settles for ${sc.warm_secs} s and is then measured for ${sc.measure_secs} s. ${R.lg_note || 'The load generator runs on the same machine.'}`;
+    const counts = [...new Set(SERIES.flatMap(s => (g(SRC[s.key], 'scale.steps') || []).map(x => x.clients)))].sort((a, b) => a - b);
+    const at = (d, c) => (g(d, 'scale.steps') || []).find(x => x.clients === c);
+    const byClients = f => counts.map(c => row(compact(c), d => { const st = at(d, c); return st ? f(st) : null; }));
+    bars('fig-scale-rps', byClients(st => st.ops_per_sec), { title: 'Requests per second', sub: 'all three request types · higher is better', unit: 'req/s' });
+    bars('fig-scale-mem', byClients(st => st.server_footprint_bytes), { title: 'Server memory', sub: 'peak physical footprint while measuring · lower is better', better: 'lower', fmt: bytes });
+    const lat = (k, what) => [() => byClients(st => g(st, `ops.${k}.${PCT}`)), latOpts(what)];
+    bars('fig-scale-get', ...lat('get', 'GET document'));
+    bars('fig-scale-put', ...lat('put', 'PUT document'));
+    bars('fig-scale-att', ...lat('get_att', 'GET attachment'));
+    RENDERERS.push(() => {
+      const host = document.getElementById('fig-scale-table');
+      host.replaceChildren();
+      const head = h('div', 'fighead'); const t = h('div');
+      t.append(h('h3', null, 'Every step'), h('div', 'sub', 'errors are counted during the measured window; connect errors include retried connection attempts'));
+      head.append(t); host.appendChild(head);
+      const wrap = h('div', 'tablewrap'); const tb = h('table');
+      const tr = h('tr'); ['Server', 'Clients', 'Connected', 'req/s', 'GET p99', 'PUT p99', 'Attachment p99', 'HTTP errors', 'I/O errors', 'Timeouts', 'Connect errors', 'Memory', 'CPU cores'].forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+      const ms = v => v == null ? '–' : v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : v.toFixed(0);
+      for (const { key, name } of SERIES) for (const st of g(SRC[key], 'scale.steps') || []) {
+        const r = h('tr');
+        [name, compact(st.clients), compact(st.connected), compact(st.ops_per_sec), ms(st.ops.get.p99_ms), ms(st.ops.put.p99_ms), ms(st.ops.get_att.p99_ms),
+          compact(st.http_errors), compact(st.io_errors), compact(st.timeouts), compact(st.connect_errors), bytes(st.server_footprint_bytes), st.server_cpu_cores == null ? '–' : st.server_cpu_cores.toFixed(1)]
+          .forEach(c => r.appendChild(h('td', null, c)));
+        tb.appendChild(r);
+      }
+      wrap.appendChild(tb); host.appendChild(wrap);
+    });
+  }
+
+  const ds2 = (E.server || S.server || {}).dataset_bytes;
+  bars('fig-disk-ratio', [row('Compression', d => ds2 && g(d, 'load.file_bytes_after') ? ds2 / g(d, 'load.file_bytes_after') : null)],
+    { title: 'Compression', sub: 'dataset size ÷ database file size after the load · higher is better', unit: '×', fmt: v => v.toFixed(2) + '×' });
+  bars('fig-disk-db', [row('Database', d => g(d, 'load.file_bytes_after'))],
+    { title: 'Database file', sub: 'after the load, no compaction · lower is better', better: 'lower', fmt: bytes });
+  bars('fig-disk-idx', [row('View index', d => g(d, 'view.index_file_bytes'))],
+    { title: 'View index file', sub: 'after a fresh build · lower is better', better: 'lower', fmt: bytes });
+
+  const renderAll = () => RENDERERS.forEach(f => f());
+  renderAll();
+  let rt;
+  addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(renderAll, 120); });
+
+  const M = R.method || [];
+  const ul = document.getElementById('method');
+  M.forEach(m => ul.appendChild(h('li', null, m)));
+})();
+</script>

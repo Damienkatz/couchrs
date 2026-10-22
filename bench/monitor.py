@@ -30,12 +30,21 @@ class RusageV4(ctypes.Structure):
 
 
 _libc = ctypes.CDLL(None)
+LINUX = sys.platform.startswith("linux")
 
 
 def footprint(pid):
     """macOS physical footprint (what Activity Monitor shows). Unlike RSS it
     excludes freed memory malloc has handed back but the kernel has not yet
-    reclaimed, which RSS keeps counting."""
+    reclaimed, which RSS keeps counting. On Linux: proportional set size."""
+    if LINUX:
+        try:
+            for line in open(f"/proc/{pid}/smaps_rollup"):
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        return 0
     ru = RusageV4()
     if _libc.proc_pid_rusage(pid, 4, ctypes.byref(ru)) != 0:  # RUSAGE_INFO_V4
         return 0
@@ -44,7 +53,7 @@ def footprint(pid):
 
 def tree_procs(pid):
     """pid and every descendant process."""
-    out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True).stdout
+    out = subprocess.run(["ps", "-eo", "pid=,ppid="], capture_output=True, text=True).stdout
     kids = {}
     for line in out.splitlines():
         p, pp = (int(x) for x in line.split())
@@ -59,7 +68,7 @@ def tree_procs(pid):
 
 def tree_rss(pid):
     """Resident bytes of pid and every descendant process."""
-    out = subprocess.run(["ps", "-axo", "pid=,ppid=,rss="], capture_output=True, text=True).stdout
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,rss="], capture_output=True, text=True).stdout
     kids, rss = {}, {}
     for line in out.splitlines():
         p, pp, r = (int(x) for x in line.split())
@@ -71,6 +80,17 @@ def tree_rss(pid):
         total += rss.get(p, 0)
         stack.extend(kids.get(p, []))
     return total
+
+
+def cpu_secs(pid):
+    """User + system CPU seconds of a process (Linux only; 0 elsewhere)."""
+    if not LINUX:
+        return 0.0
+    try:
+        f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+        return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+    except OSError:
+        return 0.0
 
 
 def dir_bytes(d):
@@ -92,7 +112,7 @@ def free_bytes(d):
 samples = []
 csv = open(a.csv, "w") if a.csv else None
 if csv:
-    csv.write("t_secs,rss_bytes,dir_bytes,free_bytes,footprint_bytes\n")
+    csv.write("t_secs,rss_bytes,dir_bytes,free_bytes,footprint_bytes,cpu_secs\n")
 t0 = time.time()
 stop = False
 
@@ -105,10 +125,11 @@ def done(*_):
 signal.signal(signal.SIGTERM, done)
 signal.signal(signal.SIGINT, done)
 while not stop:
-    s = (time.time() - t0, tree_rss(a.pid), dir_bytes(a.dir), free_bytes(a.dir), sum(footprint(p) for p in tree_procs(a.pid)))
+    procs = tree_procs(a.pid)
+    s = (time.time() - t0, tree_rss(a.pid), dir_bytes(a.dir), free_bytes(a.dir), sum(footprint(p) for p in procs), sum(cpu_secs(p) for p in procs))
     samples.append(s)
     if csv:
-        csv.write("%.1f,%d,%d,%d,%d\n" % s)
+        csv.write("%.1f,%d,%d,%d,%d,%.2f\n" % s)
         csv.flush()
     time.sleep(a.interval)
 
@@ -125,6 +146,7 @@ json.dump({
     "disk_peak_extra_bytes": peak_dir[2] - start[2],
     "disk_peak_at_secs": peak_dir[0],
     "free_min_bytes": min(s[3] for s in samples),
+    "t0_unix": t0,
     "footprint_start_bytes": start[4],
     "footprint_peak_bytes": max(s[4] for s in samples),
 }, open(a.out, "w"), indent=1)

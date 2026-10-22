@@ -332,15 +332,13 @@ async fn client(id: usize, src: IpAddr, t: Arc<Target>, sh: Arc<Shared>) {
 
 // ---------------------------------------------------- server resources
 
-unsafe extern "C" {
-    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
-}
-
 /// (physical footprint bytes, CPU seconds) of a process, from
 /// rusage_info_v4. Read in-process: spawning `ps` from a process holding
 /// tens of thousands of sockets fails on macOS.
+#[cfg(target_os = "macos")]
 fn proc_usage(pid: i32) -> (u64, f64) {
     unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
         fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
     }
     let mut buf = [0u64; 64];
@@ -355,6 +353,24 @@ fn proc_usage(pid: i32) -> (u64, f64) {
     // wakeup counts, pageins, wired, resident, physical footprint.
     let ticks = (buf[2] + buf[3]) as f64;
     (buf[9], ticks * tb[0] as f64 / tb[1] as f64 / 1e9)
+}
+
+/// (proportional set size bytes, CPU seconds) of a process from /proc.
+#[cfg(not(target_os = "macos"))]
+fn proc_usage(pid: i32) -> (u64, f64) {
+    let pss = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Pss:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
+        .unwrap_or(0)
+        * 1024;
+    let cpu = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            let f: Vec<&str> = s.rsplit_once(')')?.1.split_whitespace().collect();
+            Some((f.get(11)?.parse::<f64>().ok()? + f.get(12)?.parse::<f64>().ok()?) / 100.0)
+        })
+        .unwrap_or(0.0);
+    (pss, cpu)
 }
 
 fn self_cpu() -> f64 {
@@ -372,7 +388,9 @@ fn self_cpu() -> f64 {
 // --------------------------------------------------------------- setup
 
 async fn setup(t: &Target) {
-    let src: IpAddr = "127.0.0.1".parse().unwrap();
+    // Any local address: the clients' host addresses may be loopback aliases
+    // or, across machines, the generator's own interface addresses.
+    let src: IpAddr = "0.0.0.0".parse().unwrap();
     let mut s = connect(t, src).await.expect("connect for setup");
     let db = &t.db;
     let _ = call(&mut s, t, Method::DELETE, &format!("/{db}"), None).await;
@@ -440,6 +458,8 @@ async fn main() {
         let gen_cpu0 = self_cpu();
         let conn_err0 = sh.connect_errors.load(Relaxed);
         *sh.window.write().unwrap() = Some(w.clone());
+        let unix = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        let window_start = unix();
         let t0 = Instant::now();
         let mut fp_peak = fp0;
         while t0.elapsed() < Duration::from_secs(a.measure) {
@@ -456,6 +476,8 @@ async fn main() {
         let total: f64 = ops.values().map(|v| v["ops_per_sec"].as_f64().unwrap()).sum();
         let step = json!({
             "hosts": hi + 1,
+            "window_start_unix": window_start,
+            "window_end_unix": unix(),
             "clients": clients,
             "connected": sh.connected.load(Relaxed),
             "secs": secs,

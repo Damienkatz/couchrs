@@ -112,6 +112,41 @@ if any("scale" in v for v in results.values() if isinstance(v, dict)):
         "(fabric_worker_timeout on update_docs in its log); at 75K and 90K no PUT succeeded. Its memory and "
         "CPU were not captured in this run (the sampler read the previous CouchDB process while it exited).",
     ]
+if os.environ.get("REPORT_ENV") == "aws":
+    # Concurrent run on AWS: one server node and one load generator per
+    # configuration, all in one availability zone.
+    data["machine"] = {"cpu": "per pair: i4i.4xlarge server (16 vCPU, local NVMe) + c7i.4xlarge load generator",
+                       "ram": "128 GB per server"}
+    data["setting"] = ("ran at the same time on AWS (us-east-1a, one cluster placement group), each on its own "
+                       "i4i.4xlarge server with its own c7i.4xlarge load generator,")
+    data["configs"] = ("All four configurations (CouchDB; couchdb-rs with its B-tree engine; the hybrid, RocksDB "
+                       "documents with B-tree views; and the hybrid with point reads run inline)")
+    data["lg_note"] = ("Each load generator is its own c7i.4xlarge in the server's availability zone; its six "
+                       "private addresses are the six hosts.")
+    data["method"] = [
+        "Servers: Apache CouchDB 3.5.3 (official apache/couchdb:3.5.3 image, Erlang/OTP 27, QuickJS) and "
+        "three couchdb-rs builds, each on its own i4i.4xlarge (16 vCPU, 128 GB RAM, data on the instance's "
+        "local NVMe, XFS). Each server had its own c7i.4xlarge load generator; all eight nodes were in "
+        "us-east-1a in one cluster placement group, and the four pairs ran at the same time.",
+        "Durability: Linux fdatasync for every server (CouchDB's file:datasync, couchdb-rs's sync_data, "
+        "RocksDB's WAL sync).",
+        "CouchDB: single node, q=1 (one shard, like couchdb-rs), automatic compaction (smoosh) off, connection "
+        "cap raised to 200,000, Erlang port limit 262,144, listen backlog 1,024 (tokio's default, which "
+        "couchdb-rs uses). All nodes: 2M open files, somaxconn 65,535, local ports 1024-65535.",
+        "Dataset, phases and the load generator (bench/couchbench) are the same as the Mac runs: 100 GB, "
+        "deterministic from a fixed seed, sizes 100 B to 1 GB, generated text.",
+        "Replication used a CouchDB replicator: CouchDB's own for CouchDB, and a separate CouchDB container on "
+        "each couchdb-rs server node (port 15984) for the couchdb-rs builds, copying each database to a new "
+        "database on the same server.",
+        "View queries and the per-size GET/PUT/DELETE tests use the same 16 (or fewer) concurrent clients as "
+        "on the Mac, so across a network their rates are bounded by round trips (about 0.5 ms here) as well "
+        "as by the server; compare engines within this report rather than against the Mac numbers.",
+        "Server memory and CPU come from a monitor on the server node (resident set and, on Linux, "
+        "proportional set size; CPU from /proc), matched to each measured window by wall-clock time.",
+    ] + [m for m in data["method"] if m.startswith(("couchdb-rs (RocksDB)", "couchdb-rs (RocksDB docs",
+                                                     "View compaction streams", "hybrid, point reads",
+                                                     "RocksDB's own compression", "View rows are keyed",
+                                                     "RocksDB keeps no reductions", "RocksDB compaction"))]
 html = open(os.path.join(here, "report_template.html")).read()
 payload = json.dumps(data).replace("</", "<\\/")
 open(dst, "w").write(html.replace("__DATA__", payload))
