@@ -501,6 +501,67 @@ def show_and_update_functions():
 
 
 @test
+def config_api():
+    sec = "test_" + uuid.uuid4().hex[:8]
+    c = "/_node/_local/_config"
+    s, b, _ = req("GET", "/_node/_local")
+    eq((s, b["name"]), (200, "couchdb@127.0.0.1"))
+    s, b, _ = req("GET", "/_node/nobody@nowhere/_config")
+    eq((s, b), (404, {"error": "not_found", "reason": "no such node: nobody@nowhere"}))
+    s, all_cfg, _ = req("GET", c)
+    eq(s, 200)
+    assert "chttpd" in all_cfg, sorted(all_cfg)
+    eq(req("GET", f"{c}/{sec}")[:2], (200, {}))
+    eq(req("GET", f"{c}/{sec}/k")[:2], (404, {"error": "not_found", "reason": "unknown_config_value"}))
+    # Values are JSON strings, trimmed; PUT and DELETE return the old value.
+    eq(req("PUT", f"{c}/{sec}/k", b"123")[:2], (400, {"error": "bad_request", "reason": "a JSON string expected"}))
+    eq(req("PUT", f"{c}/{sec}/k", "  v1  ")[:2], (200, ""))
+    eq(req("GET", f"{c}/{sec}/k")[:2], (200, "v1"))
+    eq(req("PUT", f"{c}/{sec}/k", "v2")[:2], (200, "v1"))
+    eq(req("GET", f"{c}/{sec}")[:2], (200, {"k": "v2"}))
+    eq(req("GET", c)[1][sec], {"k": "v2"})
+    eq(req("PUT", f"{c}/{sec}/a%5Bb", "x")[:2], (400, {"error": "bad_request", "reason": "Invalid configuration key"}))
+    eq(req("PUT", f"{c}/{sec}/k3", "a\nb")[:2], (400, {"error": "bad_request", "reason": "Invalid configuration value"}))
+    eq(req("PUT", f"{c}/query_servers/js", "x")[:2],
+       (403, {"error": "forbidden", "reason": "Config section blacklisted for modification over HTTP API."}))
+    # An unsaved value is gone after _reload; a saved one isn't.
+    eq(req("PUT", f"{c}/{sec}/temp", "x", headers={"X-Couch-Persist": "false"})[:2], (200, ""))
+    eq(req("GET", f"{c}/{sec}/temp")[:2], (200, "x"))
+    eq(req("POST", f"{c}/_reload")[:2], (200, {"ok": True}))
+    eq(req("GET", f"{c}/{sec}/temp")[0], 404)
+    eq(req("GET", f"{c}/{sec}/k")[:2], (200, "v2"))
+    eq(req("DELETE", f"{c}/{sec}/k")[:2], (200, "v2"))
+    eq(req("DELETE", f"{c}/{sec}/k")[:2], (404, {"error": "not_found", "reason": "unknown_config_value"}))
+    eq(req("GET", f"{c}/{sec}")[:2], (200, {}))
+    for path, method, allowed in [(c, "POST", "GET"), (f"{c}/{sec}", "POST", "GET"),
+                                  (f"{c}/{sec}/k", "POST", "GET,PUT,DELETE"), (f"{c}/_reload", "GET", "POST")]:
+        eq(req(method, path)[:2], (405, {"error": "method_not_allowed", "reason": f"Only {allowed} allowed"}), path)
+    eq(req("GET", f"{c}/a/b/c")[:2], (404, {"error": "not_found", "reason": "missing"}))
+
+    # A new admin's password is stored hashed and works for login.
+    name = "admin_" + uuid.uuid4().hex[:8]
+    auth = {"Authorization": "Basic " + base64.b64encode(f"{name}:pw-{name}".encode()).decode()}
+    eq(req("PUT", f"{c}/admins/{name}", f"pw-{name}")[:2], (200, ""))
+    try:
+        # The first admin ends admin party, so ask as the new admin. CouchDB
+        # hashes the password in the background and refuses the login until
+        # it has.
+        stored = None
+        for _ in range(50):
+            s, stored, _ = req("GET", f"{c}/admins/{name}", headers=auth)
+            if s == 200 and stored.startswith("-pbkdf2:"):
+                break
+            time.sleep(0.1)
+        assert isinstance(stored, str) and stored.startswith("-pbkdf2:sha256-") and stored.endswith(",600000"), stored
+        derived, salt, iters = stored[len("-pbkdf2:sha256-"):].split(",")
+        import hashlib
+        eq(hashlib.pbkdf2_hmac("sha256", f"pw-{name}".encode(), salt.encode(), int(iters)).hex(), derived)
+        eq(req("GET", "/_all_dbs", headers=auth)[0], 200)
+    finally:
+        eq(req("DELETE", f"{c}/admins/{name}", headers=auth)[0], 200)
+
+
+@test
 def show_content_negotiation():
     db = new_db()
     req("PUT", f"/{db}/_design/fn", {

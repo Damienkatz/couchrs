@@ -2,6 +2,7 @@ pub mod api;
 pub mod btree;
 pub mod changes;
 pub mod collate;
+pub mod config;
 pub mod db;
 pub mod doc;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod http;
 pub mod js;
 pub mod keytree;
 pub mod mango;
+pub mod passwords;
 pub mod rstore;
 pub mod server;
 pub mod views;
@@ -20,7 +22,12 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: couchdb-rs [--data-dir DIR] [--bind ADDR:PORT] [--admin USER:PASS] [--fsync-mode fsync|full]\n\
+        "usage: couchdb-rs [--data-dir DIR] [--ini FILE|DIR]... [--bind ADDR:PORT] [--admin USER:PASS]\n\
+         \x20                 [--fsync-mode fsync|full]\n\
+         Configuration is read from the built-in defaults, then each --ini file or\n\
+         directory in order (default: DATA_DIR/local.ini); changes made over the\n\
+         _config API are saved to the last file. --bind and --admin override the\n\
+         files without being saved.\n\
          env: COUCHDB_DATA_DIR, COUCHDB_BIND, COUCHDB_USER, COUCHDB_PASSWORD"
     );
     std::process::exit(2)
@@ -33,7 +40,8 @@ fn main() {
         )
         .init();
     let mut data_dir = std::env::var("COUCHDB_DATA_DIR").unwrap_or_else(|_| "./data".into());
-    let mut bind = std::env::var("COUCHDB_BIND").unwrap_or_else(|_| "127.0.0.1:5984".into());
+    let mut bind = std::env::var("COUCHDB_BIND").ok();
+    let mut inis: Vec<PathBuf> = Vec::new();
     let mut admin = match (std::env::var("COUCHDB_USER"), std::env::var("COUCHDB_PASSWORD")) {
         (Ok(u), Ok(p)) => Some((u, p)),
         _ => None,
@@ -42,7 +50,8 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--data-dir" => data_dir = args.next().unwrap_or_else(|| usage()),
-            "--bind" => bind = args.next().unwrap_or_else(|| usage()),
+            "--bind" => bind = Some(args.next().unwrap_or_else(|| usage())),
+            "--ini" => inis.push(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--fsync-mode" => match args.next().as_deref() {
                 Some("fsync") => {}
                 Some("full") => file::FULL_FSYNC.store(true, std::sync::atomic::Ordering::Relaxed),
@@ -56,12 +65,25 @@ fn main() {
             _ => usage(),
         }
     }
-    let config = server::Config {
-        data_dir: PathBuf::from(data_dir),
-        bind,
-        admin,
-    };
-    let server = server::Server::new(config).unwrap_or_else(|e| {
+    let data_dir = PathBuf::from(data_dir);
+    if inis.is_empty() {
+        inis.push(data_dir.join("local.ini"));
+    }
+    let mut overrides = Vec::new();
+    let mut set = |s: &str, k: &str, v: &str| overrides.push(((s.to_string(), k.to_string()), v.to_string()));
+    if let Some(b) = bind {
+        let (addr, port) = b.rsplit_once(':').unwrap_or_else(|| usage());
+        set("chttpd", "bind_address", addr.trim_start_matches('[').trim_end_matches(']'));
+        set("chttpd", "port", port);
+    }
+    if let Some((u, p)) = admin {
+        set("admins", &u, &p);
+    }
+    let config = config::Config::load(inis, overrides).unwrap_or_else(|e| {
+        eprintln!("failed to start: {}", e.reason);
+        std::process::exit(1)
+    });
+    let server = server::Server::new(data_dir, std::sync::Arc::new(config)).unwrap_or_else(|e| {
         eprintln!("failed to start: {}", e.reason);
         std::process::exit(1)
     });

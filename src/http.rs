@@ -171,29 +171,44 @@ pub async fn handle(State(server): State<Arc<Server>>, req: Request) -> Response
 /// Basic or cookie auth against the configured admin. With no admin
 /// configured the server runs in "admin party" mode.
 fn authorize(req: &Req) -> Result<()> {
-    let Some((user, pass)) = &req.server.config.admin else {
+    if admin_party(&req.server) {
         return Ok(());
-    };
+    }
     // Like CouchDB, the welcome, _up, _session and the web UI's static
     // files need no credentials; Fauxton logs in through _session.
     if req.path.is_empty() || matches!(req.path[0].as_str(), "_up" | "_session" | "_utils") {
         return Ok(());
     }
-    if let Some(h) = req.header("authorization")
-        && let Some(b) = h.strip_prefix("Basic ")
-            && let Ok(d) = crate::doc::B64.decode(b.trim())
-                && String::from_utf8_lossy(&d) == format!("{user}:{pass}") {
-                    return Ok(());
-                }
-    if let Some(name) = session_user(req)
-        && &name == user {
-            return Ok(());
-        }
+    if basic_admin(req).is_some() || session_user(req).is_some() {
+        return Ok(());
+    }
     Err(CouchError::unauthorized("You are not authorized to access this db."))
 }
 
+/// No admins configured: everyone is an admin.
+pub fn admin_party(server: &Server) -> bool {
+    server.config.section("admins").is_empty()
+}
+
+/// Whether name/password match a configured admin.
+fn check_admin(server: &Server, name: &str, password: &str) -> bool {
+    server
+        .config
+        .get("admins", name)
+        .is_some_and(|stored| crate::passwords::verify_admin(&stored, password))
+}
+
+/// The admin a Basic Authorization header names, if its password matches.
+fn basic_admin(req: &Req) -> Option<String> {
+    let h = req.header("authorization")?;
+    let d = crate::doc::B64.decode(h.strip_prefix("Basic ")?.trim()).ok()?;
+    let s = String::from_utf8(d).ok()?;
+    let (u, p) = s.split_once(':')?;
+    check_admin(&req.server, u, p).then(|| u.to_string())
+}
+
 fn session_secret(server: &Server) -> String {
-    format!("{}{}", server.uuid, server.config.admin.as_ref().map(|a| a.1.as_str()).unwrap_or(""))
+    server.config.get_or("chttpd_auth", "secret", &server.uuid)
 }
 
 fn session_token(server: &Server, name: &str, ts: u64) -> String {
@@ -212,7 +227,12 @@ fn session_user(req: &Req) -> Option<String> {
     let mut it = raw.splitn(3, ':');
     let name = it.next()?;
     let ts: u64 = it.next()?.parse().ok()?;
-    if session_token(&req.server, name, ts) == tok && now_secs() < ts + 600 {
+    let timeout: u64 = req.server.config.get_int("chttpd_auth", "timeout", 600);
+    // The session ends with the admin it was issued to.
+    if session_token(&req.server, name, ts) == tok
+        && now_secs() < ts + timeout
+        && req.server.config.get("admins", name).is_some()
+    {
         Some(name.to_string())
     } else {
         None
@@ -363,22 +383,10 @@ pub fn new_uuid() -> String {
 }
 
 fn session(req: &Req) -> Result<Response> {
-    let party = req.server.config.admin.is_none();
+    let party = admin_party(&req.server);
     match req.method {
         Method::GET | Method::HEAD => {
-            let name = if party {
-                None
-            } else {
-                session_user(req).or_else(|| {
-                    req.header("authorization").and_then(|h| {
-                        let d = crate::doc::B64.decode(h.strip_prefix("Basic ")?.trim()).ok()?;
-                        let s = String::from_utf8(d).ok()?;
-                        let (u, p) = s.split_once(':')?;
-                        let (au, ap) = req.server.config.admin.as_ref()?;
-                        (u == au && p == ap).then(|| u.to_string())
-                    })
-                })
-            };
+            let name = if party { None } else { session_user(req).or_else(|| basic_admin(req)) };
             let roles = if party || name.is_some() { json!(["_admin"]) } else { json!([]) };
             ok_json(json!({
                 "ok": true,
@@ -397,8 +405,11 @@ fn session(req: &Req) -> Result<Response> {
             };
             let name = creds.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let pass = creds.get("password").and_then(|n| n.as_str()).unwrap_or("");
-            match &req.server.config.admin {
-                Some((u, p)) if u == name && p == pass => {
+            if party {
+                return ok_json(json!({"ok": true, "name": null, "roles": ["_admin"]}));
+            }
+            match check_admin(&req.server, name, pass) {
+                true => {
                     let tok = session_token(&req.server, name, now_secs());
                     let r = json_response(
                         StatusCode::OK,
@@ -410,8 +421,7 @@ fn session(req: &Req) -> Result<Response> {
                         &format!("AuthSession={tok}; Version=1; Path=/; HttpOnly"),
                     ))
                 }
-                None => ok_json(json!({"ok": true, "name": null, "roles": ["_admin"]})),
-                _ => Err(CouchError::unauthorized("Name or password is incorrect.")),
+                false => Err(CouchError::unauthorized("Name or password is incorrect.")),
             }
         }
         Method::DELETE => {
@@ -422,24 +432,72 @@ fn session(req: &Req) -> Result<Response> {
     }
 }
 
+pub const NODE_NAME: &str = "couchdb@127.0.0.1";
+
+/// /_node/{node}/..., where {node} is _local or this node's name
+/// (chttpd_node).
 fn node(req: &Req) -> Result<Response> {
+    let Some(name) = req.path.get(1) else { return Err(CouchError::not_found("missing")) };
+    if name != "_local" && name != NODE_NAME {
+        return Err(CouchError::not_found(format!("no such node: {name}")));
+    }
     let rest: Vec<&str> = req.path.iter().skip(2).map(|s| s.as_str()).collect();
     match rest.as_slice() {
-        [] => ok_json(json!({"name": "couchdb@127.0.0.1"})),
-        ["_config"] => ok_json(json!({
-            "couchdb": {"database_dir": req.server.config.data_dir.to_string_lossy()},
-            "chttpd": {"bind_address": req.server.config.bind}
-        })),
-        // Settings come from the command line; refuse edits rather than
-        // pretend to apply them.
-        ["_config", ..] if req.method != Method::GET && req.method != Method::HEAD => Err(CouchError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "not_implemented",
-            "couchdb-rs takes its configuration from the command line; it can't be changed over HTTP.",
-        )),
-        ["_config", ..] => ok_json(json!({})),
+        [] => ok_json(json!({"name": NODE_NAME})),
+        ["_config", ..] => node_config(req, &rest[1..]),
         ["_stats", ..] => ok_json(json!({})),
         ["_system"] => ok_json(json!({"uptime": 0})),
+        _ => Err(CouchError::not_found("missing")),
+    }
+}
+
+/// The _config API: the whole config, a section, or one value, which can
+/// be set (a JSON string; X-Couch-Persist: false keeps it out of the ini
+/// file) or deleted, each returning the old value; _reload re-reads the
+/// files. Admin passwords are stored hashed.
+fn node_config(req: &Req, rest: &[&str]) -> Result<Response> {
+    let config = &req.server.config;
+    let persist = req.header("x-couch-persist") != Some("false");
+    match (rest, &req.method) {
+        ([], &Method::GET) => ok_json(json!(config.all())),
+        ([], _) => not_allowed("GET"),
+        (["_reload"], &Method::POST) => {
+            config.reload().map_err(|e| CouchError::bad_request(e.reason))?;
+            ok_json(json!({"ok": true}))
+        }
+        (["_reload"], _) => not_allowed("POST"),
+        ([section], &Method::GET) => {
+            let m: serde_json::Map<String, Value> =
+                config.section(section).into_iter().map(|(k, v)| (k, json!(v))).collect();
+            ok_json(Value::Object(m))
+        }
+        ([_], _) => not_allowed("GET"),
+        ([section, key], &Method::GET) => match config.get(section, key) {
+            Some(v) => ok_json(json!(v)),
+            None => Err(CouchError::not_found("unknown_config_value")),
+        },
+        ([section, key], &Method::PUT) => {
+            crate::config::check_blacklist(section)?;
+            let Ok(Value::String(v)) = serde_json::from_slice::<Value>(&req.body) else {
+                return Err(CouchError::bad_request("a JSON string expected"));
+            };
+            let mut v = v.trim().to_string();
+            let old = config.get(section, key).unwrap_or_default();
+            if *section == "admins" && !crate::passwords::is_hashed(&v) {
+                v = crate::passwords::hash_admin_password(config, &v);
+            }
+            config.set(section, key, &v, persist)?;
+            ok_json(json!(old))
+        }
+        ([section, key], &Method::DELETE) => {
+            crate::config::check_blacklist(section)?;
+            let Some(old) = config.get(section, key) else {
+                return Err(CouchError::not_found("unknown_config_value"));
+            };
+            config.delete(section, key, persist)?;
+            ok_json(json!(old))
+        }
+        ([_, _], _) => not_allowed("GET,PUT,DELETE"),
         _ => Err(CouchError::not_found("missing")),
     }
 }
@@ -456,8 +514,11 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
                 .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
                 .expose_headers([header::ETAG, header::CONTENT_TYPE]),
         );
-    let listener = tokio::net::TcpListener::bind(&server.config.bind).await?;
-    tracing::info!("couchdb-rs listening on http://{}", server.config.bind);
+    let addr = server.config.get_or("chttpd", "bind_address", "127.0.0.1");
+    let port = server.config.get_or("chttpd", "port", "5984");
+    let bind = if addr.contains(':') { format!("[{addr}]:{port}") } else { format!("{addr}:{port}") };
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!("couchdb-rs listening on http://{bind}");
     axum::serve(listener, app).await
 }
 
