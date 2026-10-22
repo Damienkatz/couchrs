@@ -773,7 +773,8 @@ fn view_signature(ddoc: &Value) -> String {
     let empty = Map::new();
     let views = ddoc.get("views").and_then(Value::as_object).unwrap_or(&empty);
     // ((map, options), map names, reduce funs), each list newest first.
-    let mut by_src: Vec<((Value, Value), Vec<String>, Vec<(String, Value)>)> = Vec::new();
+    type ByMap = ((Value, Value), Vec<String>, Vec<(String, Value)>);
+    let mut by_src: Vec<ByMap> = Vec::new();
     for (name, v) in views {
         let Some(map) = v.as_object().and_then(|o| o.get("map")) else { continue };
         let opts = v.get("options").filter(|o| o.is_object()).cloned().unwrap_or_else(|| json!({}));
