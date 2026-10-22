@@ -50,6 +50,8 @@ pub async fn db_request(req: Req) -> Result<Response> {
             crate::views::http_compact_view(&req, &db, &ddoc)
         }
         ["_view_cleanup"] => crate::views::http_view_cleanup(&req, &db),
+        ["_nouveau_cleanup"] => crate::nouveau::http_cleanup(&req, &db),
+        ["_search_cleanup"] => crate::nouveau::http_search_cleanup(&req),
         ["_ensure_full_commit"] => {
             if req.method != Method::POST {
                 return not_allowed("POST");
@@ -89,6 +91,9 @@ pub async fn db_request(req: Req) -> Result<Response> {
                 ["_info"] => crate::views::http_ddoc_info(&req, &db, &id).await,
                 ["_view", view] => crate::views::http_view(&req, &db, &id, view).await,
                 ["_view", view, "queries"] => crate::views::http_view_queries(&req, &db, &id, view).await,
+                ["_nouveau", rest @ ..] => crate::nouveau::http_search(&req, &db, &id, rest, None).await,
+                ["_nouveau_info", rest @ ..] => crate::nouveau::http_info(&req, &db, &id, rest),
+                [kind @ ("_search" | "_search_info" | "_search_disk_size"), rest @ ..] => crate::nouveau::http_dreyfus(&req, &db, &id, kind, rest),
                 ["_show", ..] | ["_list", ..] | ["_update", ..] | ["_rewrite", ..] => {
                     crate::js::http_ddoc_fun(&req, &db, &id, rest).await
                 }
@@ -201,6 +206,7 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
             continue;
         }
         if d.is_design() {
+            crate::nouveau::before_doc_update(d, new_edits);
             *e = crate::auth::check_db_admin(user, &sec).err();
             // Design documents must describe valid indexes (couch_mrview
             // validate), including the partitioned option.
@@ -1124,7 +1130,7 @@ async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[Str
     let r: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
     match r.as_slice() {
         ["_all_docs", ..] => crate::stat!("couchdb.httpd.partition_all_docs_requests").inc(),
-        ["_design", _, "_view", ..] => crate::stat!("couchdb.httpd.partition_view_requests").inc(),
+        ["_design", ..] => crate::stat!("couchdb.httpd.partition_view_requests").inc(),
         ["_find", ..] => crate::stat!("couchdb.httpd.partition_find_requests").inc(),
         ["_explain", ..] => crate::stat!("couchdb.httpd.partition_explain_requests").inc(),
         _ => {}
@@ -1176,6 +1182,13 @@ async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[Str
         }
         ["_find"] => crate::mango::http_find_in(req, db, Some(partition)).await,
         ["_explain"] => crate::mango::http_explain_in(req, db, Some(partition)).await,
+        ["_design", ddoc, "_nouveau", rest @ ..] => {
+            crate::nouveau::http_search(req, db, &format!("_design/{ddoc}"), rest, Some(partition)).await
+        }
+        ["_design", ddoc, "_nouveau_info", rest @ ..] => crate::nouveau::http_info(req, db, &format!("_design/{ddoc}"), rest),
+        ["_design", ddoc, kind @ ("_search" | "_search_info" | "_search_disk_size"), rest @ ..] => {
+            crate::nouveau::http_dreyfus(req, db, &format!("_design/{ddoc}"), kind, rest)
+        }
         _ => Err(CouchError::not_found("missing")),
     }
 }

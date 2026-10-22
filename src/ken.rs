@@ -170,8 +170,32 @@ impl Ken {
                 continue;
             }
             let Ok(idx) = crate::views::get_index(&db, &ddoc, crate::views::index_dir_of(&server, name)) else { continue };
-            if !self.maybe_start_job(&server, &db, (name.to_string(), id), idx, seq) {
+            let (db2, cur) = (db.clone(), idx.state().seq);
+            let run = Box::new(move || idx.update(&db2).map(|_| ()));
+            if !self.maybe_start_job(&server, (name.to_string(), id), cur, run, seq) {
                 outcome = Outcome::Resubmit;
+            }
+        }
+        // Search indexes too (ken_server:nouveau_updated/4).
+        if crate::nouveau::enabled(&server) {
+            for d in crate::views::all_ddocs(&snap)? {
+                if !should_update(&d, "nouveau") {
+                    continue;
+                }
+                for spec in crate::nouveau::design_doc_to_indexes(&d) {
+                    if !crate::nouveau::outdated(&server, &db, &spec) {
+                        continue;
+                    }
+                    let key = (name.to_string(), format!("{}/_nouveau/{}", spec.ddoc_id, spec.name));
+                    let (server2, db2) = (server.clone(), db.clone());
+                    let run = Box::new(move || {
+                        crate::nouveau::update_in_background(&server2, &db2, &spec);
+                        Ok(())
+                    });
+                    if !self.maybe_start_job(&server, key, 0, run, seq) {
+                        outcome = Outcome::Resubmit;
+                    }
+                }
             }
         }
         Ok(outcome)
@@ -181,9 +205,9 @@ impl Ken {
     fn maybe_start_job(
         self: &Arc<Self>,
         server: &Server,
-        db: &Arc<crate::db::Db>,
         name: (String, String),
-        idx: Arc<crate::views::Index>,
+        index_seq: u64,
+        run: Box<dyn FnOnce() -> crate::error::Result<()> + Send>,
         seq: u64,
     ) -> bool {
         let threshold = config_int(server, "max_incremental_updates", 1000);
@@ -192,7 +216,7 @@ impl Ken {
         let mut st = self.st.lock();
         let active = Self::active_count(&st);
         let start = match st.jobs.get(&name) {
-            None => active < batch || (active < total && seq.saturating_sub(idx.state().seq) < threshold),
+            None => active < batch || (active < total && seq.saturating_sub(index_seq) < threshold),
             Some(j) if !j.running => {
                 let dt = j.lru.elapsed();
                 let behind = seq.saturating_sub(j.seq);
@@ -207,9 +231,9 @@ impl Ken {
         }
         st.jobs.insert(name.clone(), Job { running: true, seq, lru: Instant::now() });
         drop(st);
-        let (ken, db) = (self.clone(), db.clone());
+        let ken = self.clone();
         tokio::task::spawn_blocking(move || {
-            let r = idx.update(&db);
+            let r = run();
             if let Some(j) = ken.st.lock().jobs.get_mut(&name) {
                 j.running = false;
             }

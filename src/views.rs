@@ -1520,6 +1520,8 @@ pub fn http_view_cleanup(req: &Req, db: &Arc<Db>) -> Result<Response> {
         return not_allowed("POST");
     }
     cleanup_index_files(&req.server, db)?;
+    // Search indexes too, as fabric_index_cleanup does.
+    crate::nouveau::cleanup(&req.server, db)?;
     Ok(json_response(StatusCode::ACCEPTED, &json!({"ok": true})))
 }
 

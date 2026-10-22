@@ -39,11 +39,14 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha1 = "0.11.0"
 sha2 = "0.11.1"
 snap = "1.1.2"
+tantivy = { version = "0.27.0", default-features = false, features = ["mmap", "lz4-compression"] }
+tantivy-stemmers = { version = "0.4.0", default-features = false, features = ["arabic", "armenian_mkrtchyan", "basque", "catalan", "czech_dolamic_light", "danish", "dutch", "english_porter", "finnish", "french", "german", "hindi_lightweight", "hungarian", "indonesian_tala", "irish_gaelic", "italian", "norwegian_bokmal", "portuguese", "romanian", "russian", "spanish", "swedish", "turkish_cilden"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.0", features = ["full"] }
 tokio-rustls = "0.26.6"
 tokio-stream = "0.1.19"
 tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 tracing = "0.1.44"
+unicode-segmentation = "1.13.3"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4"] }

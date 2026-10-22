@@ -143,11 +143,9 @@ fn parse_kv(k: &str, v: &Value, field: &str) -> Result<Sel> {
                     _ => Cond::KeyMapMatch(inner),
                 })
             }
-            "text" | "default" => Err(CouchError::new(
-                StatusCode::BAD_REQUEST,
-                "no_usable_index",
-                "Text indexes are not supported by this server.",
-            )),
+            // A text index did this matching (or, with none, every
+            // document matches, as in mango_selector:match/3).
+            "text" | "default" => Ok(Sel::And(vec![])),
             _ => Err(invalid(format!("Invalid operator: {k}"))),
         };
     }
@@ -339,6 +337,8 @@ pub struct MangoIndex {
     pub partial: Option<Value>,
     /// The index lives in a partitioned design doc (rows per partition).
     pub partitioned: bool,
+    /// A nouveau index's definition, as stored.
+    pub def: Option<Value>,
 }
 
 impl MangoIndex {
@@ -350,6 +350,7 @@ impl MangoIndex {
             fields: vec![("_id".into(), true)],
             partial: None,
             partitioned: false,
+            def: None,
         }
     }
 
@@ -365,6 +366,9 @@ impl MangoIndex {
         }
         if self.kind == "special" {
             return json!({"ddoc": self.ddoc, "name": self.name, "type": self.kind, "def": def});
+        }
+        if let Some(d) = &self.def {
+            def = crate::nouveau::mango::def_to_json(d);
         }
         json!({"ddoc": self.ddoc, "name": self.name, "type": self.kind, "partitioned": self.partitioned, "def": def})
     }
@@ -391,7 +395,9 @@ fn parse_sort_fields(v: &Value) -> Result<Vec<(String, bool)>> {
     Ok(out)
 }
 
-pub fn list_indexes(snap: &Snapshot) -> Result<Vec<MangoIndex>> {
+/// The indexes Mango can use: _all_docs, then each query design doc's
+/// (nouveau ones only while nouveau is enabled).
+pub fn list_indexes(snap: &Snapshot, nouveau: bool) -> Result<Vec<MangoIndex>> {
     let mut out = vec![MangoIndex::all_docs()];
     for d in views::all_ddocs(snap)? {
         if d.get("language").and_then(|l| l.as_str()) != Some("query") {
@@ -402,6 +408,18 @@ pub fn list_indexes(snap: &Snapshot) -> Result<Vec<MangoIndex>> {
             Some(Value::Bool(b)) => *b,
             _ => snap.partitioned(),
         };
+        for (name, entry) in d.get("nouveau").and_then(Value::as_object).into_iter().flatten().filter(|_| nouveau) {
+            let Some(def) = entry.get("index").filter(|i| crate::nouveau::mango::validate_def(i).is_ok()) else { continue };
+            out.push(MangoIndex {
+                ddoc: Some(id.clone()),
+                name: name.clone(),
+                kind: "nouveau".into(),
+                fields: Vec::new(),
+                partial: crate::nouveau::mango::partial_filter(def),
+                partitioned,
+                def: Some(def.clone()),
+            });
+        }
         let Some(vs) = d.get("views").and_then(|v| v.as_object()) else { continue };
         for (name, v) in vs {
             let fields = v
@@ -430,6 +448,7 @@ pub fn list_indexes(snap: &Snapshot) -> Result<Vec<MangoIndex>> {
                 fields,
                 partial,
                 partitioned,
+                def: None,
             });
         }
     }
@@ -440,7 +459,7 @@ pub async fn http_index(req: &Req, db: &Arc<Db>) -> Result<Response> {
     match req.method {
         Method::GET => {
             let snap = db.snapshot();
-            let idx = blocking(|| list_indexes(&snap))?;
+            let idx = blocking(|| list_indexes(&snap, crate::nouveau::enabled(&req.server)))?;
             let skip = req.q_u64("skip")?.unwrap_or(0) as usize;
             let limit = req.q_u64("limit")?.map(|l| l as usize).unwrap_or(usize::MAX);
             let total = idx.len();
@@ -455,12 +474,15 @@ pub async fn http_index(req: &Req, db: &Arc<Db>) -> Result<Response> {
 async fn create_index(req: &Req, db: &Arc<Db>) -> Result<Response> {
     let body = req.json_obj_body()?;
     let kind = body.get("type").and_then(|t| t.as_str()).unwrap_or("json");
-    if kind != "json" {
-        return Err(CouchError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "not_implemented",
-            format!("Index type {kind} is not supported by this server."),
-        ));
+    match kind {
+        "json" => {}
+        "nouveau" if crate::nouveau::enabled(&req.server) => return create_nouveau_index(req, db, &body).await,
+        // Text indexes need a dreyfus (Clouseau) service, here as in a
+        // CouchDB without one.
+        "text" | "nouveau" => {
+            return Err(CouchError::new(StatusCode::SERVICE_UNAVAILABLE, "required index service unavailable", kind));
+        }
+        _ => return Err(CouchError::new(StatusCode::BAD_REQUEST, "invalid_index", format!("Invalid type for index: {kind}"))),
     }
     let index = body
         .get("index")
@@ -528,27 +550,82 @@ async fn create_index(req: &Req, db: &Arc<Db>) -> Result<Response> {
     ok_json(json!({"result": "created", "id": ddoc_id, "name": name}))
 }
 
+/// A nouveau index (mango_idx_nouveau): its definition kept in the
+/// design document's "nouveau" section, indexed by Nouveau natively.
+async fn create_nouveau_index(req: &Req, db: &Arc<Db>, body: &Map<String, Value>) -> Result<Response> {
+    let index = body.get("index").ok_or_else(|| CouchError::bad_request("Missing required key: index"))?;
+    let def = crate::nouveau::mango::validate_def(index)?;
+    if def["fields"] == json!("all_fields") {
+        match req.server.config.get("mango", "index_all_disabled").as_deref() {
+            Some("true") => {
+                return Err(CouchError::new(StatusCode::FORBIDDEN, "index_all_disabled", "New text indexes are forbidden to index all fields."));
+            }
+            Some("warn") => tracing::warn!("User {:?} is indexing all fields in db {}", req.auth.user.name, db.name),
+            _ => {}
+        }
+    }
+    let snap = db.snapshot();
+    let partitioned = match body.get("partitioned") {
+        None | Some(Value::Null) => snap.partitioned(),
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(CouchError::bad_request("`partitioned` must be a boolean")),
+    };
+    let hash_src = if snap.partitioned() { json!([def, "nouveau", partitioned]) } else { json!([def, "nouveau"]) };
+    let hash = hex::encode(Md5::digest(serde_json::to_vec(&hash_src)?));
+    let ddoc_id = match body.get("ddoc").and_then(|d| d.as_str()) {
+        Some(d) if d.starts_with("_design/") => d.to_string(),
+        Some(d) => format!("_design/{d}"),
+        None => format!("_design/{hash}"),
+    };
+    let name = body.get("name").and_then(|n| n.as_str()).unwrap_or(&hash).to_string();
+    let existing = snap.get_fdi(&ddoc_id)?;
+    let mut doc_json = match existing.as_ref().filter(|f| !f.deleted) {
+        Some(f) => snap.winner_json(f, &DocOpts::default())?,
+        None if snap.partitioned() || partitioned => json!({"_id": ddoc_id, "language": "query", "options": {"partitioned": partitioned}}),
+        None => json!({"_id": ddoc_id, "language": "query"}),
+    };
+    if doc_json.get("language").and_then(|l| l.as_str()) != Some("query") {
+        return Err(CouchError::bad_request(format!("Design document {ddoc_id} is not a query index design doc")));
+    }
+    if doc_json.get("nouveau").and_then(|n| n.get(&name)).and_then(|e| e.get("index")) == Some(&def) {
+        return ok_json(json!({"result": "exists", "id": ddoc_id, "name": name}));
+    }
+    if !doc_json.get("nouveau").is_some_and(Value::is_object) {
+        doc_json["nouveau"] = json!({});
+    }
+    doc_json["nouveau"][&name] = crate::nouveau::mango::ddoc_entry(&def);
+    let doc = from_json(doc_json)?;
+    save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
+    ok_json(json!({"result": "created", "id": ddoc_id, "name": name}))
+}
+
 pub async fn http_delete_index(req: &Req, db: &Arc<Db>, ddoc: &str, kind: &str, name: &str) -> Result<Response> {
     if req.method != Method::DELETE {
         return not_allowed("DELETE");
     }
-    if kind != "json" {
-        return Err(CouchError::not_found("Index not found"));
-    }
-    delete_index(req, db, ddoc, name).await?;
+    let section = match kind {
+        "json" => "views",
+        "nouveau" if crate::nouveau::enabled(&req.server) => "nouveau",
+        _ => return Err(CouchError::not_found("Index not found")),
+    };
+    delete_index(req, db, ddoc, section, name).await?;
     ok_json(json!({"ok": true}))
 }
 
-async fn delete_index(req: &Req, db: &Arc<Db>, ddoc: &str, name: &str) -> Result<()> {
+async fn delete_index(req: &Req, db: &Arc<Db>, ddoc: &str, section: &str, name: &str) -> Result<()> {
     let id = if ddoc.starts_with("_design/") { ddoc.to_string() } else { format!("_design/{ddoc}") };
     let snap = db.snapshot();
     let fdi = snap.get_fdi(&id)?.filter(|f| !f.deleted).ok_or_else(|| CouchError::not_found("Index not found"))?;
     let mut d = snap.winner_json(&fdi, &DocOpts::default())?;
-    let removed = d.get_mut("views").and_then(|v| v.as_object_mut()).and_then(|v| v.remove(name));
+    let removed = d.get_mut(section).and_then(|v| v.as_object_mut()).and_then(|v| v.remove(name));
     if removed.is_none() {
         return Err(CouchError::not_found("Index not found"));
     }
-    if d["views"].as_object().map(|v| v.is_empty()).unwrap_or(true) {
+    if d[section].as_object().is_some_and(|v| v.is_empty()) && section == "nouveau" {
+        d.as_object_mut().map(|o| o.remove("nouveau"));
+    }
+    let empty = |k: &str| d.get(k).and_then(Value::as_object).is_none_or(|v| v.is_empty());
+    if empty("views") && empty("nouveau") {
         d = json!({"_id": id, "_rev": d["_rev"], "_deleted": true});
     }
     let doc = from_json(d)?;
@@ -694,6 +771,9 @@ fn index_range(sel: &Selector, idx: &MangoIndex) -> (Vec<Value>, Option<(Value, 
 
 /// Can this index answer the query (fields required, sort compatible)?
 fn usable(idx: &MangoIndex, q: &FindQuery, required: &[String]) -> bool {
+    if idx.kind == "nouveau" {
+        return false;
+    }
     if idx.kind == "special" {
         return q.sort.is_empty() || (q.sort.len() == 1 && q.sort[0].0 == "_id");
     }
@@ -726,20 +806,34 @@ fn usable(idx: &MangoIndex, q: &FindQuery, required: &[String]) -> bool {
     true
 }
 
-fn choose_index(snap: &Snapshot, q: &FindQuery) -> Result<(MangoIndex, Option<String>)> {
+/// mango_idx_nouveau:is_usable/3: a nouveau index serves a selector
+/// whose fields it indexes (and sorts however asked).
+fn nouveau_usable(idx: &MangoIndex, normalized: &Value) -> bool {
+    if idx.kind != "nouveau" || normalized.as_object().is_some_and(|o| o.is_empty()) {
+        return false;
+    }
+    let Some(def) = &idx.def else { return false };
+    match crate::nouveau::mango::columns(def) {
+        None => true,
+        Some(cols) => crate::nouveau::mango::indexable_fields(normalized).is_ok_and(|fs| fs.iter().all(|f| cols.contains(f))),
+    }
+}
+
+fn choose_index(req: &Req, snap: &Snapshot, q: &FindQuery) -> Result<(MangoIndex, Option<String>)> {
     // A partition query can use partitioned indexes only, a global one
     // global indexes only; _all_docs serves both.
-    let all: Vec<MangoIndex> = list_indexes(snap)?
+    let all: Vec<MangoIndex> = list_indexes(snap, crate::nouveau::enabled(&req.server))?
         .into_iter()
         .filter(|i| i.kind == "special" || i.partitioned == q.partition.is_some())
         .collect();
     let required = q.selector.required_fields();
+    let normalized = normalize_selector(&q.selector.raw)?;
     if let Some((ddoc, name)) = &q.use_index {
         let found: Vec<&MangoIndex> = all
             .iter()
             .filter(|i| i.ddoc.as_deref() == Some(ddoc.as_str()) && name.as_ref().map(|n| n == &i.name).unwrap_or(true))
             .collect();
-        if let Some(i) = found.iter().find(|i| usable(i, q, &required)) {
+        if let Some(i) = found.iter().find(|i| nouveau_usable(i, &normalized) || usable(i, q, &required)) {
             return Ok(((*i).clone(), None));
         }
         crate::stat!("mango.query_invalid_index").inc();
@@ -747,6 +841,20 @@ fn choose_index(snap: &Snapshot, q: &FindQuery) -> Result<(MangoIndex, Option<St
         // Fall through to automatic selection with a warning.
         let (i, w) = auto_index(&all, q, &required)?;
         return Ok((i, Some(w.map(|w| format!("{warn}\n{w}")).unwrap_or(warn))));
+    }
+    // A usable nouveau index is preferred to any view (the first cursor
+    // with indexes wins, mango_cursor:group_indexes_by_type/1).
+    let nouveau: Vec<&MangoIndex> = all.iter().filter(|i| i.partial.is_none() && nouveau_usable(i, &normalized)).collect();
+    match nouveau.as_slice() {
+        [] => {}
+        [i] => return Ok(((*i).clone(), None)),
+        _ => {
+            return Err(CouchError::new(
+                StatusCode::BAD_REQUEST,
+                "multiple_nouveau_indexes",
+                "You must specify an index with the `use_index` parameter.",
+            ));
+        }
     }
     auto_index(&all, q, &required)
 }
@@ -918,7 +1026,10 @@ fn mrargs(idx: &MangoIndex, q: &FindQuery) -> (QueryArgs, Value) {
 fn run_find(req_server: &Req, db: &Arc<Db>, q: &FindQuery) -> Result<Value> {
     let t0 = Instant::now();
     let snap = db.snapshot();
-    let (idx, warning) = choose_index(&snap, q)?;
+    let (idx, warning) = choose_index(req_server, &snap, q)?;
+    if idx.kind == "nouveau" {
+        return run_nouveau_find(req_server, db, q, &idx, t0);
+    }
     let (args, _) = mrargs(&idx, q);
     let mut stats = Stats { keys: 0, docs: 0, returned: 0 };
     let mut docs = Vec::new();
@@ -1087,6 +1198,102 @@ fn run_find(req_server: &Req, db: &Arc<Db>, q: &FindQuery) -> Result<Value> {
     Ok(out)
 }
 
+/// mango_cursor_nouveau:sort_query/1.
+fn nouveau_sort(sort: &[(String, bool)]) -> Result<Option<Vec<String>>> {
+    if sort.is_empty() {
+        return Ok(None);
+    }
+    sort.iter()
+        .map(|(f, asc)| {
+            let e = crate::nouveau::mango::escape_user(f)?;
+            Ok(if *asc { e } else { format!("-{e}") })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// _find on a nouveau index (mango_cursor_nouveau): search with the
+/// selector as a Lucene query, a page at a time, keeping the documents
+/// that match it (the query can only narrow them down).
+fn run_nouveau_find(req: &Req, db: &Arc<Db>, q: &FindQuery, idx: &MangoIndex, t0: Instant) -> Result<Value> {
+    let normalized = normalize_selector(&q.selector.raw)?;
+    let query = crate::nouveau::mango::selector_query(&normalized)?;
+    let snap = db.snapshot();
+    let ddoc_id = idx.ddoc.clone().unwrap_or_default();
+    let fdi = snap.get_fdi(&ddoc_id)?.filter(|f| !f.deleted).ok_or_else(|| CouchError::not_found("missing"))?;
+    let spec = crate::nouveau::design_doc_to_index(&snap.winner_json(&fdi, &DocOpts::default())?, &idx.name)?;
+    let max = req.server.config.get_int("nouveau", "max_limit", 200usize);
+    let mut limit = q.limit.min(max);
+    let mut skip = q.skip;
+    let sort = nouveau_sort(&q.sort)?;
+    // A nouveau bookmark: the last hit's sort values.
+    let mut after: Option<Vec<Value>> = q.bookmark.as_ref().and_then(|b| b.as_array()?.last()?.as_array().cloned());
+    let opts = DocOpts { conflicts: q.conflicts, ..Default::default() };
+    let mut stats = Stats { keys: 0, docs: 0, returned: 0 };
+    let mut docs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let search_error = |e: CouchError| CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, "nouveau_search_error", format!("{}: {}", e.error, e.reason));
+    'pages: while !query.is_empty() && limit > 0 {
+        let args = crate::nouveau::SearchArgs {
+            bookmark: None,
+            counts: None,
+            include_docs: false,
+            limit: (limit + skip).min(max) as i64,
+            locale: None,
+            partition: q.partition.clone(),
+            query: query.clone(),
+            ranges: None,
+            sort: sort.clone(),
+            top_n: 10,
+            update: true,
+        };
+        let found = crate::nouveau::search_after(&req.server, db, &spec, &args, after.clone()).map_err(search_error)?;
+        if found.results.hits.is_empty() {
+            break;
+        }
+        let snap = db.snapshot();
+        for h in &found.results.hits {
+            after = Some(h.order.clone());
+            let Some(fdi) = snap.get_fdi(&h.id)?.filter(|f| !f.deleted) else { continue };
+            stats.docs += 1;
+            let doc = snap.winner_json(&fdi, &opts)?;
+            if q.selector.matches(&doc) && seen.insert(h.id.clone()) {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                docs.push(project(&doc, &q.fields));
+                limit -= 1;
+                if limit == 0 {
+                    break 'pages;
+                }
+            }
+        }
+    }
+    stats.returned = docs.len() as u64;
+    let mut out = json!({"docs": docs, "bookmark": crate::nouveau::pack_bookmark(&after)});
+    crate::stat!("mango.docs_examined").add(stats.docs as i64);
+    crate::stat!("mango.results_returned").add(stats.returned as i64);
+    crate::stat!("mango.query_time").observe(crate::stats::ms_since(t0));
+    crate::db::count_reads(&snap, stats.docs);
+    let ratio = if stats.returned == 0 { stats.docs as f64 } else { stats.docs as f64 / stats.returned as f64 };
+    let threshold = req.server.config.get_int("mango", "index_scan_warning_threshold", 10);
+    if threshold > 0 && ratio > threshold as f64 {
+        crate::stat!("mango.too_many_docs_scanned").inc();
+        out["warning"] = json!("The number of documents examined is high in proportion to the number of results returned. Consider adding a more specific index to improve this.");
+    }
+    if q.execution_stats {
+        out["execution_stats"] = json!({
+            "total_keys_examined": stats.keys,
+            "total_docs_examined": stats.docs,
+            "total_quorum_docs_examined": 0,
+            "results_returned": stats.returned,
+            "execution_time_ms": t0.elapsed().as_secs_f64() * 1000.0
+        });
+    }
+    Ok(out)
+}
+
 pub async fn http_find(req: &Req, db: &Arc<Db>) -> Result<Response> {
     http_find_in(req, db, None).await
 }
@@ -1116,9 +1323,20 @@ pub async fn http_explain_in(req: &Req, db: &Arc<Db>, partition: Option<&str>) -
     let mut q = parse_find(&body)?;
     q.partition = partition.map(String::from);
     let snap = db.snapshot();
-    let (idx, _) = blocking(|| choose_index(&snap, &q))?;
+    let (idx, _) = blocking(|| choose_index(req, &snap, &q))?;
     let (_, shown) = mrargs(&idx, &q);
-    Ok(json_response(StatusCode::OK, &explain_json(&db.name, &idx, &q, &shown)))
+    let mut out = explain_json(&db.name, &idx, &q, &shown);
+    if idx.kind == "nouveau" {
+        // mango_cursor_nouveau:explain/1: the Lucene query in place of
+        // view arguments.
+        let o = out.as_object_mut().unwrap();
+        o.remove("mrargs");
+        o.remove("covering");
+        o.insert("query".into(), json!(crate::nouveau::mango::selector_query(&normalize_selector(&q.selector.raw)?)?));
+        o.insert("partition".into(), json!(q.partition));
+        o.insert("sort".into(), json!(nouveau_sort(&q.sort)?));
+    }
+    Ok(json_response(StatusCode::OK, &out))
 }
 
 #[cfg(test)]

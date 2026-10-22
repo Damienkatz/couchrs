@@ -216,6 +216,64 @@ function __map(docjson) {
   __emits = null;
   return JSON.stringify(out);
 }
+// Nouveau index functions call index(), as CouchDB's nouveau.js has it.
+var __index_results = null;
+function index(type, name, value, options) {
+  if (__index_results === null) throw new Error("index called outside of a nouveau index function");
+  function assertType(what, expected, actual) {
+    if (typeof actual !== expected) {
+      throw ({ name: 'TypeError', message: 'type of ' + what + ' must be a ' + expected + ' not ' + typeof actual });
+    }
+  }
+  assertType('type', 'string', type);
+  assertType('name', 'string', name);
+  if (name.substring(0, 1) === '_') {
+    throw ({ name: 'ReservedName', message: 'name must not start with an underscore' });
+  }
+  options = options || {};
+  switch (type) {
+    case 'double':
+    case 'string':
+      assertType('value', type == 'double' ? 'number' : 'string', value);
+      __index_results.push({'@type': type, 'name': name, 'value': value, 'store': options.store, 'facet': options.facet});
+      break;
+    case 'text':
+      assertType('value', 'string', value);
+      __index_results.push({'@type': type, 'name': name, 'value': value, 'store': options.store});
+      break;
+    case 'stored':
+      if (typeof value != 'number' && typeof value != 'string') {
+        throw ({ name: 'TypeError', message: 'type of ' + value + ' must be a string or number' });
+      }
+      __index_results.push({'@type': type, 'name': name, 'value': value});
+      break;
+    default:
+      throw ({ name: 'TypeError', message: type + ' not supported' });
+  }
+}
+function __nouveau(docjson) {
+  var doc = __freeze(JSON.parse(docjson));
+  var out = [];
+  try {
+    for (var i = 0; i < __funs.length; i++) {
+      __index_results = [];
+      try {
+        __funs[i](doc);
+        out.push(__index_results);
+      } catch (e) {
+        if (e == "fatal_error") throw(["error", "map_runtime_error", "function raised 'fatal_error'"]);
+        if (e && e[0] == "fatal") throw(e);
+        log("function raised exception " + (e && e.toSource ? e.toSource() : String(e)) + " with doc._id " + doc._id);
+        out.push([]);
+      }
+    }
+  } catch (e) {
+    return JSON.stringify(__errjson(e));
+  } finally {
+    __index_results = null;
+  }
+  return JSON.stringify({ok: out});
+}
 function __reduce(i, kvjson, rereduce) {
   try {
     var kv = JSON.parse(kvjson);
@@ -492,6 +550,13 @@ impl JsFuns {
             res.push(rows);
         }
         Ok(res)
+    }
+
+    /// A Nouveau index function's fields for a document, per function:
+    /// what each index() call recorded ({"@type", name, value, store}).
+    pub fn index_doc(&self, doc: &Value) -> Result<Vec<Vec<Value>>> {
+        let out = unwrap_ok(self.call("__nouveau", CallArgs::S(doc.to_string()))?)?;
+        Ok(out.as_array().cloned().unwrap_or_default().into_iter().map(|f| f.as_array().cloned().unwrap_or_default()).collect())
     }
 
     /// `kvs` holds ([key, docid], value) pairs.

@@ -16,6 +16,7 @@ pub mod jwt;
 pub mod ken;
 pub mod keytree;
 pub mod mango;
+pub mod nouveau;
 pub mod passwords;
 pub mod replicator;
 pub mod rewrite;

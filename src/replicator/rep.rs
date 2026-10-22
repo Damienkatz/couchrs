@@ -587,6 +587,8 @@ pub enum Term {
     Float(f64),
     List(Vec<Term>),
     Tuple(Vec<Term>),
+    /// A map, its pairs in key order (as small maps are).
+    Map(Vec<(Term, Term)>),
 }
 
 impl Term {
@@ -648,6 +650,14 @@ impl Term {
                     t.encode_into(out);
                 }
                 out.push(106);
+            }
+            Term::Map(pairs) => {
+                out.push(116);
+                out.extend_from_slice(&(pairs.len() as u32).to_be_bytes());
+                for (k, v) in pairs {
+                    k.encode_into(out);
+                    v.encode_into(out);
+                }
             }
             Term::Tuple(t) => {
                 if t.len() <= 255 {

@@ -286,6 +286,8 @@ async fn route(req: Req) -> Result<Response> {
             "all_nodes": ["couchdb@127.0.0.1"], "cluster_nodes": ["couchdb@127.0.0.1"]
         })),
         Some("_node") => node(&req),
+        Some("_nouveau_analyze") => crate::nouveau::http_analyze(&req),
+        Some("_search_analyze") => crate::nouveau::http_search_analyze(&req),
         Some("_replicate") => crate::replicator::http_replicate(&req).await,
         Some("_scheduler") => crate::replicator::http_scheduler(&req),
         Some("_db_updates") => crate::changes::db_updates(req).await,

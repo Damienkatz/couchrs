@@ -60,10 +60,16 @@ def _json(b):
         return b
 
 
+# Databases the tests made, deleted at the end (whether or not a test
+# deleted its own), so a shared server is left as it was.
+CREATED = []
+
+
 def new_db():
     name = "t" + uuid.uuid4().hex[:12]
     s, _, _ = req("PUT", "/" + name)
     assert s == 201, s
+    CREATED.append(name)
     return name
 
 
@@ -427,48 +433,51 @@ def validate_doc_update():
 @test
 def mango():
     db = new_db()
-    people = [{"_id": f"u{i}", "name": n, "age": a, "city": c, "pets": p}
-              for i, (n, a, c, p) in enumerate([("ann", 31, "nyc", ["cat"]), ("bob", 25, "sf", []),
-                                                ("cat", 42, "nyc", ["dog", "cat"]), ("dan", 19, "la", ["fish"]),
-                                                ("eve", 25, "sf", ["dog"])])]
-    req("POST", f"/{db}/_bulk_docs", {"docs": people})
-    s, b, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gt": 24}}, "fields": ["_id"]})
-    eq(sorted(d["_id"] for d in b["docs"]), ["u0", "u1", "u2", "u4"])
-    assert "warning" in b
-    s, b, _ = req("POST", f"/{db}/_index", {"index": {"fields": ["age"]}, "name": "age-idx", "ddoc": "ages"})
-    eq((b["result"], b["id"]), ("created", "_design/ages"))
-    s, b, _ = req("POST", f"/{db}/_index", {"index": {"fields": ["age"]}, "name": "age-idx", "ddoc": "ages"})
-    eq(b["result"], "exists")
-    s, b, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gte": 25}}, "sort": [{"age": "desc"}],
-                                           "fields": ["name", "age"], "execution_stats": True})
-    eq([d["name"] for d in b["docs"]][:2], ["cat", "ann"])
-    eq(len(b["docs"]), 4)
-    assert "warning" not in b
-    eq(b["execution_stats"]["results_returned"], 4)
-    s, b, _ = req("POST", f"/{db}/_explain", {"selector": {"age": {"$gte": 25}}})
-    eq(b["index"]["name"], "age-idx")
-    s, b, _ = req("POST", f"/{db}/_find", {"selector": {"pets": {"$elemMatch": {"$eq": "dog"}}, "city": "nyc"}})
-    eq([d["_id"] for d in b["docs"]], ["u2"])
-    s, b, _ = req("POST", f"/{db}/_find", {"selector": {"name": {"$gt": None}}, "sort": ["name"]})
-    eq(s, 400)
-    eq(b["error"], "no_usable_index")
-    # pagination with bookmarks
-    s, b1, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gt": 0}}, "sort": [{"age": "asc"}], "limit": 2})
-    s, b2, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gt": 0}}, "sort": [{"age": "asc"}], "limit": 2,
-                                            "bookmark": b1["bookmark"]})
-    s, b3, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gt": 0}}, "sort": [{"age": "asc"}], "limit": 2,
-                                            "bookmark": b2["bookmark"]})
-    ages = [d["age"] for d in b1["docs"] + b2["docs"] + b3["docs"]]
-    eq(ages, [19, 25, 25, 31, 42])
-    s, b, _ = req("GET", f"/{db}/_index")
-    eq([i["name"] for i in b["indexes"]], ["_all_docs", "age-idx"])
-    s, b, _ = req("DELETE", f"/{db}/_index/_design/ages/json/age-idx")
-    eq(s, 200)
-    s, b, _ = req("GET", f"/{db}/_index")
-    eq(b["total_rows"], 1)
-    # _id range on the special index
-    s, b, _ = req("POST", f"/{db}/_find", {"selector": {"_id": {"$gt": "u2"}}, "fields": ["_id"]})
-    eq([d["_id"] for d in b["docs"]], ["u3", "u4"])
+    try:
+        people = [{"_id": f"u{i}", "name": n, "age": a, "city": c, "pets": p}
+                  for i, (n, a, c, p) in enumerate([("ann", 31, "nyc", ["cat"]), ("bob", 25, "sf", []),
+                                                    ("cat", 42, "nyc", ["dog", "cat"]), ("dan", 19, "la", ["fish"]),
+                                                    ("eve", 25, "sf", ["dog"])])]
+        req("POST", f"/{db}/_bulk_docs", {"docs": people})
+        s, b, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gt": 24}}, "fields": ["_id"]})
+        eq(sorted(d["_id"] for d in b["docs"]), ["u0", "u1", "u2", "u4"])
+        assert "warning" in b
+        s, b, _ = req("POST", f"/{db}/_index", {"index": {"fields": ["age"]}, "name": "age-idx", "ddoc": "ages"})
+        eq((b["result"], b["id"]), ("created", "_design/ages"))
+        s, b, _ = req("POST", f"/{db}/_index", {"index": {"fields": ["age"]}, "name": "age-idx", "ddoc": "ages"})
+        eq(b["result"], "exists")
+        s, b, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gte": 25}}, "sort": [{"age": "desc"}],
+                                               "fields": ["name", "age"], "execution_stats": True})
+        eq([d["name"] for d in b["docs"]][:2], ["cat", "ann"])
+        eq(len(b["docs"]), 4)
+        assert "warning" not in b
+        eq(b["execution_stats"]["results_returned"], 4)
+        s, b, _ = req("POST", f"/{db}/_explain", {"selector": {"age": {"$gte": 25}}})
+        eq(b["index"]["name"], "age-idx")
+        s, b, _ = req("POST", f"/{db}/_find", {"selector": {"pets": {"$elemMatch": {"$eq": "dog"}}, "city": "nyc"}})
+        eq([d["_id"] for d in b["docs"]], ["u2"])
+        s, b, _ = req("POST", f"/{db}/_find", {"selector": {"name": {"$gt": None}}, "sort": ["name"]})
+        eq(s, 400)
+        eq(b["error"], "no_usable_index")
+        # pagination with bookmarks
+        s, b1, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gt": 0}}, "sort": [{"age": "asc"}], "limit": 2})
+        s, b2, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gt": 0}}, "sort": [{"age": "asc"}], "limit": 2,
+                                                "bookmark": b1["bookmark"]})
+        s, b3, _ = req("POST", f"/{db}/_find", {"selector": {"age": {"$gt": 0}}, "sort": [{"age": "asc"}], "limit": 2,
+                                                "bookmark": b2["bookmark"]})
+        ages = [d["age"] for d in b1["docs"] + b2["docs"] + b3["docs"]]
+        eq(ages, [19, 25, 25, 31, 42])
+        s, b, _ = req("GET", f"/{db}/_index")
+        eq([i["name"] for i in b["indexes"]], ["_all_docs", "age-idx"])
+        s, b, _ = req("DELETE", f"/{db}/_index/_design/ages/json/age-idx")
+        eq(s, 200)
+        s, b, _ = req("GET", f"/{db}/_index")
+        eq(b["total_rows"], 1)
+        # _id range on the special index
+        s, b, _ = req("POST", f"/{db}/_find", {"selector": {"_id": {"$gt": "u2"}}, "fields": ["_id"]})
+        eq([d["_id"] for d in b["docs"]], ["u3", "u4"])
+    finally:
+        req("DELETE", f"/{db}")
 
 
 @test
@@ -1684,16 +1693,334 @@ def gzip_and_attachment_encoding():
         req("DELETE", f"/{db}")
 
 
+
+NOUVEAU_DDOC = {
+    # Built when searched (not in the background), to see it not built.
+    "autoupdate": False,
+    "nouveau": {
+        "bar": {
+            "default_analyzer": "standard",
+            "index": """function (doc) {
+              index("string", "foo", doc.foo, {store: true});
+              index("double", "bar", doc.bar, {store: true});
+              index("stored", "baz", doc.foo);
+              if (doc.baz) {index("text", "txt", doc.baz);}
+            }""",
+        }
+    }
+}
+
+
+def _nouveau_docs(db):
+    docs = [
+        {"_id": "doc4", "foo": "foo", "bar": 42, "baz": "hello hello"},
+        {"_id": "doc3", "foo": "bar", "bar": 12.0, "baz": "hello there"},
+        {"_id": "doc1", "foo": "baz", "bar": 0, "baz": "there"},
+        {"_id": "doc2", "foo": "foobar", "bar": 100, "baz": "hi"},
+    ]
+    s, b, _ = req("POST", f"/{db}/_bulk_docs", {"docs": docs})
+    eq(s, 201)
+    return b
+
+
+def _nouveau_sig(index):
+    """sha256 of term_to_binary({LuceneVersion, Analyzer, #{}, Def}), as
+    nouveau_util signs an index."""
+    import hashlib
+    def b(x):
+        x = x.encode()
+        return bytes([109]) + len(x).to_bytes(4, "big") + x
+    term = bytes([131, 104, 4, 97, index["lucene_version"]]) + b(index["default_analyzer"]) + bytes([116, 0, 0, 0, 0]) + b(index["index"])
+    return hashlib.sha256(term).hexdigest()
+
+
+@test
+def nouveau_search():
+    s, _, _ = req("POST", "/_nouveau_analyze", {"analyzer": "standard", "text": "hello there"})
+    if s != 404:
+        _nouveau_enabled()
+        req("PUT", "/_node/_local/_config/nouveau/enable", "false", headers={"X-Couch-Persist": "false"})
+    try:
+        _nouveau_disabled()
+    finally:
+        if s != 404:
+            req("PUT", "/_node/_local/_config/nouveau/enable", "true", headers={"X-Couch-Persist": "false"})
+
+
+def _nouveau_disabled():
+    # As CouchDB ships ([nouveau] enable = false): nothing to be found,
+    # though new design documents still get a lucene_version.
+    missing = {"error": "not_found", "reason": "missing"}
+    db = new_db()
+    try:
+        eq(req("PUT", f"/{db}/_design/foo", NOUVEAU_DDOC)[0], 201)
+        eq(req("GET", f"/{db}/_design/foo")[1]["nouveau"]["bar"]["lucene_version"], 10)
+        eq(req("POST", "/_nouveau_analyze", {"analyzer": "standard", "text": "hi"})[:2], (404, missing))
+        eq(req("GET", "/_nouveau_analyze")[:2], (405, {"error": "method_not_allowed", "reason": "Only POST allowed"}))
+        eq(req("GET", f"/{db}/_design/foo/_nouveau/bar?q=*:*")[:2], (404, missing))
+        eq(req("POST", f"/{db}/_design/foo/_nouveau/bar", {"q": "*:*"})[:2], (404, missing))
+        eq(req("GET", f"/{db}/_design/foo/_nouveau_info/bar")[:2], (404, missing))
+        eq(req("POST", f"/{db}/_nouveau_cleanup", {})[:2], (202, {"ok": True}))
+        eq(req("POST", f"/{db}/_nouveau_cleanup", b"{}", headers={"Content-Type": "text/plain"})[:2],
+           (415, {"error": "bad_content_type", "reason": "Content-Type must be application/json"}))
+        # Nor the older text search (dreyfus), without its Clouseau.
+        nosearch = (503, {"error": "service unavailable", "reason": "Search is not available"})
+        eq(req("PUT", f"/{db}/_design/s", {"indexes": {"i": {"index": "function(doc){index('default', doc.a)}"}}})[0], 201)
+        eq(req("GET", f"/{db}/_design/s/_search/i?q=a")[:2], nosearch)
+        eq(req("POST", f"/{db}/_design/s/_search/i", {"q": "a"})[:2], nosearch)
+        eq(req("GET", f"/{db}/_design/s/_search_info/i")[:2], nosearch)
+        eq(req("PUT", f"/{db}/_design/s/_search/i", {})[:2], (405, {"error": "method_not_allowed", "reason": "Only GET,POST allowed"}))
+        eq(req("POST", "/_search_analyze", {"analyzer": "standard", "text": "hi"})[:2], nosearch)
+        eq(req("POST", f"/{db}/_search_cleanup", {})[:2], (202, {"ok": True}))
+        eq(req("GET", f"/{db}/_search_cleanup")[:2], (405, {"error": "method_not_allowed", "reason": "Only POST allowed"}))
+        # Mango: no nouveau (or text) indexes; $text alone matches anything.
+        unavailable = lambda kind: (503, {"error": "required index service unavailable", "reason": kind})
+        mango_idx = {"type": "nouveau", "index": {"fields": [{"name": "foo", "type": "string"}]}}
+        eq(req("POST", f"/{db}/_index", mango_idx)[:2], unavailable("nouveau"))
+        eq(req("POST", f"/{db}/_index", dict(mango_idx, type="text"))[:2], unavailable("text"))
+        eq(req("POST", f"/{db}/_index", dict(mango_idx, type="bogus"))[:2], (400, {"error": "invalid_index", "reason": "Invalid type for index: bogus"}))
+        eq(req("PUT", f"/{db}/d1", {"a": "hello"})[0], 201)
+        b = req("POST", f"/{db}/_find", {"selector": {"$text": "hello"}})[1]
+        eq(([d["_id"] for d in b["docs"]], b["warning"]), (["d1"], "No matching index found, create an index to optimize query time."))
+        # Edits of existing design documents are left alone.
+        rev = req("GET", f"/{db}/_design/foo")[1]["_rev"]
+        eq(req("PUT", f"/{db}/_design/foo?rev={rev}", {"nouveau": {"idx2": {"index": "f"}}})[0], 201)
+        assert "lucene_version" not in req("GET", f"/{db}/_design/foo")[1]["nouveau"]["idx2"]
+    finally:
+        req("DELETE", f"/{db}")
+
+
+def _nouveau_enabled():
+    an = lambda a, t: req("POST", "/_nouveau_analyze", {"analyzer": a, "text": t})[:2]
+    eq(an("standard", "hello there"), (200, {"tokens": ["hello", "there"]}))
+    eq(an("standard", "ablanks@renovations.com"), (200, {"tokens": ["ablanks", "renovations.com"]}))
+    eq(an("keyword", "ablanks@renovations.com"), (200, {"tokens": ["ablanks@renovations.com"]}))
+    eq(an("english", "The dogs' running"), (200, {"tokens": ["dog", "run"]}))
+    eq(an("bogus", "x"), (400, {"error": "bad_request", "reason": "bogus is not a valid analyzer name"}))
+    eq(an("standard", ""), (400, {"error": "bad_request", "reason": "text must not be empty"}))
+    eq(req("POST", "/_nouveau_analyze", {"text": "x"})[:2],
+       (400, {"error": "bad_request", "reason": "'text' and 'analyzer' fields must be non-empty strings"}))
+
+    db = new_db()
+    url = f"/{db}/_design/foo/_nouveau/bar"
+    ids = lambda b: [h["doc"]["_id"] if "doc" in h else h["id"] for h in b["hits"]]
+    q = lambda **kw: req("POST", url, kw)
+    try:
+        eq(req("PUT", f"/{db}/_design/foo", NOUVEAU_DDOC)[0], 201)
+        # Not built until searched.
+        eq(req("GET", url + "?q=*:*&update=false")[:2], (404, {"error": "not_found", "reason": "Index does not exist"}))
+        created = _nouveau_docs(db)
+        s, b, _ = req("GET", url + "?q=*:*&include_docs=true")
+        eq(s, 200)
+        # Relevance ties break by _id.
+        eq(ids(b), ["doc1", "doc2", "doc3", "doc4"])
+        eq((b["total_hits"], b["total_hits_relation"], b["counts"], b["ranges"]), (4, "EQUAL_TO", {}, {}))
+        assert b["update_latency"] > 0, b["update_latency"]
+        eq(b["hits"][0]["fields"], {"bar": 0.0, "baz": "baz", "foo": "baz"})
+        eq(b["hits"][0]["order"], [{"@type": "float", "value": 1.0}, {"@type": "string", "value": "doc1"}])
+        eq(req("GET", url + "?q=*:*")[1]["update_latency"], 0)
+
+        info = req("GET", f"/{db}/_design/foo/_nouveau_info/bar")[1]
+        eq(info["name"], "_design/foo/bar")
+        si = info["search_index"]
+        eq((si["num_docs"], si["update_seq"], si["purge_seq"]), (4, 5, 0))
+        assert si["disk_size"] > 0
+        eq(si["signature"], _nouveau_sig(dict(NOUVEAU_DDOC["nouveau"]["bar"], lucene_version=10)))
+
+        # BM25 as Lucene scores it: more hellos in as long a text rank higher.
+        b = q(q="txt:hello")[1]
+        eq(ids(b), ["doc4", "doc3"])
+        scores = [h["order"][0]["value"] for h in b["hits"]]
+        assert abs(scores[0] - 0.39608) < 1e-4 and abs(scores[1] - 0.27726) < 1e-4, scores
+        eq(ids(q(q="txt:hello", sort="-<score>")[1]), ["doc4", "doc3"])
+        eq(ids(q(q="txt:hello", sort="<score>")[1]), ["doc3", "doc4"])
+
+        # Paging by bookmark; past the end, no hits and the same bookmark.
+        b = q(q="*:*", limit=2)[1]
+        eq(ids(b), ["doc1", "doc2"])
+        b = q(q="*:*", limit=2, bookmark=b["bookmark"])[1]
+        eq(ids(b), ["doc3", "doc4"])
+        b2 = q(q="*:*", limit=2, bookmark=b["bookmark"])[1]
+        eq((ids(b2), b2["bookmark"]), ([], b["bookmark"]))
+        eq(q(q="*:*", limit=0)[:2], (400, {"error": "query_parse_error", "reason": "limit parameter must be greater than zero"}))
+
+        # Query syntax.
+        eq(ids(q(q="foo:bar")[1]), ["doc3"])
+        eq(ids(q(q="txt:hel*")[1]), ["doc3", "doc4"])
+        eq(ids(q(q='txt:"hello there"')[1]), ["doc3"])
+        eq(ids(q(q="txt:helo~")[1]), ["doc3", "doc4"])
+        eq(sorted(ids(q(q="foo:foo OR foo:bar")[1])), ["doc3", "doc4"])
+        eq(ids(q(q="txt:hello AND -foo:foo")[1]), ["doc3"])
+        eq(ids(q(q="bar:[10.0 TO 20.0]", locale="us")[1]), ["doc3"])
+        eq(ids(q(q="bar:[10.0 TO 20.0]", locale="de")[1]), ["doc2"])
+        eq(ids(q(q="bar:{0 TO 42]", sort="bar")[1]), ["doc3", "doc4"])
+        eq(ids(q(q="bar>=42", sort="bar")[1]), ["doc4", "doc2"])
+        eq(ids(q(q="bar:12")[1]), ["doc3"])
+        s, b, _ = q(q="txt:(hello")
+        eq((s, b["error"], b["reason"].startswith("Syntax Error, cannot parse txt:(hello")), (400, "bad_request", True))
+        eq(q(q="txt:*llo")[:2], (400, {"error": "bad_request", "reason": "Leading wildcard is not allowed: txt:*llo"}))
+        eq(q(q="bar:abc")[0], 400)
+
+        # Sorting by string and number fields; text fields can't be.
+        eq(ids(q(q="*:*", sort="foo")[1]), ["doc3", "doc1", "doc4", "doc2"])
+        eq(ids(q(q="*:*", sort="-foo")[1]), ["doc2", "doc4", "doc1", "doc3"])
+        eq(ids(q(q="*:*", sort="bar")[1]), ["doc1", "doc3", "doc4", "doc2"])
+        eq(ids(req("GET", url + '?q=*:*&sort="-bar"')[1]), ["doc2", "doc4", "doc3", "doc1"])
+        eq(ids(q(q="*:*", sort=["-bar", "foo"])[1]), ["doc2", "doc4", "doc3", "doc1"])
+        eq(q(q="*:*", sort="bar", limit=1)[1]["hits"][0]["order"],
+           [{"@type": "double", "value": 0.0}, {"@type": "string", "value": "doc1"}])
+        eq(q(q="*:*", sort="txt")[:2], (400, {"error": "bad_request", "reason": "can't sort on field txt"}))
+        eq(q(q="*:*", sort="a b")[:2], (400, {"error": "bad_request", "reason": "a b is not a valid sort parameter"}))
+        # Pages of a field sort.
+        b = q(q="*:*", sort="-bar", limit=3)[1]
+        eq(ids(q(q="*:*", sort="-bar", bookmark=b["bookmark"])[1]), ["doc1"])
+
+        # Facets.
+        eq(q(q="*:*", counts=["foo"])[1]["counts"], {"foo": {"bar": 1, "baz": 1, "foo": 1, "foobar": 1}})
+        r = {"bar": [{"label": "cheap", "min": 0, "max": 42}, {"label": "expensive", "min": 42, "min_inclusive": False, "max": 1000}]}
+        eq(q(q="*:*", ranges=r)[1]["ranges"], {"bar": {"cheap": 3, "expensive": 1}})
+        r = {"bar": [{"label": "cheap", "max": 42}, {"label": "expensive", "min": 42, "min_inclusive": False}]}
+        eq(q(q="*:*", ranges=r)[1]["ranges"], {"bar": {"cheap": 3, "expensive": 1}})
+        eq(q(q="*:*", ranges=r, top_n=1)[1]["ranges"], {"bar": {"cheap": 3}})
+        eq(q(q="*:*", counts=["bar"])[:2], (400, {"error": "bad_request", "reason":
+           "unexpected docvalues type SORTED_NUMERIC for field 'bar' (expected one of [SORTED, SORTED_SET]). Re-index with correct docvalues type."}))
+        eq(q(q="*:*", top_n=1001)[:2], (400, {"error": "bad_request", "reason": "topN must be less than or equal to 1000"}))
+
+        # Arguments.
+        eq(req("GET", url)[:2], (400, {"error": "query_parse_error", "reason": "q parameter is mandatory"}))
+        eq(req("GET", url + "?q=*:*&limit=abc")[:2], (400, {"error": "query_parse_error", "reason": "limit parameter must be an integer"}))
+        eq(req("GET", url + "?q=*:*&update=yes")[:2], (400, {"error": "query_parse_error", "reason": 'Invalid value for update: "yes"'}))
+        eq(req("POST", url, b"{}", headers={"Content-Type": "text/plain"})[0], 415)
+        eq(req("PUT", url, {})[:2], (405, {"error": "method_not_allowed", "reason": "Only GET, POST allowed"}))
+        eq(req("GET", f"/{db}/_design/foo/_nouveau/missing?q=*:*")[:2], (404, {"error": "not_found", "reason": "missing not found."}))
+
+        # Deletions and purges leave the index.
+        d1 = [c for c in created if c["id"] == "doc1"][0]
+        eq(req("DELETE", f"/{db}/doc1?rev={d1['rev']}")[0], 200)
+        eq(q(q="*:*")[1]["total_hits"], 3)
+        si = req("GET", f"/{db}/_design/foo/_nouveau_info/bar")[1]["search_index"]
+        eq((si["update_seq"], si["purge_seq"], si["num_docs"]), (6, 0, 3))
+        d2 = [c for c in created if c["id"] == "doc2"][0]
+        eq(req("POST", f"/{db}/_purge", {"doc2": [d2["rev"]]})[0], 201)
+        eq(ids(q(q="*:*")[1]), ["doc3", "doc4"])
+        dbinfo = req("GET", f"/{db}")[1]
+        si = req("GET", f"/{db}/_design/foo/_nouveau_info/bar")[1]["search_index"]
+        eq((si["update_seq"], si["purge_seq"]), (int(dbinfo["update_seq"].split("-")[0]), int(dbinfo["purge_seq"].split("-")[0])))
+        eq(req("POST", f"/{db}/_nouveau_cleanup", {})[:2], (202, {"ok": True}))
+        eq(q(q="*:*")[1]["total_hits"], 2)
+
+        # One value of a field stored several times comes back as a list.
+        eq(req("PUT", f"/{db}/c", {"colors": ["red", "green"]})[0], 201)
+        many = {"nouveau": {"c": {"index": "function(doc){ (doc.colors || []).forEach(function(c){ index('string', 'color', c, {store: true}); }); }"}}}
+        eq(req("PUT", f"/{db}/_design/many", many)[0], 201)
+        b = req("POST", f"/{db}/_design/many/_nouveau/c", {"q": "*:*"})[1]
+        eq([h["fields"] for h in b["hits"]], [{"color": ["red", "green"]}])
+
+        # Index functions that throw index nothing; conflicting field types
+        # stop the index.
+        bad = {"nouveau": {"t": {"index": "function(doc){ throw(new Error('x')); }"},
+                           "c": {"index": "function(doc){ index('string', 'foo', 'bar'); index('double', 'foo', 12.0); }"}}}
+        eq(req("PUT", f"/{db}/_design/bad", bad)[0], 201)
+        eq(req("POST", f"/{db}/_design/bad/_nouveau/t", {"q": "*:*"})[1]["hits"], [])
+        eq(req("POST", f"/{db}/_design/bad/_nouveau/c", {"q": "*:*"})[:2],
+           (400, {"error": "bad_request", "reason": "field foo is of type DOUBLE not STRING"}))
+    finally:
+        req("DELETE", f"/{db}")
+
+    # Background indexing (ken) builds search indexes too.
+    db = new_db()
+    try:
+        _nouveau_docs(db)
+        auto = {"nouveau": {"a": {"index": "function(doc){ if (doc.foo) index('string', 'foo', doc.foo); }"}}}
+        eq(req("PUT", f"/{db}/_design/auto", auto)[0], 201)
+        def built():
+            s, b, _ = req("GET", f"/{db}/_design/auto/_nouveau_info/a")
+            return s == 200 and b["search_index"]["update_seq"] >= 5
+        assert _wait(built, secs=60), req("GET", f"/{db}/_design/auto/_nouveau_info/a")
+    finally:
+        req("DELETE", f"/{db}")
+
+    # Mango nouveau indexes: the selector as a Lucene query.
+    db = new_db()
+    mids = lambda b: [d["_id"] for d in b["docs"]]
+    find = lambda body: req("POST", f"/{db}/_find", body)
+    try:
+        docs = [{"_id": "doc4", "foo": "foo", "bar": 42, "baz": "hello hello there"}, {"_id": "doc3", "foo": "bar", "bar": 12.0, "baz": "hello"},
+                {"_id": "doc1", "foo": "baz", "bar": 0, "baz": "there"}, {"_id": "doc2", "foo": "foobar", "bar": 100, "baz": "hi"}]
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": docs})[0], 201)
+        fields = [{"name": "foo", "type": "string"}, {"name": "bar", "type": "number"}, {"name": "baz", "type": "string"}]
+        s, b, _ = req("POST", f"/{db}/_index", {"type": "nouveau", "index": {"fields": fields}})
+        eq((s, b["result"]), (200, "created"))
+        ddoc, name = b["id"], b["name"]
+        eq(req("POST", f"/{db}/_index", {"type": "nouveau", "index": {"fields": fields}})[1]["result"], "exists")
+        stored = req("GET", f"/{db}/{ddoc}")[1]
+        eq((stored["language"], stored["nouveau"][name]["lucene_version"]), ("query", 10))
+        listed = [i for i in req("GET", f"/{db}/_index")[1]["indexes"] if i["type"] == "nouveau"]
+        eq(listed, [{"ddoc": ddoc, "name": name, "type": "nouveau", "partitioned": False,
+                     "def": {"default_analyzer": "keyword", "default_field": {}, "selector": {},
+                             "fields": [{"foo": "string"}, {"bar": "number"}, {"baz": "string"}], "index_array_lengths": True}}])
+
+        eq(mids(find({"selector": {"bar": {"$gt": 5}}})[1]), ["doc2", "doc3", "doc4"])
+        eq(mids(find({"selector": {"foo": {"$eq": "foo"}}})[1]), ["doc4"])
+        eq(mids(find({"selector": {"$text": "hello"}})[1]), ["doc4", "doc3"])
+        eq(mids(find({"sort": [{"bar:number": "asc"}], "selector": {"bar": {"$gt": 5}}})[1]), ["doc3", "doc4", "doc2"])
+        eq(mids(find({"sort": [{"foo:string": "asc"}], "selector": {"bar": {"$gte": 0}}})[1]), ["doc3", "doc1", "doc4", "doc2"])
+        eq(mids(find({"selector": {"bar": {"$gt": 5}}, "fields": ["_id"], "limit": 1, "skip": 1})[1]), ["doc3"])
+        # The bookmark pages on.
+        b = find({"selector": {"bar": {"$gt": 5}}, "limit": 2})[1]
+        eq(mids(find({"selector": {"bar": {"$gt": 5}}, "bookmark": b["bookmark"]})[1]), ["doc4"])
+        ex = req("POST", f"/{db}/_explain", {"selector": {"bar": {"$gt": 5}}})[1]
+        eq((ex["index"]["type"], ex["query"], ex["partition"], ex["sort"]), ("nouveau", "(bar_3anumber:{5 TO *])", None, None))
+        # A field the index lacks: another index serves it.
+        eq(find({"selector": {"qux": "a"}})[1]["warning"], "No matching index found, create an index to optimize query time.")
+        eq(req("DELETE", f"/{db}/_index/{ddoc}/nouveau/{name}")[:2], (200, {"ok": True}))
+        eq(req("GET", f"/{db}/{ddoc}")[0], 404)
+    finally:
+        req("DELETE", f"/{db}")
+
+    # Partitioned: the partition's documents only.
+    db = new_db_partitioned()
+    try:
+        docs = [{"_id": "foo:doc4", "foo": "foo", "bar": 42}, {"_id": "bar:doc3", "foo": "bar", "bar": 12.0},
+                {"_id": "foo:doc1", "foo": "baz", "bar": 0}, {"_id": "bar:doc2", "foo": "foobar", "bar": 100}]
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": docs})[0], 201)
+        eq(req("PUT", f"/{db}/_design/foo", NOUVEAU_DDOC)[0], 201)
+        purl = f"/{db}/_partition/foo/_design/foo/_nouveau/bar"
+        eq([h["id"] for h in req("GET", purl + "?q=*:*")[1]["hits"]], ["foo:doc1", "foo:doc4"])
+        eq([h["id"] for h in req("POST", f"/{db}/_partition/bar/_design/foo/_nouveau/bar", {"q": "*:*"})[1]["hits"]],
+           ["bar:doc2", "bar:doc3"])
+        eq(req("GET", purl + "?q=*:*&partition=bar")[:2],
+           (400, {"error": "bad_request", "reason": "Conflicting value for `partition` in query string"}))
+        idx = {"type": "nouveau", "index": {"fields": [{"name": "foo", "type": "string"}, {"name": "bar", "type": "number"}]}}
+        eq(req("POST", f"/{db}/_index", idx)[0], 200)
+        eq([d["_id"] for d in req("POST", f"/{db}/_partition/foo/_find", {"selector": {"foo": {"$eq": "foo"}}})[1]["docs"]], ["foo:doc4"])
+        eq([d["_id"] for d in req("POST", f"/{db}/_partition/bar/_find", {"selector": {"foo": {"$eq": "bar"}}})[1]["docs"]], ["bar:doc3"])
+    finally:
+        req("DELETE", f"/{db}")
+
+
+def new_db_partitioned():
+    name = "t" + uuid.uuid4().hex[:12]
+    s, _, _ = req("PUT", "/" + name + "?partitioned=true")
+    assert s == 201, s
+    CREATED.append(name)
+    return name
+
+
 def main():
     failed = 0
-    for t in TESTS:
-        try:
-            t()
-            print(f"ok   {t.__name__}")
-        except Exception:
-            failed += 1
-            print(f"FAIL {t.__name__}")
-            traceback.print_exc()
+    try:
+        for t in TESTS:
+            try:
+                t()
+                print(f"ok   {t.__name__}")
+            except Exception:
+                failed += 1
+                print(f"FAIL {t.__name__}")
+                traceback.print_exc()
+    finally:
+        for name in CREATED:
+            req("DELETE", "/" + name)
     print(f"\n{len(TESTS) - failed}/{len(TESTS)} passed")
     sys.exit(1 if failed else 0)
 
