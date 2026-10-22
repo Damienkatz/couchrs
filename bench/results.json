@@ -554,6 +554,253 @@
       "reduce_total": 100244872278,
       "request_timeouts_during_build": 3,
       "rows": 3884695
+    },
+    "view_compact": {
+      "active_bytes_after": 176079547,
+      "active_bytes_before": 176113006,
+      "active_bytes_start": 176079547,
+      "churn_docs": 200000,
+      "churn_rounds": [
+        {
+          "active_bytes": 178130293,
+          "file_bytes": 193567812,
+          "index_docs_per_sec": 612245.4446069021,
+          "index_update_secs": 0.326666375,
+          "write_secs": 22.076269333
+        },
+        {
+          "active_bytes": 178136765,
+          "file_bytes": 213951948,
+          "index_docs_per_sec": 562027.127762415,
+          "index_update_secs": 0.355854709,
+          "write_secs": 21.220034167
+        },
+        {
+          "active_bytes": 178137444,
+          "file_bytes": 234536236,
+          "index_docs_per_sec": 566244.201305476,
+          "index_update_secs": 0.3532045,
+          "write_secs": 24.223901833
+        },
+        {
+          "active_bytes": 178139691,
+          "file_bytes": 255319462,
+          "index_docs_per_sec": 551177.0145383466,
+          "index_update_secs": 0.362859834,
+          "write_secs": 23.521147875
+        },
+        {
+          "active_bytes": 176113006,
+          "file_bytes": 260424204,
+          "index_docs_per_sec": 2153488.0751620745,
+          "index_update_secs": 0.092872583,
+          "write_secs": 26.765202584
+        }
+      ],
+      "ended_unix": 1792632552.343808,
+      "file_bytes_after": 176234667,
+      "file_bytes_before": 260424204,
+      "file_bytes_start": 176238763,
+      "live_mb_per_sec": 17.37786967747287,
+      "reclaimed_bytes": 84189537,
+      "resources": {
+        "disk_before_bytes": 2384618554,
+        "disk_peak_bytes": 2558502308,
+        "disk_peak_extra_bytes": 173883754,
+        "footprint_before_bytes": 350899272,
+        "footprint_peak_bytes": 373935176,
+        "footprint_peak_extra_bytes": 23035904,
+        "rss_before_bytes": 285310976,
+        "rss_peak_bytes": 301219840,
+        "rss_peak_extra_bytes": 15908864
+      },
+      "secs": 10.132401167,
+      "started_unix": 1792632542.210628
+    }
+  },
+  "hybrid": {
+    "server": {
+      "bands": [
+        {
+          "band": 2,
+          "share": 0.01
+        },
+        {
+          "band": 3,
+          "share": 0.04
+        },
+        {
+          "band": 4,
+          "share": 0.1
+        },
+        {
+          "band": 5,
+          "share": 0.15
+        },
+        {
+          "band": 6,
+          "share": 0.2
+        },
+        {
+          "band": 7,
+          "share": 0.25
+        },
+        {
+          "band": 8,
+          "share": 0.25
+        }
+      ],
+      "dataset_bytes": 100244872278,
+      "dataset_docs": 3884695,
+      "json_max_bytes": 65536,
+      "seed": 42,
+      "url": "http://127.0.0.1:35984",
+      "welcome": {
+        "couchdb": "Welcome",
+        "features": [
+          "access-ready",
+          "partitioned",
+          "pluggable-storage-engines",
+          "reshard",
+          "scheduler"
+        ],
+        "git_sha": "rust",
+        "uuid": "66d6ece4dd3c44678c1501e72e6c3168",
+        "vendor": {
+          "name": "couchdb-rs"
+        },
+        "version": "3.5.0"
+      }
+    },
+    "view": {
+      "build_secs": 20.915876209,
+      "docs_indexed": 3884696,
+      "docs_per_sec": 185729.536796954,
+      "index_file_bytes": 213442718,
+      "queries": {
+        "group_level1_reduce": {
+          "bytes": 116500,
+          "errors": 0,
+          "max_ms": 0.5352910000000001,
+          "mb_per_sec": 6.216731813391321,
+          "mean_ms": 0.29550424399999997,
+          "ops": 500,
+          "ops_per_sec": 26681.2524179885,
+          "p50_ms": 0.289709,
+          "p90_ms": 0.344625,
+          "p95_ms": 0.370417,
+          "p99_ms": 0.47154199999999996,
+          "secs": 0.01873975
+        },
+        "include_docs_limit10": {
+          "bytes": 190441630,
+          "errors": 0,
+          "max_ms": 3.7028339999999997,
+          "mb_per_sec": 2590.926539725595,
+          "mean_ms": 0.5711321264999999,
+          "ops": 2000,
+          "ops_per_sec": 27209.665656879697,
+          "p50_ms": 0.461916,
+          "p90_ms": 0.9375829999999999,
+          "p95_ms": 1.135917,
+          "p99_ms": 1.782,
+          "secs": 0.073503292
+        },
+        "key_lookup_limit20": {
+          "bytes": 4278293,
+          "errors": 0,
+          "max_ms": 1.6095,
+          "mb_per_sec": 51.17929879568571,
+          "mean_ms": 0.25217902239999945,
+          "ops": 5000,
+          "ops_per_sec": 59812.755689811,
+          "p50_ms": 0.226458,
+          "p90_ms": 0.341166,
+          "p95_ms": 0.372583,
+          "p99_ms": 0.693667,
+          "secs": 0.083594209
+        },
+        "key_reduce": {
+          "bytes": 119785,
+          "errors": 0,
+          "max_ms": 0.401042,
+          "mb_per_sec": 3.2220154368928933,
+          "mean_ms": 0.17970381566666666,
+          "ops": 3000,
+          "ops_per_sec": 80694.96440020602,
+          "p50_ms": 0.173583,
+          "p90_ms": 0.23525,
+          "p95_ms": 0.25866700000000004,
+          "p99_ms": 0.304792,
+          "secs": 0.037177041
+        }
+      },
+      "reduce_expected": 100244872278,
+      "reduce_total": 100244872278,
+      "request_timeouts_during_build": 0,
+      "rows": 3884695
+    },
+    "view_compact": {
+      "active_bytes_after": 213441532,
+      "active_bytes_before": 213441800,
+      "active_bytes_start": 213441532,
+      "churn_docs": 200000,
+      "churn_rounds": [
+        {
+          "active_bytes": 218130281,
+          "file_bytes": 240783519,
+          "index_docs_per_sec": 64966.19633558345,
+          "index_update_secs": 3.078524083,
+          "write_secs": 5.014207875
+        },
+        {
+          "active_bytes": 218135622,
+          "file_bytes": 273535135,
+          "index_docs_per_sec": 43584.529750140355,
+          "index_update_secs": 4.588784166,
+          "write_secs": 5.230313583
+        },
+        {
+          "active_bytes": 218132811,
+          "file_bytes": 306135199,
+          "index_docs_per_sec": 43605.902931079785,
+          "index_update_secs": 4.586535,
+          "write_secs": 5.515395833
+        },
+        {
+          "active_bytes": 218129591,
+          "file_bytes": 338821276,
+          "index_docs_per_sec": 42913.93907234493,
+          "index_update_secs": 4.660490375,
+          "write_secs": 5.505492958
+        },
+        {
+          "active_bytes": 213441800,
+          "file_bytes": 357695644,
+          "index_docs_per_sec": 74297.62163862477,
+          "index_update_secs": 2.691876208,
+          "write_secs": 5.679900334
+        }
+      ],
+      "ended_unix": 1792632353.851675,
+      "file_bytes_after": 213442715,
+      "file_bytes_before": 357695644,
+      "file_bytes_start": 213442715,
+      "live_mb_per_sec": 40.25540144312307,
+      "reclaimed_bytes": 144252929,
+      "resources": {
+        "disk_before_bytes": 361489613,
+        "disk_peak_bytes": 563756176,
+        "disk_peak_extra_bytes": 202266563,
+        "footprint_before_bytes": 1256163104,
+        "footprint_peak_bytes": 1526073432,
+        "footprint_peak_extra_bytes": 269910328,
+        "rss_before_bytes": 1153040384,
+        "rss_peak_bytes": 1523662848,
+        "rss_peak_extra_bytes": 370622464
+      },
+      "secs": 5.302183666,
+      "started_unix": 1792632348.549276
     }
   },
   "rocksdb": {
@@ -565,18 +812,18 @@
       "file_bytes_before": 60567120754,
       "live_mb_per_sec": 492.7490971804416,
       "reclaimed_bytes": 7924963,
-      "secs": 112.4600415,
       "resources": {
-        "samples": 111,
-        "duration_secs": 115.7685477733612,
-        "rss_start_bytes": 115654656,
-        "rss_peak_bytes": 303611904,
-        "disk_start_bytes": 61117365285,
+        "disk_peak_at_secs": 113.59630489349364,
         "disk_peak_bytes": 110853329536,
         "disk_peak_extra_bytes": 49735964251,
-        "disk_peak_at_secs": 113.59630489349365,
-        "free_min_bytes": 439210315776
-      }
+        "disk_start_bytes": 61117365285,
+        "duration_secs": 115.7685477733612,
+        "free_min_bytes": 439210315776,
+        "rss_peak_bytes": 303611904,
+        "rss_start_bytes": 115654656,
+        "samples": 111
+      },
+      "secs": 112.4600415
     },
     "delete": {
       "100B": {
@@ -1666,6 +1913,68 @@
       "reduce_total": 100244872278,
       "request_timeouts_during_build": 0,
       "rows": 3884695
+    },
+    "view_compact": {
+      "active_bytes_after": 213432906,
+      "active_bytes_before": 213433173,
+      "active_bytes_start": 213432906,
+      "churn_docs": 200000,
+      "churn_rounds": [
+        {
+          "active_bytes": 218105768,
+          "file_bytes": 240402591,
+          "index_docs_per_sec": 63027.00671785168,
+          "index_update_secs": 3.173242875,
+          "write_secs": 7.805000041
+        },
+        {
+          "active_bytes": 218112875,
+          "file_bytes": 274018463,
+          "index_docs_per_sec": 40647.90043707657,
+          "index_update_secs": 4.920303333,
+          "write_secs": 8.76088425
+        },
+        {
+          "active_bytes": 218110485,
+          "file_bytes": 307626143,
+          "index_docs_per_sec": 41252.25482530218,
+          "index_update_secs": 4.848219833,
+          "write_secs": 8.504767875
+        },
+        {
+          "active_bytes": 218108103,
+          "file_bytes": 341373087,
+          "index_docs_per_sec": 40880.093218876566,
+          "index_update_secs": 4.89235675,
+          "write_secs": 8.608920042
+        },
+        {
+          "active_bytes": 213433173,
+          "file_bytes": 361230492,
+          "index_docs_per_sec": 71615.17158715992,
+          "index_update_secs": 2.792704333,
+          "write_secs": 8.796089875
+        }
+      ],
+      "ended_unix": 1792632422.517418,
+      "file_bytes_after": 213434523,
+      "file_bytes_before": 361230492,
+      "file_bytes_start": 213434523,
+      "live_mb_per_sec": 42.333723963445905,
+      "reclaimed_bytes": 147795969,
+      "resources": {
+        "disk_before_bytes": 361230492,
+        "disk_peak_bytes": 568148035,
+        "disk_peak_extra_bytes": 206917543,
+        "footprint_before_bytes": 857348864,
+        "footprint_peak_bytes": 3462094960,
+        "footprint_peak_extra_bytes": 2604746096,
+        "rss_before_bytes": 1427587072,
+        "rss_peak_bytes": 3747266560,
+        "rss_peak_extra_bytes": 2319679488
+      },
+      "secs": 5.041675667,
+      "started_unix": 1792632417.47551
     }
   }
 }

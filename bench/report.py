@@ -61,6 +61,36 @@ data = {
         "continued; the client kept asking, and build time runs until the index first answered.",
     ],
 }
+if "rocksdb" in results:
+    data["method"] += [
+        "couchdb-rs (RocksDB) is the same server with its storage and view-index engines replaced by RocksDB "
+        "(librocksdb 11.8 via the rocksdb crate), from the rocksdb-experiment branch. HTTP, document, revision, "
+        "replication and query logic are unchanged.",
+        "RocksDB's own compression is off everywhere (data blocks, bottommost level, blob files). Bodies and "
+        "attachments are LZ4-compressed by couchdb-rs before reaching RocksDB; metadata is stored raw. "
+        "Attachment chunks live in RocksDB blob files so LSM compaction does not rewrite them.",
+        "Each group commit is one RocksDB WriteBatch with a synced WAL. This RocksDB build syncs with plain "
+        "fsync on macOS (no F_FULLFSYNC), the same durability level as the other two servers.",
+        "View rows are keyed by an order-preserving byte encoding of the JSON key (Unicode collation sort keys "
+        "for strings), so RocksDB's byte order equals CouchDB's view collation. Fresh view builds map in "
+        "parallel, sort externally, and ingest SST files.",
+        "RocksDB keeps no reductions: doc and row counts are counters, while view offsets and reduce queries "
+        "scan rows. couchdb-rs's B-tree stores a reduction in every node instead.",
+        "RocksDB compaction (_compact): mark the bodies and chunks of live leaf revisions, delete the rest, then "
+        "compact every column family, garbage-collecting blob files.",
+    ]
+if "hybrid" in results:
+    data["method"] += [
+        "couchdb-rs (RocksDB docs + B-tree views) keeps the RocksDB document engine and replaces the RocksDB "
+        "view index with couchdb-rs's B-tree view engine (append-only index file, a reduction in every node). "
+        "Only the view phases were rerun for it, on the RocksDB server's loaded database; its document results "
+        "in the summary are the RocksDB engine's, since the document storage code is identical.",
+        "View compaction streams each live B-tree, already in key order, into the bottom-up builder, so every "
+        "node is written once. couchdb-rs (B-tree) ran main's earlier view compaction, which collects every "
+        "live row in memory and inserts them with one B-tree update.",
+        "View compaction memory is macOS physical footprint (what Activity Monitor shows), sampled every 0.1 s; "
+        "RSS on macOS keeps counting memory malloc has freed but the kernel has not yet reclaimed.",
+    ]
 html = open(os.path.join(here, "report_template.html")).read()
 payload = json.dumps(data).replace("</", "<\\/")
 open(dst, "w").write(html.replace("__DATA__", payload))

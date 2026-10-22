@@ -8,6 +8,7 @@ of files under DATA_DIR, and free space on that volume. On SIGTERM/SIGINT it
 writes a JSON summary with the starting values and the peaks.
 """
 import argparse
+import ctypes
 import json
 import os
 import signal
@@ -22,6 +23,38 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--csv")
 ap.add_argument("--interval", type=float, default=1.0)
 a = ap.parse_args()
+
+
+class RusageV4(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [(f"f{i}", ctypes.c_uint64) for i in range(64)]  # rusage_info_v4 plus room
+
+
+_libc = ctypes.CDLL(None)
+
+
+def footprint(pid):
+    """macOS physical footprint (what Activity Monitor shows). Unlike RSS it
+    excludes freed memory malloc has handed back but the kernel has not yet
+    reclaimed, which RSS keeps counting."""
+    ru = RusageV4()
+    if _libc.proc_pid_rusage(pid, 4, ctypes.byref(ru)) != 0:  # RUSAGE_INFO_V4
+        return 0
+    return ru.f7  # ri_phys_footprint (after user, system, wakeups x2, pageins, wired, resident)
+
+
+def tree_procs(pid):
+    """pid and every descendant process."""
+    out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True).stdout
+    kids = {}
+    for line in out.splitlines():
+        p, pp = (int(x) for x in line.split())
+        kids.setdefault(pp, []).append(p)
+    procs, stack = [], [pid]
+    while stack:
+        p = stack.pop()
+        procs.append(p)
+        stack.extend(kids.get(p, []))
+    return procs
 
 
 def tree_rss(pid):
@@ -59,7 +92,7 @@ def free_bytes(d):
 samples = []
 csv = open(a.csv, "w") if a.csv else None
 if csv:
-    csv.write("t_secs,rss_bytes,dir_bytes,free_bytes\n")
+    csv.write("t_secs,rss_bytes,dir_bytes,free_bytes,footprint_bytes\n")
 t0 = time.time()
 stop = False
 
@@ -72,10 +105,10 @@ def done(*_):
 signal.signal(signal.SIGTERM, done)
 signal.signal(signal.SIGINT, done)
 while not stop:
-    s = (time.time() - t0, tree_rss(a.pid), dir_bytes(a.dir), free_bytes(a.dir))
+    s = (time.time() - t0, tree_rss(a.pid), dir_bytes(a.dir), free_bytes(a.dir), sum(footprint(p) for p in tree_procs(a.pid)))
     samples.append(s)
     if csv:
-        csv.write("%.1f,%d,%d,%d\n" % s)
+        csv.write("%.1f,%d,%d,%d,%d\n" % s)
         csv.flush()
     time.sleep(a.interval)
 
@@ -92,4 +125,6 @@ json.dump({
     "disk_peak_extra_bytes": peak_dir[2] - start[2],
     "disk_peak_at_secs": peak_dir[0],
     "free_min_bytes": min(s[3] for s in samples),
+    "footprint_start_bytes": start[4],
+    "footprint_peak_bytes": max(s[4] for s in samples),
 }, open(a.out, "w"), indent=1)

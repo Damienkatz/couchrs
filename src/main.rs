@@ -9,7 +9,6 @@ pub mod extsort;
 pub mod file;
 pub mod http;
 pub mod js;
-pub mod keyenc;
 pub mod keytree;
 pub mod mango;
 pub mod rstore;

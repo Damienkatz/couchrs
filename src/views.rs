@@ -1,19 +1,17 @@
 //! Map/reduce view indexes, a port of couch_mrview / couch_index.
 //!
-//! Each design doc's views form an index group stored in its own RocksDB
-//! instance named by the group signature, so editing a ddoc builds a new
-//! index while an identical ddoc (even under a different id) shares one.
-//! Indexes update incrementally from the database's by-seq index.
+//! Each design doc's views form an index group stored in its own file named
+//! by the group signature, so editing a ddoc builds a new index while an
+//! identical ddoc (even under a different id) shares one. Indexes update
+//! incrementally from the database's by-seq tree.
 
 use crate::api::{QueryArgs, blocking};
-use crate::btree::{Dir, Range, Spec};
+use crate::btree::{Action, Btree, Dir, NodePtr, Range, Spec};
 use crate::collate::{Json, cmp_json, cmp_json_raw};
 use crate::db::{Db, Snapshot};
 use crate::doc::{DocOpts, FullDocInfo};
 use crate::error::{CouchError, Result};
-use crate::keyenc;
-use crate::rstore::{Store, View, rerr, successor};
-use rocksdb::WriteBatch;
+use crate::file::CouchFile;
 use crate::http::{Req, json_response, not_allowed, ok_json};
 use crate::js::JsFuns;
 use crate::extsort::Sorter;
@@ -88,7 +86,7 @@ impl ViewSpec {
         if self.raw { cmp_json_raw(a, b) } else { cmp_json(a, b) }
     }
 
-    pub fn reduce_values(&self, kvs: &[(Value, Value)]) -> Option<Value> {
+    fn reduce_values(&self, kvs: &[(Value, Value)]) -> Option<Value> {
         Some(match &self.reducer {
             Reducer::None => return None,
             Reducer::Count => json!(kvs.len()),
@@ -304,14 +302,28 @@ fn finalize_red(r: &Reducer, v: Value) -> Value {
     }
 }
 
-// ------------------------------------------------------------ ids entry
+// --------------------------------------------------------- id btree
 
-/// Keys a document emitted, per view, so its rows can be found and removed
-/// when it changes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IdEntry {
     /// (view index, emitted keys)
     pub keys: Vec<(u32, Vec<Json>)>,
+}
+
+pub struct IdIdxSpec;
+impl Spec for IdIdxSpec {
+    type K = String;
+    type V = IdEntry;
+    type R = u64;
+    fn cmp(&self, a: &String, b: &String) -> Ordering {
+        a.as_bytes().cmp(b.as_bytes())
+    }
+    fn reduce(&self, kvs: &[(String, IdEntry)]) -> u64 {
+        kvs.len() as u64
+    }
+    fn rereduce(&self, reds: &[u64]) -> u64 {
+        reds.iter().sum()
+    }
 }
 
 // ---------------------------------------------------------- definition
@@ -465,11 +477,35 @@ impl IndexDef {
     }
 }
 
-/// Build empty indexes with the sort-and-ingest bulk path (default on;
+/// Build empty indexes with the sort-based bulk path (default on;
 /// COUCHDB_RS_VIEW_BULK=0 forces incremental batches, for comparison).
 fn bulk_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var("COUCHDB_RS_VIEW_BULK").map(|v| v != "0").unwrap_or(true))
+}
+
+type SortCmp<T> = Box<dyn Fn(&T, &T) -> Ordering>;
+type ViewSorter = Sorter<(VKey, VVal), SortCmp<(VKey, VVal)>>;
+type IdSorter = Sorter<(String, IdEntry), SortCmp<(String, IdEntry)>>;
+/// Rows mapped from a batch of docs: (doc id, rows per view, id-tree entry).
+type Mapped = Vec<(String, Vec<Vec<(Json, VVal)>>, IdEntry)>;
+
+/// Hand a mapped batch to the external sorters.
+fn feed_sorters(mapped: Mapped, views: &mut [ViewSorter], ids: &mut IdSorter) -> std::io::Result<()> {
+    for (id, per_view, entry) in mapped {
+        for (vi, rows) in per_view.into_iter().enumerate() {
+            for (k, val) in rows {
+                // Rough size for the memory budget; exactness doesn't matter.
+                let approx = 64 + id.len() + k.0.to_string().len();
+                views[vi].push(((k, IdBound::Id(id.clone())), val), approx)?;
+            }
+        }
+        if !entry.keys.is_empty() {
+            let approx = 64 + id.len() * 2;
+            ids.push((id, entry), approx)?;
+        }
+    }
+    Ok(())
 }
 
 /// Upper bound on JS map threads for a bulk build: COUCHDB_RS_MAP_THREADS,
@@ -483,29 +519,13 @@ fn map_threads_max() -> usize {
     })
 }
 
-/// Docs per incremental view-index write batch (COUCHDB_RS_VIEW_BATCH).
+/// Docs per view-index write batch. Experiment knob (COUCHDB_RS_VIEW_BATCH).
 fn view_batch_docs() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("COUCHDB_RS_VIEW_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(500))
 }
 
-fn cmp_key(raw: bool, a: &Value, b: &Value) -> Ordering {
-    if raw { cmp_json_raw(a, b) } else { cmp_json(a, b) }
-}
-
 // ----------------------------------------------------------- index state
-//
-// Each index is a RocksDB instance with three column families:
-//   rows  [view#][order-preserving key][doc id] -> StoredRow
-//   ids   doc id                                -> IdEntry (keys it emitted)
-//   meta  "header"                              -> IndexHeader
-// Row keys use keyenc, so RocksDB's byte order is CouchDB's view collation.
-
-const CF_ROWS: &str = "rows";
-const CF_IDS: &str = "ids";
-const CF_META: &str = "meta";
-const INDEX_CFS: &[(&str, bool)] = &[(CF_ROWS, false), (CF_IDS, false), (CF_META, false)];
-const META_KEY: &[u8] = b"header";
 
 #[derive(Serialize, Deserialize, Clone)]
 struct IndexHeader {
@@ -513,88 +533,81 @@ struct IndexHeader {
     seq: u64,
     purge_seq: u64,
     db_uuid: String,
-    /// Rows (emitted values) per view: total_rows, kept as counters because
-    /// RocksDB keeps no reductions.
-    counts: Vec<u64>,
-}
-
-/// A view row as stored: the original key (the encoded one is lossy), the
-/// doc id, and the emitted value(s).
-#[derive(Serialize, Deserialize)]
-struct StoredRow {
-    key: Json,
-    id: String,
-    val: VVal,
+    id_root: Option<NodePtr<u64>>,
+    view_roots: Vec<Option<NodePtr<VRed>>>,
 }
 
 #[derive(Clone)]
 pub struct IndexState {
     pub seq: u64,
     pub purge_seq: u64,
-    pub counts: Vec<u64>,
-    view: Arc<View>,
+    pub ids: Btree<IdIdxSpec>,
+    pub views: Vec<Btree<ViewSpec>>,
 }
 
 pub struct Index {
     pub def: IndexDef,
     pub path: PathBuf,
-    store: Arc<Store>,
+    file: RwLock<Arc<CouchFile>>,
     state: RwLock<IndexState>,
     update_lock: Mutex<()>,
     db_uuid: String,
     updater_running: std::sync::atomic::AtomicBool,
+    compact_running: std::sync::atomic::AtomicBool,
     /// How the last bulk build ran, reported in _info.
     last_build: Mutex<Option<Value>>,
 }
 
-type Mapped = Vec<(String, Vec<Vec<(Json, VVal)>>, IdEntry)>;
-type BytePair = (Vec<u8>, Vec<u8>);
-type ByteSorter = Sorter<BytePair, Box<dyn Fn(&BytePair, &BytePair) -> Ordering>>;
-
-/// Metadata is stored uncompressed; only bodies and attachments use LZ4.
-fn enc<T: Serialize>(v: &T) -> Vec<u8> {
-    crate::file::encode_term_raw(v)
-}
-
-fn dec<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T> {
-    Ok(crate::file::decode_term(b)?)
-}
-
-fn byte_sorter(path: PathBuf) -> ByteSorter {
-    Sorter::new(path, crate::extsort::budget_bytes(), Box::new(|a: &BytePair, b: &BytePair| a.0.cmp(&b.0)))
+fn fresh_state(file: &Arc<CouchFile>, def: &IndexDef) -> IndexState {
+    IndexState {
+        seq: 0,
+        purge_seq: 0,
+        ids: Btree::new(file.clone(), None, Arc::new(IdIdxSpec)),
+        views: def
+            .views
+            .iter()
+            .map(|v| {
+                Btree::new(
+                    file.clone(),
+                    None,
+                    Arc::new(ViewSpec {
+                        raw: v.raw,
+                        reducer: v.reducer.clone(),
+                    }),
+                )
+            })
+            .collect(),
+    }
 }
 
 impl Index {
-    fn row_key(&self, vi: usize, key: &Value, id: &str) -> Vec<u8> {
-        keyenc::row_key(vi as u8, key, self.def.views[vi].raw, id)
-    }
-
     fn open(db: &Db, def: IndexDef, dir: PathBuf) -> Result<Index> {
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.rocks", def.sig));
+        let path = dir.join(format!("{}.view", def.sig));
         let db_uuid = db.snapshot().header.uuid.clone();
-        let store = Store::open(&path, INDEX_CFS, true)?;
-        let n = def.views.len();
-        let header: Option<IndexHeader> = match store.db.get_cf(&store.cf(CF_META), META_KEY).map_err(rerr)? {
-            Some(b) => dec::<IndexHeader>(&b).ok(),
-            None => None,
-        };
-        let (seq, purge_seq, counts) = match header {
-            Some(h) if h.sig == def.sig && h.db_uuid == db_uuid && h.counts.len() == n => (h.seq, h.purge_seq, h.counts),
-            _ => {
-                wipe(&store)?;
-                (0, 0, vec![0; n])
+        let file = Arc::new(CouchFile::open(&path, true)?);
+        let mut state = fresh_state(&file, &def);
+        if let Some(h) = file.read_header::<IndexHeader>()? {
+            if h.sig == def.sig && h.db_uuid == db_uuid && h.view_roots.len() == def.views.len() {
+                state.seq = h.seq;
+                state.purge_seq = h.purge_seq;
+                state.ids = state.ids.with_root(h.id_root);
+                for (t, r) in state.views.iter_mut().zip(h.view_roots) {
+                    *t = t.with_root(r);
+                }
+            } else {
+                file.truncate(0)?;
             }
-        };
-        let state = IndexState { seq, purge_seq, counts, view: View::new(store.clone()) };
+        }
         Ok(Index {
             def,
             path,
-            store,
+            file: RwLock::new(file),
             state: RwLock::new(state),
             update_lock: Mutex::new(()),
             db_uuid,
             updater_running: std::sync::atomic::AtomicBool::new(false),
+            compact_running: std::sync::atomic::AtomicBool::new(false),
             last_build: Mutex::new(None),
         })
     }
@@ -603,9 +616,19 @@ impl Index {
         self.state.read().clone()
     }
 
-    fn put_meta(&self, wb: &mut WriteBatch, seq: u64, purge_seq: u64, counts: &[u64]) {
-        let h = IndexHeader { sig: self.def.sig.clone(), seq, purge_seq, db_uuid: self.db_uuid.clone(), counts: counts.to_vec() };
-        wb.put_cf(&self.store.cf(CF_META), META_KEY, enc(&h));
+    fn commit(&self, st: &IndexState) -> Result<()> {
+        let file = self.file.read().clone();
+        let h = IndexHeader {
+            sig: self.def.sig.clone(),
+            seq: st.seq,
+            purge_seq: st.purge_seq,
+            db_uuid: self.db_uuid.clone(),
+            id_root: st.ids.root.clone(),
+            view_roots: st.views.iter().map(|v| v.root.clone()).collect(),
+        };
+        file.sync()?;
+        file.write_header(&h)?;
+        Ok(())
     }
 
     /// Map one document into per-view rows.
@@ -614,7 +637,10 @@ impl Index {
         if fdi.deleted || (fdi.id.starts_with("_design/") && !self.def.include_design) {
             return Ok(vec![Vec::new(); n]);
         }
-        let opts = DocOpts { local_seq: self.def.local_seq, ..Default::default() };
+        let opts = DocOpts {
+            local_seq: self.def.local_seq,
+            ..Default::default()
+        };
         let doc = snap.winner_json(fdi, &opts)?;
         let js_rows = match &self.def.js {
             Some(f) if self.def.views.iter().any(|v| matches!(v.map, MapKind::Js(_))) => Some(f.map(&doc)?),
@@ -625,12 +651,11 @@ impl Index {
             match &v.map {
                 MapKind::Js(i) => out.push(js_rows.as_ref().and_then(|r| r.get(*i).cloned()).unwrap_or_default()),
                 MapKind::Mango { fields, partial } => {
-                    if let Some(p) = partial {
-                        if !p.matches(&doc) {
+                    if let Some(p) = partial
+                        && !p.matches(&doc) {
                             out.push(Vec::new());
                             continue;
                         }
-                    }
                     let mut key = Vec::with_capacity(fields.len());
                     for f in fields {
                         match crate::mango::get_field(&doc, f) {
@@ -649,19 +674,67 @@ impl Index {
         Ok(out)
     }
 
+    /// Bring the index up to date with the database.
+    pub fn update(&self, db: &Db) -> Result<IndexState> {
+        let _g = self.update_lock.lock();
+        let snap = db.snapshot();
+        let mut st = self.state();
+        if snap.header.purge_seq != st.purge_seq || st.seq > snap.update_seq() {
+            // Purges (and db recreation) invalidate the index: rebuild.
+            let file = self.file.read().clone();
+            file.truncate(0)?;
+            st = fresh_state(&file, &self.def);
+            st.purge_seq = snap.header.purge_seq;
+        }
+        if st.seq >= snap.update_seq() {
+            return Ok(st);
+        }
+        self.updater_running.store(true, std::sync::atomic::Ordering::Relaxed);
+        let res = (|| -> Result<IndexState> {
+            let empty = st.seq == 0 && st.ids.root.is_none() && st.views.iter().all(|v| v.root.is_none());
+            if empty && bulk_enabled() {
+                self.bulk_build(&snap, &mut st)?;
+                self.commit(&st)?;
+                *self.state.write() = st.clone();
+                return Ok(st);
+            }
+            let mut batch: Vec<FullDocInfo> = Vec::new();
+            let mut err = None;
+            snap.fold_changes(st.seq, Dir::Fwd, |fdi| {
+                batch.push(fdi.clone());
+                if batch.len() >= view_batch_docs()
+                    && let Err(e) = self.apply_batch(&snap, &mut st, std::mem::take(&mut batch)) {
+                        err = Some(e);
+                        return Ok(false);
+                    }
+                Ok(true)
+            })?;
+            if let Some(e) = err {
+                return Err(e);
+            }
+            self.apply_batch(&snap, &mut st, batch)?;
+            st.seq = snap.update_seq();
+            self.commit(&st)?;
+            *self.state.write() = st.clone();
+            Ok(st)
+        })();
+        self.updater_running.store(false, std::sync::atomic::Ordering::Relaxed);
+        res
+    }
+
     /// The rows one doc contributes: per view, (key, value) with duplicate
-    /// keys from the same doc merged, plus its ids entry.
-    fn doc_entries(&self, snap: &Snapshot, fdi: &FullDocInfo) -> Result<(Vec<Vec<(Json, VVal)>>, IdEntry)> {
+    /// keys from the same doc merged, plus its doc-id tree entry.
+    fn doc_entries(&self, snap: &Snapshot, st: &IndexState, fdi: &FullDocInfo) -> Result<(Vec<Vec<(Json, VVal)>>, IdEntry)> {
         let rows = self.map_doc(snap, fdi)?;
         let mut entry = IdEntry { keys: Vec::new() };
         let mut per_view = Vec::with_capacity(rows.len());
         for (vi, vrows) in rows.into_iter().enumerate() {
             let mut out = Vec::new();
             if !vrows.is_empty() {
-                let raw = self.def.views[vi].raw;
+                let spec = st.views[vi].spec.clone();
                 let mut grouped: Vec<(Value, Vec<Json>)> = Vec::new();
                 for (k, v) in vrows {
-                    match grouped.iter_mut().find(|(gk, _)| cmp_key(raw, gk, &k) == Ordering::Equal) {
+                    match grouped.iter_mut().find(|(gk, _)| spec.cmp_key(gk, &k) == Ordering::Equal) {
                         Some((_, vs)) => vs.push(Json(v)),
                         None => grouped.push((k, vec![Json(v)])),
                     }
@@ -679,142 +752,40 @@ impl Index {
         Ok((per_view, entry))
     }
 
-    /// Bring the index up to date with the database.
-    pub fn update(&self, db: &Db) -> Result<IndexState> {
-        let _g = self.update_lock.lock();
-        let snap = db.snapshot();
-        let mut st = self.state();
-        if snap.header.purge_seq != st.purge_seq || st.seq > snap.update_seq() {
-            // Purges (and db recreation) invalidate the index: rebuild.
-            wipe(&self.store)?;
-            st = IndexState { seq: 0, purge_seq: snap.header.purge_seq, counts: vec![0; self.def.views.len()], view: View::new(self.store.clone()) };
-        }
-        if st.seq >= snap.update_seq() {
-            return Ok(st);
-        }
-        self.updater_running.store(true, std::sync::atomic::Ordering::Relaxed);
-        let res = (|| -> Result<IndexState> {
-            if st.seq == 0 && st.counts.iter().all(|c| *c == 0) && bulk_enabled() {
-                self.bulk_build(&snap, &mut st)?;
-            } else {
-                let mut batch: Vec<FullDocInfo> = Vec::new();
-                let mut err = None;
-                snap.fold_changes(st.seq, Dir::Fwd, |fdi| {
-                    batch.push(fdi.clone());
-                    if batch.len() >= view_batch_docs() {
-                        if let Err(e) = self.apply_batch(&snap, &mut st, std::mem::take(&mut batch)) {
-                            err = Some(e);
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                })?;
-                if let Some(e) = err {
-                    return Err(e);
-                }
-                self.apply_batch(&snap, &mut st, batch)?;
-                // Record that the index has seen everything up to the
-                // snapshot, even if the last docs changed no rows.
-                let mut wb = WriteBatch::default();
-                st.seq = snap.update_seq();
-                self.put_meta(&mut wb, st.seq, st.purge_seq, &st.counts);
-                self.store.db.write(wb).map_err(rerr)?;
-            }
-            st.view = View::new(self.store.clone());
-            *self.state.write() = st.clone();
-            Ok(st)
-        })();
-        self.updater_running.store(false, std::sync::atomic::Ordering::Relaxed);
-        res
-    }
-
-    /// Apply a batch of changed docs: delete their old rows, write their
-    /// new ones, and advance the seq, all in one atomic WriteBatch.
-    fn apply_batch(&self, snap: &Snapshot, st: &mut IndexState, batch: Vec<FullDocInfo>) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let current = View::new(self.store.clone());
-        let mut wb = WriteBatch::default();
-        let (rows_cf, ids_cf) = (self.store.cf(CF_ROWS), self.store.cf(CF_IDS));
-        let last_seq = batch.last().map(|f| f.update_seq).unwrap_or(st.seq);
-        for fdi in batch {
-            let old: Option<IdEntry> = match current.get(CF_IDS, fdi.id.as_bytes())? {
-                Some(b) => Some(dec(&b)?),
-                None => None,
-            };
-            if let Some(old) = &old {
-                for (vi, keys) in &old.keys {
-                    let vi = *vi as usize;
-                    for k in keys {
-                        let rk = self.row_key(vi, &k.0, &fdi.id);
-                        if let Some(b) = current.get(CF_ROWS, &rk)? {
-                            let row: StoredRow = dec(&b)?;
-                            st.counts[vi] = st.counts[vi].saturating_sub(row.val.values().len() as u64);
-                        }
-                        wb.delete_cf(&rows_cf, rk);
-                    }
-                }
-            }
-            let (per_view, entry) = self.doc_entries(snap, &fdi)?;
-            for (vi, rows) in per_view.into_iter().enumerate() {
-                for (k, val) in rows {
-                    st.counts[vi] += val.values().len() as u64;
-                    let rk = self.row_key(vi, &k.0, &fdi.id);
-                    wb.put_cf(&rows_cf, rk, enc(&StoredRow { key: k, id: fdi.id.clone(), val }));
-                }
-            }
-            if entry.keys.is_empty() {
-                if old.is_some() {
-                    wb.delete_cf(&ids_cf, fdi.id.as_bytes());
-                }
-            } else {
-                wb.put_cf(&ids_cf, fdi.id.as_bytes(), enc(&entry));
-            }
-        }
-        st.seq = last_seq;
-        self.put_meta(&mut wb, st.seq, st.purge_seq, &st.counts);
-        self.store.db.write(wb).map_err(rerr)?;
-        Ok(())
-    }
-
-    /// Build a fresh index: map every doc on a pool of threads, sort the
-    /// encoded rows externally, then write each column family as one SST
-    /// file and ingest it (RocksDB's bulk load: no memtable, no compaction).
+    /// Build a fresh index in one pass: map every doc, spill rows to
+    /// external sorters, then build each B-tree bottom-up from the sorted
+    /// stream. Each node is written once, contiguously, with no lookups of
+    /// old keys (there are none) and no copy-on-write rewrites.
     fn bulk_build(&self, snap: &Snapshot, st: &mut IndexState) -> Result<()> {
-        let scratch = |name: &str| self.path.join(format!("bulk-{name}"));
-        let mut row_sorter = byte_sorter(scratch("rows.sort"));
-        let mut id_sorter = byte_sorter(scratch("ids.sort"));
-        let mut counts = vec![0u64; self.def.views.len()];
-        let feed = |mapped: Mapped, rows: &mut ByteSorter, ids: &mut ByteSorter, counts: &mut Vec<u64>| -> Result<()> {
-            for (id, per_view, entry) in mapped {
-                for (vi, vrows) in per_view.into_iter().enumerate() {
-                    for (k, val) in vrows {
-                        counts[vi] += val.values().len() as u64;
-                        let rk = self.row_key(vi, &k.0, &id);
-                        let v = enc(&StoredRow { key: k, id: id.clone(), val });
-                        let approx = rk.len() + v.len();
-                        rows.push((rk, v), approx)?;
-                    }
-                }
-                if !entry.keys.is_empty() {
-                    let v = enc(&entry);
-                    let approx = id.len() + v.len();
-                    ids.push((id.into_bytes(), v), approx)?;
-                }
-            }
-            Ok(())
-        };
-        // Pipeline: one thread walks the by-seq index, JS map workers load and
+        type Cmp<T> = SortCmp<T>;
+        let budget = crate::extsort::budget_bytes();
+        let scratch = |name: &str| self.path.with_extension(format!("{name}.sort"));
+        let mut view_sorters: Vec<ViewSorter> = st
+            .views
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let spec = t.spec.clone();
+                let cmp: Cmp<(VKey, VVal)> = Box::new(move |a, b| spec.cmp(&a.0, &b.0));
+                Sorter::new(scratch(&format!("v{i}")), budget, cmp)
+            })
+            .collect();
+        let id_cmp: Cmp<(String, IdEntry)> = Box::new(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut id_sorter = Sorter::new(scratch("ids"), budget, id_cmp);
+        // Pipeline: one thread walks the by-seq tree, JS map workers load and
         // map docs, and this thread feeds the sorters. Workers are added while
-        // this (serial) stage sits idle waiting for them, up to the core count.
+        // this (serial) stage sits idle waiting for them, i.e. until it keeps
+        // a full core busy, up to the machine's core count.
         let max_workers = map_threads_max();
         let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Vec<FullDocInfo>>(max_workers * 4);
         let work_rx = Arc::new(Mutex::new(work_rx));
         let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<Result<Mapped>>(max_workers * 4);
         let producer_done = std::sync::atomic::AtomicBool::new(false);
         let alive = std::sync::atomic::AtomicUsize::new(0);
+        // Nanoseconds the reader spent blocked handing out work (high means
+        // the map workers are the bottleneck, low means the reader is).
         let reader_blocked = std::sync::atomic::AtomicU64::new(0);
+        let st_ref: &IndexState = st;
         let mut err: Option<CouchError> = None;
         let mut workers = 0usize;
         let mut busy = std::time::Duration::ZERO;
@@ -847,8 +818,10 @@ impl Index {
                     loop {
                         let next = work_rx.lock().recv();
                         let Ok(batch) = next else { break };
-                        let out: Result<Mapped> =
-                            batch.iter().map(|f| self.doc_entries(snap, f).map(|(pv, e)| (f.id.clone(), pv, e))).collect();
+                        let out: Result<Mapped> = batch
+                            .iter()
+                            .map(|f| self.doc_entries(snap, st_ref, f).map(|(pv, e)| (f.id.clone(), pv, e)))
+                            .collect();
                         if res_tx.send(out).is_err() {
                             break;
                         }
@@ -867,8 +840,8 @@ impl Index {
                 match got {
                     Ok(Ok(mapped)) => {
                         let t_work = Instant::now();
-                        if let Err(e) = feed(mapped, &mut row_sorter, &mut id_sorter, &mut counts) {
-                            err = Some(e);
+                        if let Err(e) = feed_sorters(mapped, &mut view_sorters, &mut id_sorter) {
+                            err = Some(e.into());
                             break;
                         }
                         busy += t_work.elapsed();
@@ -882,10 +855,14 @@ impl Index {
                 }
                 let done = producer_done.load(std::sync::atomic::Ordering::SeqCst);
                 if done && alive.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    // Drain anything already sent, then finish.
                     while let Ok(r) = res_rx.try_recv() {
-                        if let Err(e) = r.and_then(|m| feed(m, &mut row_sorter, &mut id_sorter, &mut counts)) {
-                            err = Some(e);
-                            break;
+                        match r.and_then(|m| Ok(feed_sorters(m, &mut view_sorters, &mut id_sorter)?)) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
                         }
                     }
                     break;
@@ -904,6 +881,7 @@ impl Index {
                     idle = std::time::Duration::ZERO;
                 }
             }
+            // Stops the producer and workers early if we bailed out.
             drop(res_rx);
             drop(res_tx);
         });
@@ -912,62 +890,86 @@ impl Index {
         }
         let map_secs = t_start.elapsed().as_secs_f64();
         let t_build = Instant::now();
-        self.ingest_sorted(CF_ROWS, row_sorter, &scratch("rows.sst"))?;
-        self.ingest_sorted(CF_IDS, id_sorter, &scratch("ids.sst"))?;
+        for (vi, sorter) in view_sorters.into_iter().enumerate() {
+            let mut sorted = sorter.finish()?;
+            let mut b = st.views[vi].bulk_builder();
+            while let Some((k, v)) = sorted.next_item()? {
+                b.push(k, v)?;
+            }
+            st.views[vi] = b.finish()?;
+        }
+        let mut sorted = id_sorter.finish()?;
+        let mut b = st.ids.bulk_builder();
+        while let Some((k, v)) = sorted.next_item()? {
+            b.push(k, v)?;
+        }
+        st.ids = b.finish()?;
         st.seq = snap.update_seq();
-        st.counts = counts;
-        let mut wb = WriteBatch::default();
-        self.put_meta(&mut wb, st.seq, st.purge_seq, &st.counts);
-        let mut wo = rocksdb::WriteOptions::default();
-        wo.set_sync(true);
-        self.store.db.write_opt(wb, &wo).map_err(rerr)?;
         *self.last_build.lock() = Some(json!({
-            "method": "bulk (sort + SST ingest)",
+            "method": "bulk",
             "map_threads": workers,
             "map_threads_max": max_workers,
             "map_phase_secs": map_secs,
             "collector_busy": busy.as_secs_f64() / map_secs.max(1e-9),
             "reader_blocked": reader_blocked.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9 / map_secs.max(1e-9),
-            "sort_and_ingest_secs": t_build.elapsed().as_secs_f64(),
+            "sort_and_build_secs": t_build.elapsed().as_secs_f64(),
         }));
         Ok(())
     }
 
-    /// Write sorted pairs into one SST file and ingest it into `cf`.
-    fn ingest_sorted(&self, cf: &str, sorter: ByteSorter, sst: &std::path::Path) -> Result<()> {
-        let mut sorted = sorter.finish()?;
-        let opts = crate::rstore::cf_options(false);
-        let mut w = rocksdb::SstFileWriter::create(&opts);
-        w.open(sst).map_err(rerr)?;
-        let mut any = false;
-        while let Some((k, v)) = sorted.next_item()? {
-            w.put(k, v).map_err(rerr)?;
-            any = true;
-        }
-        if !any {
-            drop(w);
-            let _ = std::fs::remove_file(sst);
+    fn apply_batch(&self, snap: &Snapshot, st: &mut IndexState, batch: Vec<FullDocInfo>) -> Result<()> {
+        if batch.is_empty() {
             return Ok(());
         }
-        w.finish().map_err(rerr)?;
-        self.store.db.ingest_external_file_cf(&self.store.cf(cf), vec![sst]).map_err(rerr)?;
-        let _ = std::fs::remove_file(sst);
+        let nviews = self.def.views.len();
+        let mut view_acts: Vec<Vec<Action<VKey, VVal>>> = (0..nviews).map(|_| Vec::new()).collect();
+        let mut id_acts = Vec::new();
+        let last_seq = batch.last().map(|f| f.update_seq).unwrap_or(st.seq);
+        for fdi in batch {
+            let old = st.ids.lookup(&fdi.id)?;
+            if let Some(old) = &old {
+                for (vi, keys) in &old.keys {
+                    for k in keys {
+                        view_acts[*vi as usize].push(Action::Remove((k.clone(), IdBound::Id(fdi.id.clone()))));
+                    }
+                }
+            }
+            let (per_view, entry) = self.doc_entries(snap, st, &fdi)?;
+            for (vi, rows) in per_view.into_iter().enumerate() {
+                for (k, val) in rows {
+                    view_acts[vi].push(Action::Insert((k, IdBound::Id(fdi.id.clone())), val));
+                }
+            }
+            if entry.keys.is_empty() {
+                if old.is_some() {
+                    id_acts.push(Action::Remove(fdi.id.clone()));
+                }
+            } else {
+                id_acts.push(Action::Insert(fdi.id.clone(), entry));
+            }
+        }
+        st.ids = st.ids.modify(id_acts)?;
+        for (vi, acts) in view_acts.into_iter().enumerate() {
+            st.views[vi] = st.views[vi].modify(acts)?;
+        }
+        st.seq = last_seq;
         Ok(())
     }
 
     pub fn info(&self, name: &str) -> Value {
         let st = self.state();
-        let active: u64 = [CF_ROWS, CF_IDS].iter().map(|cf| self.store.prop(cf, "rocksdb.estimate-live-data-size")).sum();
+        let file = self.file.read().clone();
+        let active: u64 = st.ids.size() + st.views.iter().map(|v| v.size()).sum::<u64>();
         json!({
             "name": name.trim_start_matches("_design/"),
             "view_index": {
                 "signature": self.def.sig,
                 "language": self.def.language,
-                "sizes": {"file": self.store.disk_bytes(), "external": 0, "active": active},
+                "sizes": {"file": file.eof(), "external": 0, "active": active},
                 "update_seq": st.seq,
                 "purge_seq": st.purge_seq,
                 "updater_running": self.updater_running.load(std::sync::atomic::Ordering::Relaxed),
-                "compact_running": false,
+                "compact_running": self.compact_running.load(std::sync::atomic::Ordering::Relaxed),
                 "waiting_clients": 0,
                 "waiting_commit": false,
                 "collator_versions": ["153.112"],
@@ -977,104 +979,55 @@ impl Index {
         })
     }
 
-    /// Compact every column family (RocksDB reclaims deleted rows).
+    /// Rewrite the index file with only live data. The live trees are
+    /// already in key order, so each streams straight into a bottom-up
+    /// builder: one sequential pass, every node written once.
     pub fn compact(&self) -> Result<()> {
         let _g = self.update_lock.lock();
-        let mut co = rocksdb::CompactOptions::default();
-        co.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
-        for (cf, _) in INDEX_CFS {
-            self.store.db.compact_range_cf_opt(&self.store.cf(cf), None::<&[u8]>, None::<&[u8]>, &co);
-        }
-        Ok(())
+        self.compact_running.store(true, std::sync::atomic::Ordering::Relaxed);
+        let res = self.compact_locked();
+        self.compact_running.store(false, std::sync::atomic::Ordering::Relaxed);
+        res
     }
 
-    /// RocksDB bounds [lower, upper) for a view query's key range, and
-    /// whether to iterate in reverse. (`keys` is handled by the caller.)
-    fn bounds(&self, vi: usize, args: &QueryArgs) -> (Vec<u8>, Vec<u8>, bool) {
-        let p = vi as u8;
-        let raw = self.def.views[vi].raw;
-        let (all_lo, all_hi) = (vec![p], vec![p + 1]);
-        let row = |k: &Value, d: &str| keyenc::row_key(p, k, raw, d);
-        let incl = args.inclusive_end;
-        if !args.descending {
-            let lower = match (&args.start_key, &args.start_docid) {
-                (Some(k), Some(d)) => row(k, d),
-                (Some(k), None) => keyenc::key_min(p, k, raw),
-                (None, _) => all_lo,
-            };
-            let upper = match (&args.end_key, &args.end_docid) {
-                (Some(k), Some(d)) => if incl { successor(&row(k, d)) } else { row(k, d) },
-                (Some(k), None) => if incl { keyenc::key_max(p, k, raw) } else { keyenc::key_min(p, k, raw) },
-                (None, _) => all_hi,
-            };
-            (lower, upper, false)
-        } else {
-            let upper = match (&args.start_key, &args.start_docid) {
-                (Some(k), Some(d)) => successor(&row(k, d)),
-                (Some(k), None) => keyenc::key_max(p, k, raw),
-                (None, _) => all_hi,
-            };
-            let lower = match (&args.end_key, &args.end_docid) {
-                (Some(k), Some(d)) => if incl { row(k, d) } else { successor(&row(k, d)) },
-                (Some(k), None) => if incl { keyenc::key_min(p, k, raw) } else { keyenc::key_max(p, k, raw) },
-                (None, _) => all_lo,
-            };
-            (lower, upper, true)
-        }
-    }
-
-    /// Visit the rows of view `vi` in `args`' range and direction.
-    pub fn fold_rows<F>(&self, st: &IndexState, vi: usize, args: &QueryArgs, mut f: F) -> Result<()>
-    where
-        F: FnMut(&Value, &str, &VVal) -> Result<bool>,
-    {
-        let (lo, hi, rev) = self.bounds(vi, args);
-        if lo >= hi {
-            return Ok(());
-        }
-        st.view.scan(CF_ROWS, Some(&lo), Some(&hi), rev, |_, v| {
-            let row: StoredRow = dec(v)?;
-            f(&row.key.0, &row.id, &row.val)
-        })
-    }
-
-    /// Emitted values sorting before the range start, in iteration order
-    /// (the `offset` of a view response). RocksDB keeps no order
-    /// statistics, so this counts by scanning.
-    fn count_before(&self, st: &IndexState, vi: usize, args: &QueryArgs) -> Result<u64> {
-        let p = vi as u8;
-        let (lo, hi, rev) = self.bounds(vi, args);
-        let (a, b) = if rev { (hi, vec![p + 1]) } else { (vec![p], lo) };
-        let mut n = 0u64;
-        if a < b {
-            st.view.scan(CF_ROWS, Some(&a), Some(&b), false, |_, v| {
-                n += dec::<StoredRow>(v)?.val.values().len() as u64;
+    fn compact_locked(&self) -> Result<()> {
+        let st = self.state();
+        let tmp = self.path.with_extension("compact.view");
+        let _ = std::fs::remove_file(&tmp);
+        let nf = Arc::new(CouchFile::open(&tmp, true)?);
+        let mut ns = fresh_state(&nf, &self.def);
+        ns.seq = st.seq;
+        ns.purge_seq = st.purge_seq;
+        let mut b = ns.ids.bulk_builder();
+        st.ids.fold(Dir::Fwd, &Range::default(), |k, v| {
+            b.push(k.clone(), v.clone())?;
+            Ok(true)
+        })?;
+        ns.ids = b.finish()?;
+        for (i, v) in st.views.iter().enumerate() {
+            let mut b = ns.views[i].bulk_builder();
+            v.fold(Dir::Fwd, &Range::default(), |k, val| {
+                b.push(k.clone(), val.clone())?;
                 Ok(true)
             })?;
+            ns.views[i] = b.finish()?;
         }
-        Ok(n)
+        *self.file.write() = nf;
+        self.commit(&ns)?;
+        std::fs::rename(&tmp, &self.path)?;
+        *self.state.write() = ns;
+        Ok(())
     }
-}
-
-/// Delete everything in an index store (rebuild from scratch).
-fn wipe(store: &Store) -> Result<()> {
-    let mut wb = WriteBatch::default();
-    wb.delete_range_cf(&store.cf(CF_ROWS), [0u8], [0xFFu8]);
-    wb.delete_range_cf(&store.cf(CF_IDS), &[][..], &[0xFFu8][..]);
-    wb.delete_cf(&store.cf(CF_META), META_KEY);
-    store.db.write(wb).map_err(rerr)?;
-    Ok(())
 }
 
 /// Find or open the index for a design doc.
 pub fn get_index(db: &Arc<Db>, ddoc: &Value, index_dir: PathBuf) -> Result<Arc<Index>> {
     let def = IndexDef::from_ddoc(ddoc)?;
     let key = format!("mrview:{}", def.sig);
-    if let Some(i) = db.ext.lock().get(&key).cloned() {
-        if let Ok(idx) = i.downcast::<Index>() {
+    if let Some(i) = db.ext.lock().get(&key).cloned()
+        && let Ok(idx) = i.downcast::<Index>() {
             return Ok(idx);
         }
-    }
     let idx = Arc::new(Index::open(db, def, index_dir)?);
     db.ext.lock().insert(key, idx.clone());
     Ok(idx)
@@ -1086,6 +1039,33 @@ pub fn index_dir(req: &Req, db: &Db) -> PathBuf {
 
 // ------------------------------------------------------------- querying
 
+fn key_range(args: &QueryArgs, spec: &ViewSpec) -> Range<VKey> {
+    let (start_id_default, end_id_default) = if args.descending {
+        (IdBound::Max, IdBound::Min)
+    } else {
+        (IdBound::Min, IdBound::Max)
+    };
+    let start = args.start_key.as_ref().map(|k| {
+        let id = args.start_docid.clone().map(IdBound::Id).unwrap_or(start_id_default.clone());
+        (Json(k.clone()), id)
+    });
+    let end = args.end_key.as_ref().map(|k| {
+        let id = match &args.end_docid {
+            Some(d) => IdBound::Id(d.clone()),
+            None if args.inclusive_end => end_id_default.clone(),
+            // Exclusive end without a docid excludes every row of that key.
+            None => if args.descending { IdBound::Max } else { IdBound::Min },
+        };
+        (Json(k.clone()), id)
+    });
+    let _ = spec;
+    Range {
+        start,
+        end,
+        inclusive_end: args.inclusive_end || args.end_docid.is_none(),
+    }
+}
+
 fn group_key(args: &QueryArgs, key: &Value) -> Value {
     if let Some(l) = args.group_level {
         if let Value::Array(a) = key {
@@ -1096,17 +1076,21 @@ fn group_key(args: &QueryArgs, key: &Value) -> Value {
     if args.group { key.clone() } else { Value::Null }
 }
 
-fn same_group(args: &QueryArgs, raw: bool, a: &Value, b: &Value) -> bool {
+fn same_group(args: &QueryArgs, spec: &ViewSpec, a: &Value, b: &Value) -> bool {
     if let Some(l) = args.group_level {
         return match (a, b) {
             (Value::Array(x), Value::Array(y)) => {
                 let (x, y) = (&x[..x.len().min(l)], &y[..y.len().min(l)]);
-                x.len() == y.len() && x.iter().zip(y).all(|(p, q)| cmp_key(raw, p, q) == Ordering::Equal)
+                x.len() == y.len() && x.iter().zip(y).all(|(p, q)| spec.cmp_key(p, q) == Ordering::Equal)
             }
-            _ => cmp_key(raw, a, b) == Ordering::Equal,
+            _ => spec.cmp_key(a, b) == Ordering::Equal,
         };
     }
-    if args.group { cmp_key(raw, a, b) == Ordering::Equal } else { true }
+    if args.group {
+        spec.cmp_key(a, b) == Ordering::Equal
+    } else {
+        true
+    }
 }
 
 /// Fetch the doc for include_docs, following `{"_id": ...}` values.
@@ -1143,45 +1127,15 @@ pub struct ViewResult {
     pub reduced: bool,
 }
 
-/// Running reduction of one group: kvs are reduced in chunks, chunk
-/// results rereduced at the end (RocksDB has no stored reductions).
-struct GroupAcc {
-    key: Value,
-    kvs: Vec<(Value, Value)>,
-    partials: Vec<Value>,
-}
-
-impl GroupAcc {
-    fn push(&mut self, spec: &ViewSpec, k: &Value, id: &str, v: &Value) {
-        self.kvs.push((json!([k, id]), v.clone()));
-        if self.kvs.len() >= 1000 {
-            if let Some(r) = spec.reduce_values(&std::mem::take(&mut self.kvs)) {
-                self.partials.push(r);
-            }
-        }
-    }
-    fn finish(mut self, spec: &ViewSpec) -> Option<Value> {
-        if !self.kvs.is_empty() {
-            if let Some(r) = spec.reduce_values(&self.kvs) {
-                self.partials.push(r);
-            }
-        }
-        match self.partials.len() {
-            0 => None,
-            1 => self.partials.pop(),
-            _ => spec.rereduce_values(&self.partials),
-        }
-    }
-}
-
-pub fn query_view(snap: &Snapshot, idx: &Index, st: &IndexState, vi: usize, args: &QueryArgs) -> Result<ViewResult> {
-    let def = &idx.def;
+pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, args: &QueryArgs) -> Result<ViewResult> {
+    let tree = &st.views[vi];
     let vdef = &def.views[vi];
     let has_reduce = !matches!(vdef.reducer, Reducer::None);
     let reduce = args.reduce.unwrap_or(has_reduce);
-    if reduce && !has_reduce && args.reduce == Some(true) {
-        return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Reduce is invalid for map-only views."));
-    }
+    if reduce && !has_reduce
+        && args.reduce == Some(true) {
+            return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Reduce is invalid for map-only views."));
+        }
     if !has_reduce && (args.group || args.group_level.is_some()) {
         return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Invalid use of grouping on a map view."));
     }
@@ -1192,9 +1146,9 @@ pub fn query_view(snap: &Snapshot, idx: &Index, st: &IndexState, vi: usize, args
     if reduce && args.keys.is_some() && !(args.group || args.group_level.is_some()) {
         return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Multi-key fetches for reduce views must use `group=true`"));
     }
-    let raw = vdef.raw;
-    let spec = ViewSpec { raw, reducer: vdef.reducer.clone() };
-    let total = st.counts.get(vi).copied().unwrap_or(0);
+    let dir = if args.descending { Dir::Rev } else { Dir::Fwd };
+    let spec = tree.spec.clone();
+    let total = tree.full_reduce().map(|r| r.count).unwrap_or(0);
     let opts = args.doc_opts();
     let mut rows = Vec::new();
 
@@ -1216,65 +1170,67 @@ pub fn query_view(snap: &Snapshot, idx: &Index, st: &IndexState, vi: usize, args
 
     if reduce {
         let mut skip = args.skip;
-        let mut emit = |acc: GroupAcc, rows: &mut Vec<Value>| -> Result<()> {
-            let key = group_key(args, &acc.key);
-            let v = acc.finish(&spec).map(|j| finalize_red(&vdef.reducer, j)).unwrap_or(Value::Null);
-            if let Some(e) = v.get("error").filter(|_| v.get("reason").is_some()) {
-                return Err(CouchError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    e.as_str().unwrap_or("reduce_error"),
-                    v["reason"].as_str().unwrap_or("").to_string(),
-                ));
-            }
-            if skip > 0 {
-                skip -= 1;
-            } else if rows.len() < args.limit {
-                rows.push(json!({"key": key, "value": v}));
-            }
-            Ok(())
-        };
-        for a in &key_args {
-            let mut acc: Option<GroupAcc> = None;
+        'outer: for a in &key_args {
+            let range = key_range(a, &spec);
             let mut err = None;
-            idx.fold_rows(st, vi, a, |k, id, val| {
-                if let Some(g) = &acc {
-                    if !same_group(args, raw, &g.key, k) {
-                        if let Err(e) = emit(acc.take().unwrap(), &mut rows) {
-                            err = Some(e);
-                            return Ok(false);
-                        }
-                        if rows.len() >= args.limit {
-                            return Ok(false);
-                        }
+            tree.fold_reduce(
+                dir,
+                &range,
+                |x, y| same_group(args, &spec, &x.0.0, &y.0.0),
+                |k, red| {
+                    if skip > 0 {
+                        skip -= 1;
+                        return Ok(true);
                     }
-                }
-                let g = acc.get_or_insert_with(|| GroupAcc { key: k.clone(), kvs: Vec::new(), partials: Vec::new() });
-                for v in val.values() {
-                    g.push(&spec, k, id, v);
-                }
-                Ok(true)
-            })?;
+                    if rows.len() >= args.limit {
+                        return Ok(false);
+                    }
+                    let v = red.red.map(|j| finalize_red(&vdef.reducer, j.0)).unwrap_or(Value::Null);
+                    if let Some(e) = v.get("error").filter(|_| v.get("reason").is_some()) {
+                        err = Some(CouchError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            e.as_str().unwrap_or("reduce_error"),
+                            v["reason"].as_str().unwrap_or("").to_string(),
+                        ));
+                        return Ok(false);
+                    }
+                    rows.push(json!({"key": group_key(args, &k.0.0), "value": v}));
+                    Ok(true)
+                },
+            )?;
             if let Some(e) = err {
                 return Err(e);
             }
-            if let Some(g) = acc.take() {
-                emit(g, &mut rows)?;
-            }
             if rows.len() >= args.limit {
-                break;
+                break 'outer;
             }
         }
-        return Ok(ViewResult { total_rows: total, offset: 0, rows, update_seq: st.seq, reduced: true });
+        // An empty ungrouped reduce returns no rows, like CouchDB.
+        return Ok(ViewResult {
+            total_rows: total,
+            offset: 0,
+            rows,
+            update_seq: st.seq,
+            reduced: true,
+        });
     }
 
     let mut offset = None;
     let mut skip = args.skip;
     for a in &key_args {
+        let range = key_range(a, &spec);
         if offset.is_none() {
-            offset = Some(idx.count_before(st, vi, a)?);
+            offset = Some(match &range.start {
+                Some(s) => tree.reduce_before(s, dir)?.map(|r| r.count).unwrap_or(0),
+                None => 0,
+            });
         }
         let mut err = None;
-        idx.fold_rows(st, vi, a, |k, id, v| {
+        tree.fold(dir, &range, |(k, id), v| {
+            let id = match id {
+                IdBound::Id(s) => s.clone(),
+                _ => String::new(),
+            };
             for val in v.values() {
                 if skip > 0 {
                     skip -= 1;
@@ -1283,9 +1239,9 @@ pub fn query_view(snap: &Snapshot, idx: &Index, st: &IndexState, vi: usize, args
                 if rows.len() >= args.limit {
                     return Ok(false);
                 }
-                let mut row = json!({"id": id, "key": k, "value": val});
+                let mut row = json!({"id": id, "key": k.0, "value": val});
                 if args.include_docs {
-                    match row_doc(snap, id, val, &opts) {
+                    match row_doc(snap, &id, val, &opts) {
                         Ok(d) => row["doc"] = d,
                         Err(e) => {
                             err = Some(e);
@@ -1304,7 +1260,13 @@ pub fn query_view(snap: &Snapshot, idx: &Index, st: &IndexState, vi: usize, args
             break;
         }
     }
-    Ok(ViewResult { total_rows: total, offset: offset.unwrap_or(0) + args.skip as u64, rows, update_seq: st.seq, reduced: false })
+    Ok(ViewResult {
+        total_rows: total,
+        offset: offset.unwrap_or(0) + args.skip as u64,
+        rows,
+        update_seq: st.seq,
+        reduced: false,
+    })
 }
 
 /// Load ddoc + index, update per `args.update`, and return state.
@@ -1353,7 +1315,7 @@ pub async fn http_view(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Re
     let v = blocking(|| -> Result<Value> {
         let (snap, idx, st) = prepare(db, dir, ddoc_id, &args.update)?;
         let vi = idx.def.view_index(view).ok_or_else(|| CouchError::not_found("missing_named_view"))?;
-        Ok(view_response(query_view(&snap, &idx, &st, vi, &args)?, &args))
+        Ok(view_response(query_view(&snap, &st, &idx.def, vi, &args)?, &args))
     })?;
     ok_json(v)
 }
@@ -1377,7 +1339,7 @@ pub async fn http_view_queries(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &st
         for q in &queries {
             let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
             let args = QueryArgs::from_obj(obj, base.clone())?;
-            results.push(view_response(query_view(&snap, &idx, &st, vi, &args)?, &args));
+            results.push(view_response(query_view(&snap, &st, &idx.def, vi, &args)?, &args));
         }
         Ok(json!({"results": results}))
     })?;
@@ -1437,11 +1399,10 @@ pub fn http_view_cleanup(req: &Req, db: &Arc<Db>) -> Result<Response> {
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if let Some(sig) = name.strip_suffix(".rocks")
+            if let Some(sig) = name.strip_suffix(".view")
                 && !live.contains(sig) {
-                    // Drop the open index first so its RocksDB handle closes.
+                    let _ = std::fs::remove_file(e.path());
                     db.ext.lock().remove(&format!("mrview:{sig}"));
-                    let _ = std::fs::remove_dir_all(e.path());
                 }
         }
     }

@@ -930,6 +930,119 @@ async fn phase_compact(c: &Couch, a: &Args) -> Value {
     })
 }
 
+/// Bring the bench view up to date, retrying CouchDB's request timeouts.
+async fn refresh_view(c: &Couch, db: &str) -> f64 {
+    let t0 = Instant::now();
+    for _ in 0..10_000 {
+        let r = c
+            .req(reqwest::Method::GET, &format!("/{db}/_design/bench/_view/by_group?limit=1&reduce=false"))
+            .timeout(Duration::from_secs(24 * 3600))
+            .send()
+            .await;
+        if let Ok(r) = r && r.status().is_success() {
+            return t0.elapsed().as_secs_f64();
+        }
+    }
+    panic!("view refresh failed");
+}
+
+async fn view_sizes(c: &Couch, db: &str) -> (u64, u64, bool) {
+    let v = c.json(reqwest::Method::GET, &format!("/{db}/_design/bench/_info"), None).await.unwrap().1;
+    let vi = &v["view_index"];
+    (
+        vi["sizes"]["file"].as_u64().unwrap_or(0),
+        vi["sizes"]["active"].as_u64().unwrap_or(0),
+        vi["compact_running"].as_bool().unwrap_or(false),
+    )
+}
+
+const CHURN_DOCS: usize = 200_000;
+const CHURN_ROUNDS: usize = 3;
+
+/// View compaction after incremental churn: insert CHURN_DOCS small docs,
+/// update each CHURN_ROUNDS times and then delete them, refreshing the
+/// index after every round, so the index ends with the rows it started
+/// with plus the dead space incremental updates leave. Then compact it.
+async fn phase_view_compact(c: &Couch, a: &Args) -> Value {
+    let db = &a.db;
+    refresh_view(c, db).await;
+    let (file_start, active_start, _) = view_sizes(c, db).await;
+    let mut revs: Vec<Option<String>> = vec![None; CHURN_DOCS];
+    let mut rounds = Vec::new();
+    for round in 0..=CHURN_ROUNDS + 1 {
+        let delete = round == CHURN_ROUNDS + 1;
+        let t0 = Instant::now();
+        for start in (0..CHURN_DOCS).step_by(10_000) {
+            let docs: Vec<Value> = (start..(start + 10_000).min(CHURN_DOCS))
+                .map(|i| {
+                    let mut d = json!({"_id": format!("vc-{i:07}"), "band": 99, "group": (i + round) % 100, "size": round});
+                    if let Some(r) = &revs[i] {
+                        d["_rev"] = json!(r);
+                    }
+                    if delete {
+                        d["_deleted"] = json!(true);
+                    }
+                    d
+                })
+                .collect();
+            let (st, v) = c.json(reqwest::Method::POST, &format!("/{db}/_bulk_docs"), Some(json!({"docs": docs}))).await.unwrap();
+            assert!(st == 201, "churn bulk_docs: {st}");
+            for (k, r) in v.as_array().unwrap().iter().enumerate() {
+                revs[start + k] = r["rev"].as_str().map(str::to_string);
+            }
+        }
+        let write_secs = t0.elapsed().as_secs_f64();
+        let index_secs = refresh_view(c, db).await;
+        let (file, active, _) = view_sizes(c, db).await;
+        eprintln!(
+            "  view_compact churn {round}: write {write_secs:.1}s, index update {index_secs:.1}s ({:.0} docs/s), file {:.2} GB",
+            CHURN_DOCS as f64 / index_secs, file as f64 / 1e9
+        );
+        rounds.push(json!({"write_secs": write_secs, "index_update_secs": index_secs,
+            "index_docs_per_sec": CHURN_DOCS as f64 / index_secs, "file_bytes": file, "active_bytes": active}));
+    }
+    let (file0, active0, _) = view_sizes(c, db).await;
+    eprintln!("  view_compact: {:.2} GB file, {:.2} GB live", file0 as f64 / 1e9, active0 as f64 / 1e9);
+    let unix = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    let started_unix = unix();
+    let t0 = Instant::now();
+    let (st, v) = c.json(reqwest::Method::POST, &format!("/{db}/_compact/bench"), Some(json!({}))).await.unwrap();
+    assert!(st == 202, "view compact request failed: {st} {v}");
+    // Done once compaction has been seen running and then stopped, or once
+    // the file has been swapped: main's B-tree build never reports
+    // compact_running.
+    let mut seen = false;
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let (file, _, running) = view_sizes(c, db).await;
+        seen |= running;
+        if !running && (seen || file != file0 || t0.elapsed() > Duration::from_secs(3600)) {
+            break;
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let (file1, active1, _) = view_sizes(c, db).await;
+    eprintln!(
+        "  view_compact: {secs:.1}s -> {:.2} GB file, {:.2} GB live",
+        file1 as f64 / 1e9, active1 as f64 / 1e9
+    );
+    json!({
+        "started_unix": started_unix,
+        "ended_unix": unix(),
+        "churn_docs": CHURN_DOCS,
+        "churn_rounds": rounds,
+        "file_bytes_start": file_start,
+        "active_bytes_start": active_start,
+        "secs": secs,
+        "file_bytes_before": file0,
+        "active_bytes_before": active0,
+        "file_bytes_after": file1,
+        "active_bytes_after": active1,
+        "reclaimed_bytes": file0.saturating_sub(file1),
+        "live_mb_per_sec": mb(active1) / secs,
+    })
+}
+
 // ------------------------------------------------------------------ main
 
 fn save(out: &str, name: &str, key: &str, val: Value) {
@@ -973,6 +1086,7 @@ async fn main() {
             "delete" => phase_delete(&c, &a, created.clone()).await,
             "replicate" => phase_replicate(&c, &a).await,
             "compact" => phase_compact(&c, &a).await,
+            "view_compact" => phase_view_compact(&c, &a).await,
             other => {
                 eprintln!("unknown phase {other}");
                 continue;

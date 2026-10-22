@@ -15,6 +15,8 @@
   --ring: rgba(11,11,11,0.10);
   --erlang: #2a78d6;
   --rust: #eb6834;
+  --rocks: #1baf7a;
+  --hybrid: #eda100;
   --good: #006300;
   --font: system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -23,13 +25,13 @@
   :root:not([data-theme="light"]) {
     --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7;
     --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
-    --erlang: #3987e5; --rust: #d95926; --good: #0ca30c; color-scheme: dark;
+    --erlang: #3987e5; --rust: #d95926; --rocks: #199e70; --hybrid: #c98500; --good: #0ca30c; color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7;
   --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
-  --erlang: #3987e5; --rust: #d95926; --good: #0ca30c; color-scheme: dark;
+  --erlang: #3987e5; --rust: #d95926; --rocks: #199e70; --hybrid: #c98500; --good: #0ca30c; color-scheme: dark;
 }
 body {
   background: var(--page); color: var(--ink); font: 15px/1.55 var(--font);
@@ -96,10 +98,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
     <h1>Apache CouchDB 3.5.3 (Erlang) vs couchdb-rs</h1>
     <p id="intro"></p>
     <div class="facts" id="facts"></div>
-    <div class="legend" aria-hidden="true">
-      <span><i style="background:var(--erlang)"></i>CouchDB (Erlang)</span>
-      <span><i style="background:var(--rust)"></i>couchdb-rs</span>
-    </div>
+    <div class="legend" aria-hidden="true" id="legend"></div>
     <div id="partial" class="warn" hidden></div>
   </header>
 
@@ -107,6 +106,8 @@ code { font-family: var(--mono); font-size: 0.92em; }
     <h2>Summary</h2>
     <p>How many times faster couchdb-rs is than CouchDB on each headline measure. Right of 1× means couchdb-rs is faster; left means CouchDB is faster.</p>
     <div class="figure" id="fig-summary"></div>
+    <div class="figure" id="fig-summary-rocks" hidden></div>
+    <div class="figure" id="fig-summary-hybrid" hidden></div>
   </section>
 
   <section>
@@ -155,6 +156,14 @@ code { font-family: var(--mono); font-size: 0.92em; }
     <div class="figrow"><div class="figure" id="fig-view-build"></div><div class="figure" id="fig-view-q"></div></div>
   </section>
 
+  <section id="vc-section" hidden>
+    <h2>View compaction</h2>
+    <p id="vc-text">Incremental index updates followed by view compaction. 200,000 small documents are inserted, updated three times and then deleted, and the index is brought up to date after each round, so it ends with the rows it started with plus whatever dead space incremental updates leave. Then the index is compacted. CouchDB's background indexer updates its index while the churn is written, so its index update times are not shown.</p>
+    <div class="figrow"><div class="figure" id="fig-vc-update"></div><div class="figure" id="fig-vc-time"></div></div>
+    <div class="figrow"><div class="figure" id="fig-vc-ram"></div><div class="figure" id="fig-vc-disk"></div></div>
+    <div class="figure" id="fig-vc-sizes"></div>
+  </section>
+
   <section>
     <h2>Replication</h2>
     <p>One full replication of the loaded database into a new database on the same server, driven by CouchDB's own replicator in both cases. That replicator talks to couchdb-rs over HTTP, so this also shows the two interoperate.</p>
@@ -187,11 +196,16 @@ code { font-family: var(--mono); font-size: 0.92em; }
 <script>
 (function () {
   const R = JSON.parse(document.getElementById('data').textContent);
-  const E = R.results.erlang || {}, S = R.results.rust || {};
+  const E = R.results.erlang || {}, S = R.results.rust || {}, K = R.results.rocksdb || {}, Hy = R.results.hybrid || {};
+  const SRC = { erlang: E, rust: S, rocksdb: K, hybrid: Hy };
   const SERIES = [
     { key: 'erlang', name: 'CouchDB (Erlang)', color: 'var(--erlang)' },
     { key: 'rust', name: 'couchdb-rs', color: 'var(--rust)' },
   ];
+  if (R.results.rocksdb) SERIES.push({ key: 'rocksdb', name: 'couchdb-rs (RocksDB)', color: 'var(--rocks)' });
+  if (R.results.hybrid) SERIES.push({ key: 'hybrid', name: 'couchdb-rs (RocksDB docs + B-tree views)', color: 'var(--hybrid)' });
+  // One bar-chart row: f picks the value out of each server's results.
+  const row = (label, f) => { const r = { label }; for (const s of SERIES) r[s.key] = f(SRC[s.key]); return r; };
   const tip = document.getElementById('tip');
   const NS = 'http://www.w3.org/2000/svg';
   const el = (tag, attrs, parent) => {
@@ -266,23 +280,25 @@ code { font-family: var(--mono); font-size: 0.92em; }
   const RENDERERS = [];
   const width = host => Math.max(280, Math.floor(host.clientWidth - 36));
   function bars(id, rows, opts) { RENDERERS.push(() => drawBars(id, typeof rows === 'function' ? rows() : rows, typeof opts === 'function' ? opts() : opts)); }
-  function ratios(id, rows) { RENDERERS.push(() => drawRatios(id, rows)); }
+  function ratios(id, rows, series) { RENDERERS.push(() => drawRatios(id, rows, series)); }
   function drawBars(id, rows, opts) {
     const host = document.getElementById(id);
     host.replaceChildren();
-    rows = rows.filter(r => r.erlang != null || r.rust != null);
+    // Only the servers with a value in this chart get a bar and a legend entry.
+    const SER = SERIES.filter(s => rows.some(r => r[s.key] != null));
+    rows = rows.filter(r => SER.some(s => r[s.key] != null));
     const head = h('div', 'fighead');
     const t = h('div'); t.append(h('h3', null, opts.title), h('div', 'sub', opts.sub || ''));
     const lg = h('div', 'legend');
-    for (const s of SERIES) { const sp = h('span'); const i = h('i'); i.style.background = s.color; sp.append(i, document.createTextNode(s.name)); lg.appendChild(sp); }
+    for (const s of SER) { const sp = h('span'); const i = h('i'); i.style.background = s.color; sp.append(i, document.createTextNode(s.name)); lg.appendChild(sp); }
     head.append(t, lg);
     host.appendChild(head);
     if (!rows.length) { host.appendChild(h('div', 'sub', 'No data in this run.')); return; }
     const fmt = opts.fmt || compact;
-    const vals = rows.flatMap(r => [r.erlang, r.rust]).filter(v => v != null && v > 0);
+    const vals = rows.flatMap(r => SER.map(s => r[s.key])).filter(v => v != null && v > 0);
     const max = Math.max(...vals);
     const lo = 0, ticks = niceTicks(max), hi = ticks[ticks.length - 1];
-    const W = width(host), labelW = 76, valW = 50, barH = 11, gapIn = 2, rowH = 2 * barH + gapIn + 14, top = 6, axisH = 22;
+    const W = width(host), labelW = 76, valW = 50, barH = 11, gapIn = 2, rowH = SER.length * barH + (SER.length - 1) * gapIn + 14, top = 6, axisH = 22;
     const H = top + rows.length * rowH + axisH;
     const x0 = labelW, x1 = W - valW;
     const sx = scale(lo, hi, x0, x1);
@@ -297,7 +313,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
       const y = top + i * rowH + 7;
       const g = el('g', {}, svg);
       const lab = el('text', { x: labelW - 10, y: y + barH + 1 + 4, 'text-anchor': 'end', class: 'rowlabel' }, g); lab.textContent = r.label;
-      SERIES.forEach((s, si) => {
+      SER.forEach((s, si) => {
         const v = r[s.key]; if (v == null) return;
         const by = y + si * (barH + gapIn);
         const xe = Math.max(sx(v), x0 + 4);
@@ -305,15 +321,16 @@ code { font-family: var(--mono); font-size: 0.92em; }
         // 4px rounded data end, square at the baseline.
         const rr = Math.min(4, w / 2, barH / 2);
         const d = `M${x0},${by} H${xe - rr} Q${xe},${by} ${xe},${by + rr} V${by + barH - rr} Q${xe},${by + barH} ${xe - rr},${by + barH} H${x0} Z`;
-        el('path', { d, fill: s.color, class: 'bar' + (si === 0 ? ' b0' : ' b1') }, g);
+        el('path', { d, fill: s.color, class: 'bar' }, g);
         const vt = el('text', { x: xe + 6, y: by + barH - 1.5, class: 'val' }, g); vt.textContent = fmt(v);
       });
       const hit = el('rect', { x: 0, y: y - 4, width: W, height: rowH - 6, class: 'hit', tabindex: 0 }, g);
       const tipRows = () => {
-        const out = SERIES.filter(s => r[s.key] != null).map(s => ({ name: s.name, value: fmt(r[s.key]) + (opts.unit ? ' ' + opts.unit : ''), color: s.color }));
-        if (r.erlang && r.rust) {
-          const ratio = opts.better === 'lower' ? r.erlang / r.rust : r.rust / r.erlang;
-          out.push({ name: ratio >= 1 ? 'couchdb-rs faster' : 'CouchDB faster', value: (ratio >= 1 ? ratio : 1 / ratio).toFixed(2) + '×' });
+        const out = SER.filter(s => r[s.key] != null).map(s => ({ name: s.name, value: fmt(r[s.key]) + (opts.unit ? ' ' + opts.unit : ''), color: s.color }));
+        for (const s of SER.slice(1)) {
+          if (!r.erlang || !r[s.key]) continue;
+          const ratio = opts.better === 'lower' ? r.erlang / r[s.key] : r[s.key] / r.erlang;
+          out.push({ name: `${s.name} vs CouchDB`, value: (ratio >= 1 ? ratio.toFixed(2) + '× faster' : (1 / ratio).toFixed(2) + '× slower') });
         }
         return out;
       };
@@ -324,9 +341,10 @@ code { font-family: var(--mono); font-size: 0.92em; }
       hit.addEventListener('blur', off);
     });
     host.appendChild(svg);
-    table(host, ['', ...SERIES.map(s => s.name), opts.better === 'lower' ? 'CouchDB / rs' : 'rs / CouchDB'],
-      rows.map(r => [r.label, r.erlang == null ? '–' : fmt(r.erlang), r.rust == null ? '–' : fmt(r.rust),
-        r.erlang && r.rust ? ((opts.better === 'lower' ? r.erlang / r.rust : r.rust / r.erlang).toFixed(2) + '×') : '–']));
+    const others = SER.slice(1);
+    table(host, ['', ...SER.map(s => s.name), ...others.map(s => `${s.name} speed vs CouchDB`)],
+      rows.map(r => [r.label, ...SER.map(s => r[s.key] == null ? '–' : fmt(r[s.key])),
+        ...others.map(s => r.erlang && r[s.key] ? ((opts.better === 'lower' ? r.erlang / r[s.key] : r[s.key] / r.erlang).toFixed(2) + '×') : '–')]));
   }
 
   function table(host, header, rows) {
@@ -338,12 +356,12 @@ code { font-family: var(--mono); font-size: 0.92em; }
   }
 
   // ------------------------------------------------------ ratio chart
-  function drawRatios(id, rows) {
+  function drawRatios(id, rows, series) {
     const host = document.getElementById(id);
     host.replaceChildren();
     rows = rows.filter(r => isFinite(r.ratio) && r.ratio > 0);
     const head = h('div', 'fighead');
-    const t = h('div'); t.append(h('h3', null, 'couchdb-rs speed relative to CouchDB'), h('div', 'sub', 'each bar starts at 1× (parity)'));
+    const t = h('div'); t.append(h('h3', null, `${series.name} speed relative to CouchDB`), h('div', 'sub', 'each bar starts at 1× (parity)'));
     head.append(t); host.appendChild(head);
     if (!rows.length) { host.appendChild(h('div', 'sub', 'No comparable results yet.')); return; }
     const rticks = niceTicks(Math.max(2, ...rows.map(r => r.ratio)));
@@ -366,7 +384,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
       const g = el('g', {}, svg);
       const lab = el('text', { x: labelW - 12, y: y + 4, 'text-anchor': 'end', class: 'rowlabel' }, g); lab.textContent = r.label;
       const xs = sx(1), xe = sx(r.ratio);
-      const color = r.ratio >= 1 ? 'var(--rust)' : 'var(--erlang)';
+      const color = r.ratio >= 1 ? series.color : 'var(--erlang)';
       const a = Math.min(xs, xe), b = Math.max(xs, xe);
       el('rect', { x: a, y: y - 5, width: Math.max(b - a, 2), height: 10, rx: 3, fill: color, class: 'bar' }, g);
       const lbl = r.ratio >= 1 ? r.ratio.toFixed(1) + '×' : (1 / r.ratio).toFixed(1) + '× slower';
@@ -374,8 +392,8 @@ code { font-family: var(--mono); font-size: 0.92em; }
       const hit = el('rect', { x: 0, y: y - rowH / 2, width: W, height: rowH, class: 'hit', tabindex: 0 }, g);
       const tipRows = () => [
         { name: 'CouchDB (Erlang)', value: r.efmt, color: 'var(--erlang)' },
-        { name: 'couchdb-rs', value: r.rfmt, color: 'var(--rust)' },
-        { name: r.ratio >= 1 ? 'couchdb-rs faster' : 'CouchDB faster', value: (r.ratio >= 1 ? r.ratio : 1 / r.ratio).toFixed(2) + '×' },
+        { name: series.name, value: r.rfmt, color: series.color },
+        { name: r.ratio >= 1 ? `${series.name} faster` : 'CouchDB faster', value: (r.ratio >= 1 ? r.ratio : 1 / r.ratio).toFixed(2) + '×' },
       ];
       hit.addEventListener('pointermove', e => showTip(e, r.label, tipRows()));
       hit.addEventListener('pointerleave', hideTip);
@@ -383,18 +401,18 @@ code { font-family: var(--mono); font-size: 0.92em; }
       hit.addEventListener('blur', hideTip);
     });
     host.appendChild(svg);
-    table(host, ['Benchmark', 'CouchDB (Erlang)', 'couchdb-rs', 'couchdb-rs speed'], rows.map(r => [r.label, r.efmt, r.rfmt, r.ratio.toFixed(2) + '×']));
+    table(host, ['Benchmark', 'CouchDB (Erlang)', series.name, `${series.name} speed`], rows.map(r => [r.label, r.efmt, r.rfmt, r.ratio.toFixed(2) + '×']));
   }
 
   // ------------------------------------------------------------- data
   const g = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
   const CLASSES = ['100B', '1KB', '10KB', '100KB', '1MB', '10MB', '100MB', '1GB'];
-  const byClass = (phase, field) => CLASSES.map(c => ({ label: c, erlang: g(E, `${phase}.${c}.${field}`), rust: g(S, `${phase}.${c}.${field}`) }));
+  const byClass = (phase, field) => CLASSES.map(c => (row(c, d => g(d, `${phase}.${c}.${field}`))));
 
   const srv = E.server || S.server || {};
   const ds = srv.dataset_bytes;
   document.getElementById('intro').textContent =
-    `Both servers ran on one machine, one after the other, against byte-identical data: ${bytes(ds)} in ${compact(srv.dataset_docs)} documents ` +
+    `${R.results.hybrid ? 'All four configurations (CouchDB; couchdb-rs with its B-tree engine; couchdb-rs with RocksDB for documents and views; and couchdb-rs with RocksDB for documents and B-tree views)' : R.results.rocksdb ? 'All three servers (CouchDB, couchdb-rs with its B-tree engine, and couchdb-rs with a RocksDB engine)' : 'Both servers'} ran on one machine, one after the other, against byte-identical data: ${bytes(ds)} in ${compact(srv.dataset_docs)} documents ` +
     `sized from 100 bytes to 1 GB, filled with generated English-like text. Each was loaded, then measured for writes, reads, deletes, view indexing and queries, and replication.`;
   const facts = document.getElementById('facts');
   const fact = (k, v) => { const s = h('span'); s.append(document.createTextNode(k + ' '), h('b', null, v)); facts.appendChild(s); };
@@ -402,38 +420,53 @@ code { font-family: var(--mono); font-size: 0.92em; }
   fact('Machine', R.machine.cpu); fact('RAM', R.machine.ram); fact('Run', R.generated);
   const missing = ['erlang', 'rust'].filter(k => !R.results[k]);
   const phases = ['load', 'view', 'get', 'put', 'delete', 'replicate'];
-  const incomplete = ['erlang', 'rust'].filter(k => R.results[k] && phases.some(p => !R.results[k][p]));
+  const incomplete = ['erlang', 'rust', 'rocksdb'].filter(k => R.results[k] && phases.some(p => !R.results[k][p]));
   if (missing.length || incomplete.length) {
     const p = document.getElementById('partial'); p.hidden = false;
     p.textContent = 'This run is still in progress: ' + [...missing.map(m => m + ' not started'), ...incomplete.map(m => m + ' partially complete')].join(', ') + '. Charts show what has finished.';
   }
 
-  // Summary ratios (>1 = couchdb-rs faster).
-  const sumRows = [];
-  const addR = (label, ev, rv, lowerBetter, f) => {
-    if (ev == null || rv == null || !ev || !rv) return;
-    sumRows.push({ label, ratio: lowerBetter ? ev / rv : rv / ev, efmt: f(ev), rfmt: f(rv) });
-  };
-  addR('Bulk load (MB/s)', g(E, 'load.mb_per_sec'), g(S, 'load.mb_per_sec'), false, v => compact(v) + ' MB/s');
-  addR('PUT 1 KB (ops/s)', g(E, 'put.1KB.ops_per_sec'), g(S, 'put.1KB.ops_per_sec'), false, v => compact(v) + '/s');
-  addR('PUT 10 MB (MB/s)', g(E, 'put.10MB.mb_per_sec'), g(S, 'put.10MB.mb_per_sec'), false, v => compact(v) + ' MB/s');
-  addR('PUT 1 GB (MB/s)', g(E, 'put.1GB.mb_per_sec'), g(S, 'put.1GB.mb_per_sec'), false, v => compact(v) + ' MB/s');
-  addR('GET 1 KB (ops/s)', g(E, 'get.1KB.ops_per_sec'), g(S, 'get.1KB.ops_per_sec'), false, v => compact(v) + '/s');
-  addR('GET 10 MB (MB/s)', g(E, 'get.10MB.mb_per_sec'), g(S, 'get.10MB.mb_per_sec'), false, v => compact(v) + ' MB/s');
-  addR('DELETE 1 KB (ops/s)', g(E, 'delete.1KB.ops_per_sec'), g(S, 'delete.1KB.ops_per_sec'), false, v => compact(v) + '/s');
-  addR('View build (docs/s)', g(E, 'view.docs_per_sec'), g(S, 'view.docs_per_sec'), false, v => compact(v) + '/s');
-  addR('View key lookup (q/s)', g(E, 'view.queries.key_lookup_limit20.ops_per_sec'), g(S, 'view.queries.key_lookup_limit20.ops_per_sec'), false, v => compact(v) + '/s');
-  addR('View reduce (q/s)', g(E, 'view.queries.group_level1_reduce.ops_per_sec'), g(S, 'view.queries.group_level1_reduce.ops_per_sec'), false, v => compact(v) + '/s');
-  addR('Replication (time)', g(E, 'replicate.secs'), g(S, 'replicate.secs'), true, dur);
-  addR('Compaction (time)', g(E, 'compact.secs'), g(S, 'compact.secs'), true, dur);
-  ratios('fig-summary', sumRows);
+  // Summary ratios (>1 = faster than CouchDB), one chart per other engine.
+  const HEADLINE = [
+    ['Bulk load (MB/s)', 'load.mb_per_sec', false, v => compact(v) + ' MB/s'],
+    ['PUT 1 KB (ops/s)', 'put.1KB.ops_per_sec', false, v => compact(v) + '/s'],
+    ['PUT 10 MB (MB/s)', 'put.10MB.mb_per_sec', false, v => compact(v) + ' MB/s'],
+    ['PUT 1 GB (MB/s)', 'put.1GB.mb_per_sec', false, v => compact(v) + ' MB/s'],
+    ['GET 1 KB (ops/s)', 'get.1KB.ops_per_sec', false, v => compact(v) + '/s'],
+    ['GET 10 MB (MB/s)', 'get.10MB.mb_per_sec', false, v => compact(v) + ' MB/s'],
+    ['DELETE 1 KB (ops/s)', 'delete.1KB.ops_per_sec', false, v => compact(v) + '/s'],
+    ['View build (docs/s)', 'view.docs_per_sec', false, v => compact(v) + '/s'],
+    ['View key lookup (q/s)', 'view.queries.key_lookup_limit20.ops_per_sec', false, v => compact(v) + '/s'],
+    ['View reduce (q/s)', 'view.queries.group_level1_reduce.ops_per_sec', false, v => compact(v) + '/s'],
+    ['Replication (time)', 'replicate.secs', true, dur],
+    ['Compaction (time)', 'compact.secs', true, dur],
+    ['View compaction (time)', 'view_compact.secs', true, dur],
+  ];
+  const ratioRows = src => HEADLINE.flatMap(([label, path, lowerBetter, f]) => {
+    const ev = g(E, path), rv = g(src, path);
+    if (!ev || !rv) return [];
+    return [{ label, ratio: lowerBetter ? ev / rv : rv / ev, efmt: f(ev), rfmt: f(rv) }];
+  });
+  ratios('fig-summary', ratioRows(S), SERIES[1]);
+  if (R.results.rocksdb) {
+    document.getElementById('fig-summary-rocks').hidden = false;
+    ratios('fig-summary-rocks', ratioRows(K), SERIES[2]);
+  }
+  if (R.results.hybrid) {
+    // The hybrid shares the RocksDB engine's document storage, so its
+    // document results are the RocksDB run's; only views were rerun.
+    document.getElementById('fig-summary-hybrid').hidden = false;
+    ratios('fig-summary-hybrid', ratioRows({ ...K, ...Hy }), SERIES.find(s => s.key === 'hybrid'));
+  }
+  const lg = document.getElementById('legend');
+  for (const sr of SERIES) { const sp = h('span'); const i = h('i'); i.style.background = sr.color; sp.append(i, document.createTextNode(sr.name)); lg.appendChild(sp); }
 
   const loadTxt = (n, d) => d && d.load ? `${n}: ${bytes(d.load.bytes)} in ${dur(d.load.secs)}` : null;
   document.getElementById('load-text').textContent =
     'The whole dataset, loaded with 16 concurrent connections: small docs through _bulk_docs (1,000 per batch), large ones as streamed single-document uploads. ' +
     [loadTxt('CouchDB', E), loadTxt('couchdb-rs', S)].filter(Boolean).join(' · ') + '.';
-  bars('fig-load-mb', [{ label: 'Throughput', erlang: g(E, 'load.mb_per_sec'), rust: g(S, 'load.mb_per_sec') }], { title: 'Load throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
-  bars('fig-load-docs', [{ label: 'Documents', erlang: g(E, 'load.docs_per_sec'), rust: g(S, 'load.docs_per_sec') }], { title: 'Load rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
+  bars('fig-load-mb', [row('Throughput', d => g(d, 'load.mb_per_sec'))], { title: 'Load throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
+  bars('fig-load-docs', [row('Documents', d => g(d, 'load.docs_per_sec'))], { title: 'Load rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
 
   bars('fig-put-ops', byClass('put', 'ops_per_sec'), { title: 'PUT operations', sub: 'ops/s by doc size · higher is better', unit: 'ops/s' });
   bars('fig-put-mb', byClass('put', 'mb_per_sec'), { title: 'PUT throughput', sub: 'MB/s by doc size · higher is better', unit: 'MB/s' });
@@ -448,7 +481,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
   bars('fig-lat-get', () => byClass('get', PCT), latOpts('GET'));
   bars('fig-lat-del', () => byClass('delete', PCT), latOpts('DELETE'));
   const QL = [['key_lookup_limit20', 'Key lookup'], ['key_reduce', 'Key + reduce'], ['group_level1_reduce', 'Group reduce'], ['include_docs_limit10', 'include_docs']];
-  bars('fig-lat-view', () => QL.map(([k, l]) => ({ label: l, erlang: g(E, `view.queries.${k}.${PCT}`), rust: g(S, `view.queries.${k}.${PCT}`) })), latOpts('View query'));
+  bars('fig-lat-view', () => QL.map(([k, l]) => (row(l, d => g(d, `view.queries.${k}.${PCT}`)))), latOpts('View query'));
   document.querySelectorAll('#pct button').forEach(b => b.addEventListener('click', () => {
     PCT = b.dataset.k;
     document.querySelectorAll('#pct button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
@@ -470,7 +503,8 @@ code { font-family: var(--mono); font-size: 0.92em; }
     for (const ph of ['put', 'get', 'delete']) for (const c of CLASSES) ops.push([`${ph.toUpperCase()} ${c}`, `${ph}.${c}`]);
     for (const [k, l] of QL) ops.push([`View: ${l}`, `view.queries.${k}`]);
     for (const [label, path] of ops) {
-      for (const [src, name] of [[E, 'CouchDB'], [S, 'couchdb-rs']]) {
+      for (const { key, name } of SERIES) {
+        const src = SRC[key];
         const m = g(src, path); if (!m) continue;
         const row = h('tr');
         [label, name, compact(m.ops_per_sec), m.bytes ? compact(m.mb_per_sec) : '–', ms(m.mean_ms), ms(m.p50_ms), ms(m.p90_ms), ms(m.p95_ms), ms(m.p99_ms), ms(m.max_ms)]
@@ -482,27 +516,27 @@ code { font-family: var(--mono); font-size: 0.92em; }
   });
 
   bars('fig-view-build', [
-    { label: 'Index build', erlang: g(E, 'view.docs_per_sec'), rust: g(S, 'view.docs_per_sec') },
+    row('Index build', d => g(d, 'view.docs_per_sec')),
   ], { title: 'View build rate', sub: 'docs indexed per second · higher is better', unit: 'docs/s' });
   const Q = [['key_lookup_limit20', 'Key lookup'], ['key_reduce', 'Key + reduce'], ['group_level1_reduce', 'Group reduce'], ['include_docs_limit10', 'include_docs']];
-  bars('fig-view-q', Q.map(([k, l]) => ({ label: l, erlang: g(E, `view.queries.${k}.ops_per_sec`), rust: g(S, `view.queries.${k}.ops_per_sec`) })),
+  bars('fig-view-q', Q.map(([k, l]) => (row(l, d => g(d, `view.queries.${k}.ops_per_sec`)))),
     { title: 'View queries', sub: 'queries/s · higher is better', unit: 'q/s' });
 
   const mins = v => v == null ? null : v / 60;
-  bars('fig-repl-time', [{ label: 'Full copy', erlang: mins(g(E, 'replicate.secs')), rust: mins(g(S, 'replicate.secs')) }],
+  bars('fig-repl-time', [row('Full copy', d => mins(g(d, 'replicate.secs')))],
     { title: 'Replication time', sub: 'minutes · lower is better', unit: 'min', better: 'lower' });
-  bars('fig-repl-mb', [{ label: 'Throughput', erlang: g(E, 'replicate.mb_per_sec'), rust: g(S, 'replicate.mb_per_sec') }],
+  bars('fig-repl-mb', [row('Throughput', d => g(d, 'replicate.mb_per_sec'))],
     { title: 'Replication throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
-  bars('fig-repl-docs', [{ label: 'Documents', erlang: g(E, 'replicate.docs_per_sec'), rust: g(S, 'replicate.docs_per_sec') }],
+  bars('fig-repl-docs', [row('Documents', d => g(d, 'replicate.docs_per_sec'))],
     { title: 'Replication rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
 
-  bars('fig-compact-time', [{ label: 'Compaction', erlang: mins(g(E, 'compact.secs')), rust: mins(g(S, 'compact.secs')) }],
+  bars('fig-compact-time', [row('Compaction', d => mins(g(d, 'compact.secs')))],
     { title: 'Compaction time', sub: 'minutes · lower is better', unit: 'min', better: 'lower' });
-  bars('fig-compact-rate', [{ label: 'Live data', erlang: g(E, 'compact.live_mb_per_sec'), rust: g(S, 'compact.live_mb_per_sec') }],
+  bars('fig-compact-rate', [row('Live data', d => g(d, 'compact.live_mb_per_sec'))],
     { title: 'Compaction throughput', sub: 'MB/s of live data copied · higher is better', unit: 'MB/s' });
-  bars('fig-compact-ram', [{ label: 'Peak RAM', erlang: g(E, 'compact.resources.rss_peak_bytes'), rust: g(S, 'compact.resources.rss_peak_bytes') }],
+  bars('fig-compact-ram', [row('Peak RAM', d => g(d, 'compact.resources.rss_peak_bytes'))],
     { title: 'Peak memory during compaction', sub: 'server resident memory · lower is better', better: 'lower', fmt: bytes });
-  bars('fig-compact-disk', [{ label: 'Peak extra disk', erlang: g(E, 'compact.resources.disk_peak_extra_bytes'), rust: g(S, 'compact.resources.disk_peak_extra_bytes') }],
+  bars('fig-compact-disk', [row('Peak extra disk', d => g(d, 'compact.resources.disk_peak_extra_bytes'))],
     { title: 'Peak extra disk during compaction', sub: 'growth of the data directory over its starting size · lower is better', better: 'lower', fmt: bytes });
   RENDERERS.push(() => {
     const host = document.getElementById('fig-compact-sizes');
@@ -512,7 +546,8 @@ code { font-family: var(--mono); font-size: 0.92em; }
     head.append(t); host.appendChild(head);
     const wrap = h('div', 'tablewrap'); const tb = h('table');
     const tr = h('tr'); ['Server', 'File before', 'Live before', 'File after', 'Reclaimed', 'Time', 'Peak RAM', 'Peak extra disk'].forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
-    for (const [src, name] of [[E, 'CouchDB (Erlang)'], [S, 'couchdb-rs']]) {
+    for (const { key, name } of SERIES) {
+      const src = SRC[key];
       const m = g(src, 'compact'); if (!m) continue;
       const row = h('tr');
       [name, bytes(m.file_bytes_before), bytes(m.active_bytes_before), bytes(m.file_bytes_after), bytes(m.reclaimed_bytes), dur(m.secs), bytes(g(m, 'resources.rss_peak_bytes')), bytes(g(m, 'resources.disk_peak_extra_bytes'))]
@@ -522,12 +557,44 @@ code { font-family: var(--mono); font-size: 0.92em; }
     wrap.appendChild(tb); host.appendChild(wrap);
   });
 
+  if (SERIES.some(s => g(SRC[s.key], 'view_compact'))) {
+    document.getElementById('vc-section').hidden = false;
+    const upd = d => { const rs = g(d, 'view_compact.churn_rounds'); return rs ? rs.reduce((a, r) => a + r.index_update_secs, 0) / rs.length : null; };
+    // CouchDB's background indexer (ken) indexes while the churn is being
+    // written, so its refresh times don't measure the update; left out.
+    bars('fig-vc-update', [row('Per round', d => d === E ? null : upd(d))],
+      { title: 'Incremental index update', sub: 'seconds to index 200,000 changed docs · lower is better', unit: 's', better: 'lower', fmt: v => v < 10 ? v.toFixed(2) : v.toFixed(0) });
+    bars('fig-vc-time', [row('Compaction', d => g(d, 'view_compact.secs'))],
+      { title: 'View compaction time', sub: 'seconds · lower is better', unit: 's', better: 'lower', fmt: v => v < 10 ? v.toFixed(2) : v.toFixed(0) });
+    bars('fig-vc-ram', [row('Peak extra memory', d => g(d, 'view_compact.resources.footprint_peak_extra_bytes'))],
+      { title: 'Extra memory during view compaction', sub: 'peak physical footprint over its level just before · lower is better', better: 'lower', fmt: bytes });
+    bars('fig-vc-disk', [row('Peak extra disk', d => g(d, 'view_compact.resources.disk_peak_extra_bytes'))],
+      { title: 'Extra disk during view compaction', sub: 'peak growth of the index directory · lower is better', better: 'lower', fmt: bytes });
+    RENDERERS.push(() => {
+      const host = document.getElementById('fig-vc-sizes');
+      host.replaceChildren();
+      const head = h('div', 'fighead'); const t = h('div');
+      t.append(h('h3', null, 'Index file sizes'), h('div', 'sub', 'start is the index before the churn; before and after bracket the compaction'));
+      head.append(t); host.appendChild(head);
+      const wrap = h('div', 'tablewrap'); const tb = h('table');
+      const tr = h('tr'); ['Server', 'File at start', 'File before', 'Live before', 'File after', 'Reclaimed', 'Time'].forEach(c => tr.appendChild(h('th', null, c))); tb.appendChild(tr);
+      for (const { key, name } of SERIES) {
+        const m = g(SRC[key], 'view_compact'); if (!m) continue;
+        const r = h('tr');
+        [name, bytes(m.file_bytes_start), bytes(m.file_bytes_before), bytes(m.active_bytes_before), bytes(m.file_bytes_after), bytes(m.reclaimed_bytes), dur(m.secs)]
+          .forEach(c => r.appendChild(h('td', null, c)));
+        tb.appendChild(r);
+      }
+      wrap.appendChild(tb); host.appendChild(wrap);
+    });
+  }
+
   const ds2 = (E.server || S.server || {}).dataset_bytes;
-  bars('fig-disk-ratio', [{ label: 'Compression', erlang: ds2 && g(E, 'load.file_bytes_after') ? ds2 / g(E, 'load.file_bytes_after') : null, rust: ds2 && g(S, 'load.file_bytes_after') ? ds2 / g(S, 'load.file_bytes_after') : null }],
+  bars('fig-disk-ratio', [row('Compression', d => ds2 && g(d, 'load.file_bytes_after') ? ds2 / g(d, 'load.file_bytes_after') : null)],
     { title: 'Compression', sub: 'dataset size ÷ database file size after the load · higher is better', unit: '×', fmt: v => v.toFixed(2) + '×' });
-  bars('fig-disk-db', [{ label: 'Database', erlang: g(E, 'load.file_bytes_after'), rust: g(S, 'load.file_bytes_after') }],
+  bars('fig-disk-db', [row('Database', d => g(d, 'load.file_bytes_after'))],
     { title: 'Database file', sub: 'after the load, no compaction · lower is better', better: 'lower', fmt: bytes });
-  bars('fig-disk-idx', [{ label: 'View index', erlang: g(E, 'view.index_file_bytes'), rust: g(S, 'view.index_file_bytes') }],
+  bars('fig-disk-idx', [row('View index', d => g(d, 'view.index_file_bytes'))],
     { title: 'View index file', sub: 'after a fresh build · lower is better', better: 'lower', fmt: bytes });
 
   const renderAll = () => RENDERERS.forEach(f => f());
