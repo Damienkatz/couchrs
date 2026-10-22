@@ -337,6 +337,17 @@ pub fn decode_chunk(stored: Vec<u8>) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Serialize metadata (rev trees, doc infos, index rows) without any
+/// compression: it is read on nearly every request, so decompressing it
+/// would cost more than it saves.
+pub fn encode_term_raw<T: Serialize>(term: &T) -> Vec<u8> {
+    let raw = bincode::serialize(term).expect("serialize");
+    let mut out = Vec::with_capacity(raw.len() + 1);
+    out.push(ENC_RAW);
+    out.extend_from_slice(&raw);
+    out
+}
+
 pub fn decode_term<T: DeserializeOwned>(data: &[u8]) -> io::Result<T> {
     let (tag, body) = data.split_first().ok_or_else(|| corrupt("empty term"))?;
     let res = match *tag {

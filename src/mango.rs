@@ -10,7 +10,7 @@ use crate::db::{Db, Snapshot};
 use crate::doc::{DocOpts, from_json};
 use crate::error::{CouchError, Result};
 use crate::http::{Req, json_response, not_allowed, ok_json};
-use crate::views::{self, IdBound};
+use crate::views;
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use base64::Engine;
@@ -939,28 +939,18 @@ fn run_find(req_server: &Req, db: &Arc<Db>, q: &FindQuery) -> Result<Value> {
         let update = if q.update { "true" } else { "false" };
         let (snap2, index, st) = views::prepare(db, dir, &ddoc_id, update)?;
         let vi = index.def.view_index(&idx.name).ok_or_else(|| CouchError::not_found("missing index"))?;
-        let tree = &st.views[vi];
-        let fdir = if args.descending { Dir::Rev } else { Dir::Fwd };
-        let start_id = if args.descending { IdBound::Max } else { IdBound::Min };
-        let end_id = if args.descending { IdBound::Min } else { IdBound::Max };
-        let mut range = Range {
-            start: args.start_key.clone().map(|k| (crate::collate::Json(k), start_id.clone())),
-            end: args.end_key.clone().map(|k| {
-                let id = if args.inclusive_end { end_id.clone() } else if args.descending { IdBound::Max } else { IdBound::Min };
-                (crate::collate::Json(k), id)
-            }),
-            inclusive_end: true,
-        };
+        let mut qargs = args.clone();
         let mut after: Option<(Value, String)> = None;
         if let Some(b) = &bookmark
             && let (Some(k), Some(id)) = (b.get(0), b.get(1).and_then(|i| i.as_str())) {
-                range.start = Some((crate::collate::Json(k.clone()), IdBound::Id(id.to_string())));
+                // Resume at the bookmark row; it is skipped below.
+                qargs.start_key = Some(k.clone());
+                qargs.start_docid = Some(id.to_string());
                 after = Some((k.clone(), id.to_string()));
             }
-        tree.fold(fdir, &range, |(k, id), _| {
-            let IdBound::Id(id) = id else { return Ok(true) };
+        index.fold_rows(&st, vi, &qargs, |k, id, _| {
             if let Some((ak, aid)) = &after
-                && aid == id && cmp_json(ak, &k.0) == Ordering::Equal {
+                && aid == id && cmp_json(ak, k) == Ordering::Equal {
                     return Ok(true);
                 }
             stats.keys += 1;
@@ -975,7 +965,7 @@ fn run_find(req_server: &Req, db: &Arc<Db>, q: &FindQuery) -> Result<Value> {
                     skip -= 1;
                     return Ok(true);
                 }
-                last_key = Some(json!([k.0, id]));
+                last_key = Some(json!([k, id]));
                 docs.push(project(&doc, &q.fields));
             }
             Ok(docs.len() < q.limit)

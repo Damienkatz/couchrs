@@ -45,7 +45,8 @@ impl Server {
     }
 
     pub fn db_path(&self, name: &str) -> PathBuf {
-        self.config.data_dir.join(format!("{name}.couch"))
+        // Each database is a RocksDB directory.
+        self.config.data_dir.join(format!("{name}.rocks"))
     }
 
     pub fn index_dir(&self, name: &str) -> PathBuf {
@@ -103,7 +104,7 @@ impl Server {
         match db {
             Some(db) => db.delete_files(),
             None => {
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_dir_all(&path);
             }
         }
         let _ = std::fs::remove_dir_all(self.index_dir(name));
@@ -127,9 +128,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
         if fname.starts_with('.') {
             continue;
         }
-        if p.is_dir() {
-            walk(root, &p, out);
-        } else if let Some(stem) = fname.strip_suffix(".couch") {
+        if let Some(stem) = fname.strip_suffix(".rocks").filter(|_| p.is_dir()) {
             let rel = p.parent().unwrap().strip_prefix(root).unwrap();
             let name = if rel.as_os_str().is_empty() {
                 stem.to_string()
@@ -139,6 +138,9 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
             if is_valid_db_name(&name) {
                 out.push(name);
             }
+        } else if p.is_dir() {
+            // Database names with '/' live in subdirectories.
+            walk(root, &p, out);
         }
     }
 }

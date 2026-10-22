@@ -1,37 +1,49 @@
-//! A single database file: a port of couch_db + couch_db_updater +
-//! couch_bt_engine.
+//! A single database, stored in RocksDB: the RocksDB-experiment
+//! replacement for couch_db + couch_db_updater + couch_bt_engine.
 //!
-//! Readers take cheap immutable snapshots (the btree roots from the last
-//! committed header). All writes go through one writer thread per database
-//! which drains its queue and commits everything it found in one fsync'd
-//! header write (group commit).
+//! Column families:
+//!   by_id   doc id            -> FdiVal (rev tree)
+//!   by_seq  seq (big-endian)  -> FullDocInfo
+//!   local   _local doc id     -> LocalDoc
+//!   body    body id (BE)      -> DiskBody, LZ4 value encoding
+//!   att     chunk id (BE)     -> attachment chunk, LZ4 chunk encoding (blob files)
+//!   meta    "header"          -> Header (seq, counters, settings)
+//!
+//! Readers take RocksDB snapshots. All writes go through one writer thread
+//! per database, which drains its queue and commits everything it found as
+//! one WriteBatch with a synced WAL (group commit). RocksDB keeps no
+//! reductions, so doc counts and sizes are counters kept in the header.
 
-use crate::btree::{Action, Btree, Dir, NodePtr, Range, Spec};
+use crate::btree::{Dir, Range};
 use crate::doc::*;
 use crate::error::{CouchError, Result};
-use crate::file::{CouchFile, Pos};
+use crate::file::Pos;
 use crate::keytree::{self, Path};
+use crate::rstore::{Store, View, rerr, successor};
 use md5::{Digest, Md5};
 use parking_lot::{Mutex, RwLock};
+use rocksdb::{WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 use tokio::sync::{oneshot, watch};
 
-/// Format 2 stores doc bodies LZ4-compressed (when that helps) and tags
-/// every attachment chunk with its encoding. Format 1 chunks are raw bytes;
-/// such files stay format 1 until compaction rewrites them.
 const DISK_VERSION: u32 = 2;
-const TAGGED_CHUNKS_SINCE: u32 = 2;
 const ATT_CHUNK: usize = 64 * 1024;
 const SEQ_PLACEHOLDER: u64 = u64::MAX;
 
-// ------------------------------------------------------------------ btrees
+const CF_ID: &str = "by_id";
+const CF_SEQ: &str = "by_seq";
+const CF_LOCAL: &str = "local";
+const CF_BODY: &str = "body";
+const CF_ATT: &str = "att";
+const CF_META: &str = "meta";
+const CFS: &[(&str, bool)] = &[(CF_ID, false), (CF_SEQ, false), (CF_LOCAL, false), (CF_BODY, false), (CF_ATT, true), (CF_META, false)];
+const HEADER_KEY: &[u8] = b"header";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FdiVal {
@@ -40,84 +52,10 @@ pub struct FdiVal {
     pub tree: keytree::RevTree<RevVal>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct IdRed {
-    pub doc_count: u64,
-    pub del_count: u64,
-    pub size: u64,
-}
-
-pub struct IdSpec;
-impl Spec for IdSpec {
-    type K = String;
-    type V = FdiVal;
-    type R = IdRed;
-    fn cmp(&self, a: &String, b: &String) -> Ordering {
-        a.as_bytes().cmp(b.as_bytes())
-    }
-    fn reduce(&self, kvs: &[(String, FdiVal)]) -> IdRed {
-        let mut r = IdRed::default();
-        for (id, v) in kvs {
-            if v.deleted {
-                r.del_count += 1;
-            } else {
-                r.doc_count += 1;
-            }
-            let _ = id;
-            r.size += keytree::leafs(&v.tree)
-                .iter()
-                .filter_map(|l| l.val.leaf().map(|lv| lv.size))
-                .sum::<u64>();
-        }
-        r
-    }
-    fn rereduce(&self, reds: &[IdRed]) -> IdRed {
-        let mut r = IdRed::default();
-        for x in reds {
-            r.doc_count += x.doc_count;
-            r.del_count += x.del_count;
-            r.size += x.size;
-        }
-        r
-    }
-}
-
-pub struct SeqSpec;
-impl Spec for SeqSpec {
-    type K = u64;
-    type V = FullDocInfo;
-    type R = u64;
-    fn cmp(&self, a: &u64, b: &u64) -> Ordering {
-        a.cmp(b)
-    }
-    fn reduce(&self, kvs: &[(u64, FullDocInfo)]) -> u64 {
-        kvs.len() as u64
-    }
-    fn rereduce(&self, reds: &[u64]) -> u64 {
-        reds.iter().sum()
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LocalDoc {
     pub rev: u64,
     pub body: Vec<u8>,
-}
-
-pub struct LocalSpec;
-impl Spec for LocalSpec {
-    type K = String;
-    type V = LocalDoc;
-    type R = u64;
-    fn cmp(&self, a: &String, b: &String) -> Ordering {
-        a.as_bytes().cmp(b.as_bytes())
-    }
-    fn reduce(&self, kvs: &[(String, LocalDoc)]) -> u64 {
-        kvs.len() as u64
-    }
-    fn rereduce(&self, reds: &[u64]) -> u64 {
-        reds.iter().sum()
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -126,28 +64,29 @@ pub struct Header {
     pub uuid: String,
     pub update_seq: u64,
     pub purge_seq: u64,
-    pub id_root: Option<NodePtr<IdRed>>,
-    pub seq_root: Option<NodePtr<u64>>,
-    pub local_root: Option<NodePtr<u64>>,
     pub security: Vec<u8>,
     pub revs_limit: u64,
-    pub props: Vec<u8>,
+    /// Live (non-deleted) and deleted document counts.
+    pub doc_count: u64,
+    pub del_count: u64,
+    /// Inflated bytes of live leaf revisions (sizes.external).
+    pub external: u64,
+    /// The same, as stored after LZ4 (body part of sizes.active).
+    pub stored_live: u64,
 }
 
-impl Header {
-    fn prop_u64(&self, key: &str) -> Option<u64> {
-        serde_json::from_slice::<Value>(&self.props).ok()?.get(key)?.as_u64()
-    }
-    fn set_prop_u64(&mut self, key: &str, v: u64) {
-        let mut m: Map<String, Value> = serde_json::from_slice(&self.props).unwrap_or_default();
-        m.insert(key.into(), json!(v));
-        self.props = serde_json::to_vec(&m).unwrap();
-    }
+fn be(n: u64) -> [u8; 8] {
+    n.to_be_bytes()
 }
 
-/// Header property holding the stored (deflated) bytes of all live leaf
-/// revisions: the body part of sizes.active.
-const STORED_LIVE: &str = "stored_live";
+/// Metadata is stored uncompressed; only bodies and attachments use LZ4.
+fn enc<T: Serialize>(v: &T) -> Vec<u8> {
+    crate::file::encode_term_raw(v)
+}
+
+fn dec<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T> {
+    Ok(crate::file::decode_term(b)?)
+}
 
 fn add_signed(base: u64, delta: i128) -> u64 {
     (base as i128 + delta).max(0) as u64
@@ -159,10 +98,7 @@ fn add_signed(base: u64, delta: i128) -> u64 {
 pub struct Snapshot {
     pub name: String,
     pub header: Header,
-    pub file: Arc<CouchFile>,
-    pub ids: Btree<IdSpec>,
-    pub seqs: Btree<SeqSpec>,
-    pub locals: Btree<LocalSpec>,
+    view: Arc<View>,
 }
 
 pub fn fmt_seq(seq: u64, uuid: &str) -> String {
@@ -182,6 +118,10 @@ pub fn parse_seq(v: &Value) -> Option<u64> {
     }
 }
 
+fn fdi_from(id: &str, v: FdiVal) -> FullDocInfo {
+    FullDocInfo { id: id.to_string(), update_seq: v.update_seq, deleted: v.deleted, tree: v.tree }
+}
+
 impl Snapshot {
     pub fn seq_str(&self, seq: u64) -> String {
         fmt_seq(seq, &self.header.uuid)
@@ -192,7 +132,7 @@ impl Snapshot {
     }
 
     pub fn doc_count(&self) -> u64 {
-        self.ids.full_reduce().map(|r| r.doc_count).unwrap_or(0)
+        self.header.doc_count
     }
 
     pub fn security(&self) -> Value {
@@ -200,41 +140,37 @@ impl Snapshot {
     }
 
     pub fn get_fdi(&self, id: &str) -> Result<Option<FullDocInfo>> {
-        Ok(self.ids.lookup(&id.to_string())?.map(|v| FullDocInfo {
-            id: id.to_string(),
-            update_seq: v.update_seq,
-            deleted: v.deleted,
-            tree: v.tree,
-        }))
+        match self.view.get(CF_ID, id.as_bytes())? {
+            Some(b) => Ok(Some(fdi_from(id, dec(&b)?))),
+            None => Ok(None),
+        }
     }
 
     pub fn get_local(&self, id: &str) -> Result<Option<LocalDoc>> {
-        Ok(self.locals.lookup(&id.to_string())?)
+        match self.view.get(CF_LOCAL, id.as_bytes())? {
+            Some(b) => Ok(Some(dec(&b)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn read_body(&self, ptr: Pos) -> Result<DiskBody> {
-        let raw = self.file.read_raw(ptr)?;
-        if crate::file::is_current_value(&raw) {
-            Ok(crate::file::decode_value(&raw)?)
-        } else {
-            Ok(crate::file::decode_term::<DiskBodyV1>(&raw)?.into())
-        }
+        let raw = self.view.get(CF_BODY, &be(ptr))?.ok_or_else(|| CouchError::internal(format!("missing body {ptr}")))?;
+        Ok(crate::file::decode_value(&raw)?)
     }
 
     /// Stored (deflated) bytes of every live leaf revision.
     pub fn stored_live(&self) -> u64 {
-        self.header.prop_u64(STORED_LIVE).unwrap_or(0)
+        self.header.stored_live
     }
 
-    /// True if this file tags (and may LZ4-compress) attachment chunks.
     pub fn tagged_chunks(&self) -> bool {
-        self.header.version >= TAGGED_CHUNKS_SINCE
+        true
     }
 
     /// Read one attachment chunk, inflated.
     pub fn read_chunk(&self, pos: Pos) -> Result<Vec<u8>> {
-        let stored = self.file.read_raw(pos)?;
-        Ok(if self.tagged_chunks() { crate::file::decode_chunk(stored)? } else { stored })
+        let stored = self.view.get(CF_ATT, &be(pos))?.ok_or_else(|| CouchError::internal(format!("missing chunk {pos}")))?;
+        Ok(crate::file::decode_chunk(stored)?)
     }
 
     pub fn read_att(&self, a: &AttInfo) -> Result<Vec<u8>> {
@@ -245,21 +181,21 @@ impl Snapshot {
         Ok(out)
     }
 
-    /// `sizes.external` counts inflated (uncompressed) body and attachment
-    /// bytes. `sizes.active`, which compaction is judged by, counts what is
-    /// live as stored on disk: deflated bodies and attachments plus index
-    /// nodes. `sizes.file` is the file's length.
+    /// `sizes.external` counts inflated body and attachment bytes.
+    /// `sizes.active` counts live data as stored: deflated bodies and
+    /// attachments plus RocksDB's estimate of live index data. `sizes.file`
+    /// is every file in the database's RocksDB directory.
     pub fn info(&self, compacting: bool) -> Value {
-        let red = self.ids.full_reduce().unwrap_or_default();
-        let active = self.stored_live() + self.ids.size() + self.seqs.size() + self.locals.size();
+        let store = self.view.store();
+        let meta: u64 = [CF_ID, CF_SEQ, CF_LOCAL].iter().map(|cf| store.prop(cf, "rocksdb.estimate-live-data-size")).sum();
         json!({
             "db_name": self.name,
             "purge_seq": self.seq_str(self.header.purge_seq),
             "update_seq": self.seq_str(self.header.update_seq),
-            "sizes": {"file": self.file.eof(), "external": red.size, "active": active},
+            "sizes": {"file": store.disk_bytes(), "external": self.header.external, "active": self.header.stored_live + meta},
             "props": {},
-            "doc_del_count": red.del_count,
-            "doc_count": red.doc_count,
+            "doc_del_count": self.header.del_count,
+            "doc_count": self.header.doc_count,
             "disk_format_version": 8,
             "compact_running": compacting,
             "cluster": {"q": 1, "n": 1, "w": 1, "r": 1},
@@ -269,13 +205,7 @@ impl Snapshot {
 
     /// Find a revision in the doc's tree; None if absent or body missing.
     pub fn find_rev(fdi: &FullDocInfo, pos: u64, id: &str) -> Option<RevInfo> {
-        keytree::get(&fdi.tree, pos, id).map(|(val, path)| RevInfo {
-            pos,
-            id: id.to_string(),
-            deleted: val.deleted(),
-            val,
-            path,
-        })
+        keytree::get(&fdi.tree, pos, id).map(|(val, path)| RevInfo { pos, id: id.to_string(), deleted: val.deleted(), val, path })
     }
 
     /// Load a revision as a Doc (body + attachment refs).
@@ -289,8 +219,8 @@ impl Snapshot {
             deleted: leaf.deleted,
             body: map,
             atts: body.atts.iter().map(Att::from_info).collect(),
-            // Stored chunk pointers are only valid in this file.
-            att_gen: if body.atts.is_empty() { 0 } else { self.file.generation },
+            // Chunks never move in RocksDB, so there is no file generation.
+            att_gen: 0,
         })
     }
 
@@ -378,62 +308,75 @@ impl Snapshot {
         self.doc_json(fdi, &fdi.winner(), opts)
     }
 
+    /// RocksDB [lower, upper) bounds for a string-keyed range. Btree ranges
+    /// start where iteration starts, so reverse ranges swap ends.
+    fn str_bounds(range: &Range<String>, dir: Dir) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let start = range.start.as_ref().map(|s| s.as_bytes().to_vec());
+        let end = range.end.as_ref().map(|e| e.as_bytes().to_vec());
+        match dir {
+            Dir::Fwd => (start, end.map(|e| if range.inclusive_end { successor(&e) } else { e })),
+            Dir::Rev => (end.map(|e| if range.inclusive_end { e } else { successor(&e) }), start.map(|s| successor(&s))),
+        }
+    }
+
     pub fn fold_docs<F>(&self, dir: Dir, range: &Range<String>, mut f: F) -> Result<()>
     where
         F: FnMut(FullDocInfo) -> Result<bool>,
     {
-        let mut err = None;
-        self.ids.fold(dir, range, |k, v| {
-            let fdi = FullDocInfo {
-                id: k.clone(),
-                update_seq: v.update_seq,
-                deleted: v.deleted,
-                tree: v.tree.clone(),
-            };
-            match f(fdi) {
-                Ok(c) => Ok(c),
-                Err(e) => {
-                    err = Some(e);
-                    Ok(false)
-                }
-            }
-        })?;
-        err.map_or(Ok(()), Err)
+        let (lo, hi) = Self::str_bounds(range, dir);
+        self.view.scan(CF_ID, lo.as_deref(), hi.as_deref(), dir == Dir::Rev, |k, v| {
+            let id = std::str::from_utf8(k).map_err(|_| CouchError::internal("bad doc id"))?;
+            f(fdi_from(id, dec(v)?))
+        })
     }
 
     pub fn fold_changes<F>(&self, since: u64, dir: Dir, mut f: F) -> Result<()>
     where
         F: FnMut(&FullDocInfo) -> Result<bool>,
     {
-        let range = match dir {
-            Dir::Fwd => Range {
-                start: Some(since + 1),
-                end: None,
-                inclusive_end: true,
-            },
-            Dir::Rev => Range {
-                start: if since == 0 { None } else { Some(since) },
-                end: None,
-                inclusive_end: true,
-            },
+        let (lo, hi) = match dir {
+            Dir::Fwd => (Some(be(since + 1).to_vec()), None),
+            Dir::Rev => (None, if since == 0 { None } else { Some(be(since + 1).to_vec()) }),
         };
-        let mut err = None;
-        self.seqs.fold(dir, &range, |_, v| match f(v) {
-            Ok(c) => Ok(c),
-            Err(e) => {
-                err = Some(e);
-                Ok(false)
-            }
-        })?;
-        err.map_or(Ok(()), Err)
+        self.view.scan(CF_SEQ, lo.as_deref(), hi.as_deref(), dir == Dir::Rev, |_, v| f(&dec::<FullDocInfo>(v)?))
     }
 
     pub fn fold_locals<F>(&self, range: &Range<String>, dir: Dir, mut f: F) -> Result<()>
     where
         F: FnMut(&str, &LocalDoc) -> bool,
     {
-        self.locals.fold(dir, range, |k, v| Ok(f(k, v)))?;
-        Ok(())
+        let (lo, hi) = Self::str_bounds(range, dir);
+        self.view.scan(CF_LOCAL, lo.as_deref(), hi.as_deref(), dir == Dir::Rev, |k, v| {
+            let id = String::from_utf8_lossy(k);
+            Ok(f(&id, &dec::<LocalDoc>(v)?))
+        })
+    }
+
+    /// Live docs sorting before `key` in `dir` order (_all_docs offset).
+    /// RocksDB has no order statistics, so this counts by scanning.
+    pub fn count_docs_before(&self, key: &str, dir: Dir) -> Result<u64> {
+        let mut n = 0u64;
+        let (lo, hi) = match dir {
+            Dir::Fwd => (None, Some(key.as_bytes().to_vec())),
+            Dir::Rev => (Some(successor(key.as_bytes())), None),
+        };
+        self.view.scan(CF_ID, lo.as_deref(), hi.as_deref(), false, |_, v| {
+            if !dec::<FdiVal>(v)?.deleted {
+                n += 1;
+            }
+            Ok(true)
+        })?;
+        Ok(n)
+    }
+
+    /// Changes after `seq` (the `pending` count of _changes), by scanning.
+    pub fn pending_after(&self, seq: u64) -> u64 {
+        let mut n = 0u64;
+        let _ = self.view.scan(CF_SEQ, Some(&be(seq + 1)), None, false, |_, _| {
+            n += 1;
+            Ok(true)
+        });
+        n
     }
 }
 
@@ -442,82 +385,88 @@ impl Snapshot {
 pub type UpdateResult = Result<String>;
 
 enum Msg {
-    Update {
-        docs: Vec<Doc>,
-        new_edits: bool,
-        reply: oneshot::Sender<Vec<UpdateResult>>,
-    },
+    Update { docs: Vec<Doc>, new_edits: bool, reply: oneshot::Sender<Vec<UpdateResult>> },
     SetSecurity(Vec<u8>, oneshot::Sender<()>),
     SetRevsLimit(u64, oneshot::Sender<()>),
     Purge(Vec<(String, Vec<(u64, String)>)>, oneshot::Sender<Result<Value>>),
-    CompactDone(Box<Snapshot>, PathBuf, oneshot::Sender<Result<()>>),
+    /// Compaction: forget bodies of non-leaf revisions (ptr < limit) for
+    /// these docs and any doc changed after `since`.
+    DropOldBodies { ids: Vec<String>, since: u64, limit: u64, reply: oneshot::Sender<Result<()>> },
 }
 
 pub struct Db {
     pub name: String,
     pub path: PathBuf,
+    store: Arc<Store>,
     state: RwLock<Snapshot>,
     tx: Mutex<mpsc::Sender<Msg>>,
     seq_tx: watch::Sender<u64>,
     compacting: AtomicBool,
+    /// Next id for a body or attachment chunk.
+    next_ptr: AtomicU64,
     /// Per-database extension state (view indexes), keyed by signature.
     pub ext: Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
+/// Highest big-endian id in a column family, plus one.
+fn next_id_after(view: &View, cf: &str) -> Result<u64> {
+    let mut next = 1u64;
+    view.scan(cf, None, None, true, |k, _| {
+        if k.len() == 8 {
+            next = u64::from_be_bytes(k.try_into().unwrap()) + 1;
+        }
+        Ok(false)
+    })?;
+    Ok(next)
+}
+
 impl Db {
     pub fn open(path: &FsPath, name: &str, create: bool) -> Result<Arc<Db>> {
-        if create
-            && let Some(dir) = path.parent() {
+        if create {
+            if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-        let file = Arc::new(CouchFile::open(path, create)?);
-        let header: Header = match file.read_header()? {
-            Some(h) => h,
+        } else if !path.exists() {
+            return Err(CouchError::not_found("Database does not exist."));
+        }
+        let store = Store::open(path, CFS, create)?;
+        let header: Header = match store.db.get_cf(&store.cf(CF_META), HEADER_KEY).map_err(rerr)? {
+            Some(b) => dec(&b)?,
             None => {
                 let h = Header {
                     version: DISK_VERSION,
                     uuid: uuid::Uuid::new_v4().simple().to_string(),
                     update_seq: 0,
                     purge_seq: 0,
-                    id_root: None,
-                    seq_root: None,
-                    local_root: None,
                     security: b"{}".to_vec(),
                     revs_limit: 1000,
-                    props: b"{}".to_vec(),
+                    doc_count: 0,
+                    del_count: 0,
+                    external: 0,
+                    stored_live: 0,
                 };
-                file.write_header(&h)?;
-                file.sync()?;
+                let mut wo = WriteOptions::default();
+                wo.set_sync(true);
+                store.db.put_cf_opt(&store.cf(CF_META), HEADER_KEY, enc(&h), &wo).map_err(rerr)?;
                 h
             }
         };
-        let mut snap = Snapshot {
-            name: name.to_string(),
-            ids: Btree::new(file.clone(), header.id_root.clone(), Arc::new(IdSpec)),
-            seqs: Btree::new(file.clone(), header.seq_root.clone(), Arc::new(SeqSpec)),
-            locals: Btree::new(file.clone(), header.local_root.clone(), Arc::new(LocalSpec)),
-            file,
-            header,
-        };
-        if snap.header.prop_u64(STORED_LIVE).is_none() {
-            // Older file: total the stored size of live leaves once; it is
-            // persisted with the next commit and maintained from then on.
-            let mut total = 0u64;
-            snap.fold_docs(Dir::Fwd, &Range::default(), |fdi| {
-                total += fdi.leaf_stored();
-                Ok(true)
-            })?;
-            snap.header.set_prop_u64(STORED_LIVE, total);
-        }
+        let view = View::new(store.clone());
+        // Chunk ids are allocated before their doc commits; reusing one an
+        // uncommitted upload took is harmless (it was never referenced).
+        let next_ptr = next_id_after(&view, CF_BODY)?.max(next_id_after(&view, CF_ATT)?);
+        let snap = Snapshot { name: name.to_string(), header, view };
         let (tx, rx) = mpsc::channel();
         let (seq_tx, _) = watch::channel(snap.header.update_seq);
         let db = Arc::new(Db {
             name: name.to_string(),
             path: path.to_path_buf(),
+            store,
             state: RwLock::new(snap),
             tx: Mutex::new(tx),
             seq_tx,
             compacting: AtomicBool::new(false),
+            next_ptr: AtomicU64::new(next_ptr),
             ext: Mutex::new(HashMap::new()),
         });
         let weak = Arc::downgrade(&db);
@@ -541,19 +490,12 @@ impl Db {
     }
 
     fn send(&self, m: Msg) -> Result<()> {
-        self.tx
-            .lock()
-            .send(m)
-            .map_err(|_| CouchError::internal("database writer stopped"))
+        self.tx.lock().send(m).map_err(|_| CouchError::internal("database writer stopped"))
     }
 
     pub async fn update_docs(&self, docs: Vec<Doc>, new_edits: bool) -> Result<Vec<UpdateResult>> {
         let (reply, rx) = oneshot::channel();
-        self.send(Msg::Update {
-            docs,
-            new_edits,
-            reply,
-        })?;
+        self.send(Msg::Update { docs, new_edits, reply })?;
         rx.await.map_err(|_| CouchError::internal("update failed"))
     }
 
@@ -579,19 +521,18 @@ impl Db {
         rx.await.map_err(|_| CouchError::internal("purge failed"))?
     }
 
-    /// Write a doc's new attachment bytes to the file before it reaches the
-    /// writer thread (CouchDB streams attachments the same way), so large
-    /// uploads don't stall every other write. The writer rejects the doc if
-    /// compaction swapped the file in between.
+    fn alloc_ptrs(&self, n: u64) -> u64 {
+        self.next_ptr.fetch_add(n, AtomicOrdering::Relaxed)
+    }
+
+    /// Write a doc's new attachment bytes before it reaches the writer
+    /// thread, so large uploads don't stall every other write. They become
+    /// durable with the doc's own synced commit, which follows them in the
+    /// WAL.
     pub fn stage_atts(&self, doc: &mut Doc) -> Result<()> {
-        if !doc.atts.iter().any(|a| matches!(a.data, AttData::Bytes(_))) {
-            return Ok(());
-        }
-        let snap = self.snapshot();
-        let file = snap.file.clone();
         for a in doc.atts.iter_mut() {
             if let AttData::Bytes(bytes) = &a.data {
-                let (chunks, stored) = write_att_chunks(&file, bytes, snap.tagged_chunks())?;
+                let (chunks, stored) = write_att_chunks(self, bytes)?;
                 a.stored_length = stored;
                 if a.md5.is_empty() || a.encoding.is_none() {
                     a.md5 = Md5::digest(bytes).to_vec();
@@ -603,7 +544,6 @@ impl Db {
                 a.data = AttData::Stored(chunks);
             }
         }
-        doc.att_gen = file.generation;
         Ok(())
     }
 
@@ -618,8 +558,7 @@ impl Db {
         }
         let db = self.clone();
         std::thread::spawn(move || {
-            let r = db.compact_blocking();
-            if let Err(e) = r {
+            if let Err(e) = db.compact_blocking() {
                 tracing::error!("compaction of {} failed: {}", db.name, e.reason);
             }
             db.compacting.store(false, AtomicOrdering::SeqCst);
@@ -627,158 +566,97 @@ impl Db {
         Ok(())
     }
 
+    /// Compaction for the RocksDB engine:
+    /// 1. mark every body and chunk referenced by a live leaf revision,
+    /// 2. have the writer drop non-leaf revision bodies from rev trees,
+    /// 3. delete unreferenced bodies and chunks allocated before the mark,
+    /// 4. compact every column family so RocksDB reclaims the space,
+    ///    including garbage collection of blob files.
     fn compact_blocking(&self) -> Result<()> {
         let snap = self.snapshot();
-        let tmp = self.path.with_extension("couch.compact");
-        let _ = std::fs::remove_file(&tmp);
-        let file = Arc::new(CouchFile::open(&tmp, true)?);
-        let mut header = snap.header.clone();
-        header.version = DISK_VERSION;
-        header.id_root = None;
-        header.seq_root = None;
-        header.local_root = None;
-        let mut new = Snapshot {
-            name: snap.name.clone(),
-            ids: Btree::new(file.clone(), None, Arc::new(IdSpec)),
-            seqs: Btree::new(file.clone(), None, Arc::new(SeqSpec)),
-            locals: Btree::new(file.clone(), None, Arc::new(LocalSpec)),
-            file: file.clone(),
-            header,
-        };
-        // Copy bodies in seq order (sequential appends) while building the
-        // indexes without copy-on-write: by-seq keys already arrive sorted
-        // and stream into a bottom-up builder; by-id entries go through an
-        // external sort first. Every index node is written exactly once.
-        let mut seqs = new.seqs.bulk_builder();
-        type IdCmp = Box<dyn Fn(&(String, FdiVal), &(String, FdiVal)) -> Ordering>;
-        let id_cmp: IdCmp = Box::new(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        let mut ids = crate::extsort::Sorter::new(
-            self.path.with_extension("couch.compact.idsort"),
-            crate::extsort::budget_bytes(),
-            id_cmp,
-        );
-        let mut stored_total = 0u64;
-        snap.fold_changes(0, Dir::Fwd, |fdi| {
-            let copied = copy_fdi(&snap, &file, fdi)?;
-            stored_total += copied.leaf_stored();
-            let approx = 64 + copied.id.len() + 48 * keytree::leafs(&copied.tree).len();
-            ids.push(
-                (copied.id.clone(), FdiVal { update_seq: copied.update_seq, deleted: copied.deleted, tree: copied.tree.clone() }),
-                approx,
-            )?;
-            seqs.push(copied.update_seq, copied)?;
+        let limit = self.next_ptr.load(AtomicOrdering::SeqCst);
+        let mut live_bodies: Vec<u64> = Vec::new();
+        let mut live_chunks: Vec<u64> = Vec::new();
+        let mut with_old: Vec<String> = Vec::new();
+        snap.fold_docs(Dir::Fwd, &Range::default(), |fdi| {
+            let mut has_old = false;
+            keytree::map_vals(&fdi.tree, &mut |_, _, v, is_leaf| {
+                if let RevVal::Avail(l) = v {
+                    if is_leaf {
+                        live_bodies.push(l.ptr);
+                    } else {
+                        has_old = true;
+                    }
+                }
+            });
+            for l in keytree::leafs(&fdi.tree) {
+                if let Some(lv) = l.val.leaf() {
+                    for a in snap.read_body(lv.ptr)?.atts {
+                        live_chunks.extend(a.chunks);
+                    }
+                }
+            }
+            if has_old {
+                with_old.push(fdi.id.clone());
+            }
             Ok(true)
         })?;
-        new.seqs = seqs.finish()?;
-        let mut sorted = ids.finish()?;
-        let mut idb = new.ids.bulk_builder();
-        while let Some((k, v)) = sorted.next_item()? {
-            idb.push(k, v)?;
-        }
-        new.ids = idb.finish()?;
-        let mut locals = new.locals.bulk_builder();
-        snap.locals.fold(Dir::Fwd, &Range::default(), |k, v| {
-            locals.push(k.clone(), v.clone())?;
-            Ok(true)
-        })?;
-        new.locals = locals.finish()?;
-        new.header.set_prop_u64(STORED_LIVE, stored_total);
-        commit_header(&mut new)?;
+        live_bodies.sort_unstable();
+        live_chunks.sort_unstable();
+        live_chunks.dedup();
+
         let (reply, rx) = oneshot::channel();
-        self.send(Msg::CompactDone(Box::new(new), tmp, reply))?;
-        rx.blocking_recv().map_err(|_| CouchError::internal("compaction swap failed"))?
+        self.send(Msg::DropOldBodies { ids: with_old, since: snap.update_seq(), limit, reply })?;
+        rx.blocking_recv().map_err(|_| CouchError::internal("compaction failed"))??;
+
+        sweep(&self.store, CF_BODY, &live_bodies, limit)?;
+        sweep(&self.store, CF_ATT, &live_chunks, limit)?;
+
+        let mut co = rocksdb::CompactOptions::default();
+        co.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        for (cf, _) in CFS {
+            self.store.db.compact_range_cf_opt(&self.store.cf(cf), None::<&[u8]>, None::<&[u8]>, &co);
+        }
+        Ok(())
     }
 
     pub fn delete_files(&self) {
-        let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::remove_file(self.path.with_extension("couch.compact"));
-        let _ = std::fs::remove_file(self.path.with_extension("couch.compact.idsort"));
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
-/// Copy docs changed since the bulk copy into a compaction target,
-/// replacing the entries copied earlier.
-/// Returns the change in stored live bytes.
-fn copy_docs(src: &Snapshot, dst: &mut Snapshot, fdis: Vec<FullDocInfo>) -> Result<i128> {
-    let mut delta = 0i128;
-    if fdis.is_empty() {
-        return Ok(0);
-    }
-    let mut id_acts = Vec::new();
-    let mut seq_acts = Vec::new();
-    for fdi in fdis {
-        if let Some(old) = dst.ids.lookup(&fdi.id)? {
-            seq_acts.push(Action::Remove(old.update_seq));
-            let old = FullDocInfo { id: fdi.id.clone(), update_seq: old.update_seq, deleted: old.deleted, tree: old.tree };
-            delta -= old.leaf_stored() as i128;
-        }
-        let new = copy_fdi(src, &dst.file, &fdi)?;
-        delta += new.leaf_stored() as i128;
-        id_acts.push(Action::Insert(
-            new.id.clone(),
-            FdiVal {
-                update_seq: new.update_seq,
-                deleted: new.deleted,
-                tree: new.tree.clone(),
-            },
-        ));
-        seq_acts.push(Action::Insert(new.update_seq, new));
-    }
-    dst.ids = dst.ids.modify(id_acts)?;
-    dst.seqs = dst.seqs.modify(seq_acts)?;
-    Ok(delta)
-}
-
-/// Copy a doc's leaf bodies (and their attachments) into `dst`. Non-leaf
-/// revisions keep their place in the tree but lose their bodies.
-fn copy_fdi(src: &Snapshot, dst: &CouchFile, fdi: &FullDocInfo) -> Result<FullDocInfo> {
-    let mut err = None;
-    let tree = keytree::map_vals(&fdi.tree, &mut |_, _, v, is_leaf| match v {
-        RevVal::Avail(l) if is_leaf => match copy_body(src, dst, l.ptr) {
-            Ok((ptr, stored)) => RevVal::Avail(LeafVal { ptr, stored, ..l.clone() }),
-            Err(e) => {
-                err = Some(e);
-                RevVal::Missing
+/// Delete ids below `limit` that aren't in `live` (sorted), as ranges.
+/// Walks keys only, so blob-file values (attachment chunks) aren't read.
+fn sweep(store: &Store, cf: &str, live: &[u64], limit: u64) -> Result<()> {
+    let handle = store.cf(cf);
+    let mut ro = rocksdb::ReadOptions::default();
+    ro.set_iterate_upper_bound(be(limit).to_vec());
+    let mut it = store.db.raw_iterator_cf_opt(&handle, ro);
+    it.seek_to_first();
+    let mut batch = WriteBatch::default();
+    let mut run: Option<(u64, u64)> = None;
+    while it.valid() {
+        let id = u64::from_be_bytes(it.key().unwrap().try_into().map_err(|_| CouchError::internal("bad id key"))?);
+        if live.binary_search(&id).is_ok() {
+            if let Some((a, b)) = run.take() {
+                batch.delete_range_cf(&handle, be(a), be(b + 1));
             }
-        },
-        _ => RevVal::Missing,
-    });
-    match err {
-        Some(e) => Err(e),
-        None => Ok(FullDocInfo { tree, ..fdi.clone() }),
-    }
-}
-
-/// Compaction always writes format 2: chunks already stored tagged are
-/// copied as is (no recompression); format-1 raw chunks get encoded.
-/// Returns the new body position and its stored size with attachments.
-fn copy_body(src: &Snapshot, dst: &CouchFile, ptr: Pos) -> Result<(Pos, u64)> {
-    let mut body = src.read_body(ptr)?;
-    for a in body.atts.iter_mut() {
-        let mut chunks = Vec::with_capacity(a.chunks.len());
-        let mut stored_len = 0u64;
-        for p in &a.chunks {
-            let stored = src.file.read_raw(*p)?;
-            let out = if src.tagged_chunks() { stored } else { crate::file::encode_chunk(&stored) };
-            stored_len += out.len() as u64;
-            chunks.push(dst.append_raw(&out)?.0);
+        } else {
+            run = Some(match run {
+                Some((a, _)) => (a, id),
+                None => (id, id),
+            });
         }
-        a.chunks = chunks;
-        a.stored_length = stored_len;
+        if batch.len() >= 10_000 {
+            store.db.write(std::mem::take(&mut batch)).map_err(rerr)?;
+        }
+        it.next();
     }
-    let att_stored: u64 = body.atts.iter().map(|a| a.stored_length).sum();
-    let encoded = crate::file::encode_value(&body);
-    let stored = encoded.len() as u64 + att_stored;
-    Ok((dst.append_raw(&encoded)?.0, stored))
-}
-
-fn commit_header(s: &mut Snapshot) -> Result<()> {
-    s.header.id_root = s.ids.root.clone();
-    s.header.seq_root = s.seqs.root.clone();
-    s.header.local_root = s.locals.root.clone();
-    s.file.sync()?;
-    s.file.write_header(&s.header)?;
-    s.file.sync()?;
+    it.status().map_err(rerr)?;
+    if let Some((a, b)) = run.take() {
+        batch.delete_range_cf(&handle, be(a), be(b + 1));
+    }
+    store.db.write(batch).map_err(rerr)?;
     Ok(())
 }
 
@@ -795,11 +673,7 @@ fn writer_loop(weak: Weak<Db>, rx: mpsc::Receiver<Msg>) {
         let mut updates = Vec::new();
         for m in pending {
             match m {
-                Msg::Update {
-                    docs,
-                    new_edits,
-                    reply,
-                } => updates.push((docs, new_edits, reply)),
+                Msg::Update { docs, new_edits, reply } => updates.push((docs, new_edits, reply)),
                 other => {
                     flush_updates(&db, std::mem::take(&mut updates));
                     handle_other(&db, other);
@@ -810,67 +684,75 @@ fn writer_loop(weak: Weak<Db>, rx: mpsc::Receiver<Msg>) {
     }
 }
 
+/// Commit a batch plus the new header atomically and durably, then
+/// publish a new snapshot.
+fn commit(db: &Db, mut batch: WriteBatch, header: Header) -> Result<()> {
+    batch.put_cf(&db.store.cf(CF_META), HEADER_KEY, enc(&header));
+    let mut wo = WriteOptions::default();
+    wo.set_sync(true);
+    db.store.db.write_opt(batch, &wo).map_err(rerr)?;
+    let seq = header.update_seq;
+    *db.state.write() = Snapshot { name: db.name.clone(), header, view: View::new(db.store.clone()) };
+    db.seq_tx.send_replace(seq);
+    Ok(())
+}
+
 fn handle_other(db: &Db, m: Msg) {
-    let mut snap = db.snapshot();
+    let snap = db.snapshot();
     match m {
         Msg::Update { .. } => unreachable!(),
         Msg::SetSecurity(sec, reply) => {
-            snap.header.security = sec;
-            let _ = commit_and_swap(db, snap);
+            let mut h = snap.header.clone();
+            h.security = sec;
+            let _ = commit(db, WriteBatch::default(), h);
             let _ = reply.send(());
         }
         Msg::SetRevsLimit(n, reply) => {
-            snap.header.revs_limit = n;
-            let _ = commit_and_swap(db, snap);
+            let mut h = snap.header.clone();
+            h.revs_limit = n;
+            let _ = commit(db, WriteBatch::default(), h);
             let _ = reply.send(());
         }
         Msg::Purge(req, reply) => {
-            let r = do_purge(db, snap, req);
-            let _ = reply.send(r);
+            let _ = reply.send(do_purge(db, snap, req));
         }
-        Msg::CompactDone(new, tmp, reply) => {
-            let r = finish_compaction(db, snap, *new, &tmp);
-            let _ = reply.send(r);
+        Msg::DropOldBodies { ids, since, limit, reply } => {
+            let _ = reply.send(drop_old_bodies(db, snap, ids, since, limit));
         }
     }
 }
 
-fn finish_compaction(db: &Db, cur: Snapshot, mut new: Snapshot, tmp: &FsPath) -> Result<()> {
-    let compacted = new.header.update_seq;
-    let mut changed = Vec::new();
-    cur.fold_changes(compacted, Dir::Fwd, |fdi| {
-        changed.push(fdi.clone());
+fn drop_old_bodies(db: &Db, snap: Snapshot, mut ids: Vec<String>, since: u64, limit: u64) -> Result<()> {
+    snap.fold_changes(since, Dir::Fwd, |fdi| {
+        ids.push(fdi.id.clone());
         Ok(true)
     })?;
-    let delta = copy_docs(&cur, &mut new, changed)?;
-    let stored = add_signed(new.header.prop_u64(STORED_LIVE).unwrap_or(0), delta);
-    let mut locals = Vec::new();
-    cur.locals.fold(Dir::Fwd, &Range::default(), |k, v| {
-        locals.push(Action::Insert(k.clone(), v.clone()));
-        Ok(true)
-    })?;
-    // Replace local docs wholesale; there are few of them.
-    new.locals = Btree::new(new.file.clone(), None, Arc::new(LocalSpec)).modify(locals)?;
-    new.header = Header {
-        version: DISK_VERSION,
-        id_root: None,
-        seq_root: None,
-        local_root: None,
-        ..cur.header.clone()
-    };
-    new.header.set_prop_u64(STORED_LIVE, stored);
-    commit_header(&mut new)?;
-    std::fs::rename(tmp, &db.path)?;
-    *db.state.write() = new;
-    Ok(())
+    ids.sort();
+    ids.dedup();
+    let mut batch = WriteBatch::default();
+    for id in ids {
+        let Some(fdi) = snap.get_fdi(&id)? else { continue };
+        let mut changed = false;
+        let tree = keytree::map_vals(&fdi.tree, &mut |_, _, v, is_leaf| match v {
+            RevVal::Avail(l) if !is_leaf && l.ptr < limit => {
+                changed = true;
+                RevVal::Missing
+            }
+            other => other.clone(),
+        });
+        if !changed {
+            continue;
+        }
+        let fdi = FullDocInfo { tree, ..fdi };
+        put_fdi(db, &mut batch, &fdi);
+        batch.put_cf(&db.store.cf(CF_SEQ), be(fdi.update_seq), enc(&fdi));
+    }
+    commit(db, batch, snap.header.clone())
 }
 
-fn commit_and_swap(db: &Db, mut snap: Snapshot) -> Result<()> {
-    commit_header(&mut snap)?;
-    let seq = snap.header.update_seq;
-    *db.state.write() = snap;
-    db.seq_tx.send_replace(seq);
-    Ok(())
+fn put_fdi(db: &Db, batch: &mut WriteBatch, fdi: &FullDocInfo) {
+    let v = FdiVal { update_seq: fdi.update_seq, deleted: fdi.deleted, tree: fdi.tree.clone() };
+    batch.put_cf(&db.store.cf(CF_ID), fdi.id.as_bytes(), enc(&v));
 }
 
 type UpdateBatch = Vec<(Vec<Doc>, bool, oneshot::Sender<Vec<UpdateResult>>)>;
@@ -880,9 +762,9 @@ fn flush_updates(db: &Db, batch: UpdateBatch) {
         return;
     }
     let snap = db.snapshot();
-    match apply_updates(&snap, &batch) {
-        Ok((new, results)) => {
-            let ok = commit_and_swap(db, new);
+    match apply_updates(db, &snap, &batch) {
+        Ok((wb, header, results)) => {
+            let ok = commit(db, wb, header);
             for ((_, _, reply), res) in batch.into_iter().zip(results) {
                 let res = match &ok {
                     Ok(()) => res,
@@ -899,11 +781,33 @@ fn flush_updates(db: &Db, batch: UpdateBatch) {
     }
 }
 
-fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<Vec<UpdateResult>>)> {
+/// Header counters change by the difference between a doc's old and new
+/// state; `sign` is -1 to remove a doc's contribution and +1 to add it.
+fn count_doc(h: &mut Header, fdi: Option<&FullDocInfo>, sign: i128) {
+    let Some(f) = fdi else { return };
+    if f.deleted {
+        h.del_count = add_signed(h.del_count, sign);
+    } else {
+        h.doc_count = add_signed(h.doc_count, sign);
+    }
+    h.external = add_signed(h.external, sign * f.leaf_size() as i128);
+    h.stored_live = add_signed(h.stored_live, sign * f.leaf_stored() as i128);
+}
+
+/// Writes collected while applying a group of updates.
+struct Writes<'a> {
+    db: &'a Db,
+    batch: WriteBatch,
+    /// Bodies written earlier in this batch (not yet visible to readers), so
+    /// a second update to the same doc can find its parent's body.
+    pending_bodies: HashMap<u64, DiskBody>,
+}
+
+fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<(WriteBatch, Header, Vec<Vec<UpdateResult>>)> {
+    let mut w = Writes { db, batch: WriteBatch::default(), pending_bodies: HashMap::new() };
     let mut fdis: HashMap<String, Option<FullDocInfo>> = HashMap::new();
+    let mut originals: HashMap<String, Option<FullDocInfo>> = HashMap::new();
     let mut locals: HashMap<String, Option<LocalDoc>> = HashMap::new();
-    let mut original_seq: HashMap<String, Option<u64>> = HashMap::new();
-    let mut original_stored: HashMap<String, u64> = HashMap::new();
     let mut changed: Vec<String> = Vec::new();
     let mut local_changed: Vec<String> = Vec::new();
     let mut results = Vec::with_capacity(batch.len());
@@ -924,21 +828,16 @@ fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<
                 res.push(r);
                 continue;
             }
-            if doc.att_gen != 0 && doc.att_gen != snap.file.generation {
-                res.push(Err(att_file_moved()));
-                continue;
-            }
             if !fdis.contains_key(&doc.id) {
                 let f = snap.get_fdi(&doc.id)?;
-                original_seq.insert(doc.id.clone(), f.as_ref().map(|f| f.update_seq));
-                original_stored.insert(doc.id.clone(), f.as_ref().map(|f| f.leaf_stored()).unwrap_or(0));
+                originals.insert(doc.id.clone(), f.clone());
                 fdis.insert(doc.id.clone(), f);
             }
             let slot = fdis.get_mut(&doc.id).unwrap();
             let r = if *new_edits {
-                update_interactive(snap, slot, doc, revs_limit)
+                update_interactive(&mut w, snap, slot, doc, revs_limit)
             } else {
-                update_replicated(snap, slot, doc, revs_limit)
+                update_replicated(&mut w, snap, slot, doc, revs_limit)
             };
             match r {
                 Ok((rev, did_change)) => {
@@ -953,14 +852,10 @@ fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<
         results.push(res);
     }
 
-    let mut new = snap.clone();
-    let mut seq = snap.header.update_seq;
-    let mut id_acts = Vec::new();
-    let mut seq_acts = Vec::new();
-    let mut stored_delta = 0i128;
+    let mut header = snap.header.clone();
+    let mut seq = header.update_seq;
     for id in changed {
         let mut fdi = fdis.remove(&id).unwrap().unwrap();
-        stored_delta += fdi.leaf_stored() as i128 - original_stored.get(&id).copied().unwrap_or(0) as i128;
         seq += 1;
         fdi.update_seq = seq;
         fdi.tree = keytree::map_vals(&fdi.tree, &mut |_, _, v, _| match v {
@@ -968,33 +863,23 @@ fn apply_updates(snap: &Snapshot, batch: &UpdateBatch) -> Result<(Snapshot, Vec<
             other => other.clone(),
         });
         fdi.deleted = fdi.winner().deleted;
-        if let Some(Some(old)) = original_seq.get(&id) {
-            seq_acts.push(Action::Remove(*old));
+        let old = originals.get(&id).cloned().flatten();
+        if let Some(o) = &old {
+            w.batch.delete_cf(&db.store.cf(CF_SEQ), be(o.update_seq));
         }
-        id_acts.push(Action::Insert(
-            id.clone(),
-            FdiVal {
-                update_seq: seq,
-                deleted: fdi.deleted,
-                tree: fdi.tree.clone(),
-            },
-        ));
-        seq_acts.push(Action::Insert(seq, fdi));
+        count_doc(&mut header, old.as_ref(), -1);
+        count_doc(&mut header, Some(&fdi), 1);
+        put_fdi(db, &mut w.batch, &fdi);
+        w.batch.put_cf(&db.store.cf(CF_SEQ), be(seq), enc(&fdi));
     }
-    let mut local_acts = Vec::new();
     for id in local_changed {
         match locals.remove(&id).unwrap() {
-            Some(l) => local_acts.push(Action::Insert(id, l)),
-            None => local_acts.push(Action::Remove(id)),
+            Some(l) => w.batch.put_cf(&db.store.cf(CF_LOCAL), id.as_bytes(), enc(&l)),
+            None => w.batch.delete_cf(&db.store.cf(CF_LOCAL), id.as_bytes()),
         }
     }
-    new.ids = new.ids.modify(id_acts)?;
-    new.seqs = new.seqs.modify(seq_acts)?;
-    new.locals = new.locals.modify(local_acts)?;
-    new.header.update_seq = seq;
-    let stored = add_signed(snap.stored_live(), stored_delta);
-    new.header.set_prop_u64(STORED_LIVE, stored);
-    Ok((new, results))
+    header.update_seq = seq;
+    Ok((w.batch, header, results))
 }
 
 fn update_local(slot: &mut Option<LocalDoc>, doc: &Doc) -> UpdateResult {
@@ -1014,38 +899,26 @@ fn update_local(slot: &mut Option<LocalDoc>, doc: &Doc) -> UpdateResult {
         return Ok("0-0".into());
     }
     let rev = cur + 1;
-    *slot = Some(LocalDoc {
-        rev,
-        body: serde_json::to_vec(&doc.body)?,
-    });
+    *slot = Some(LocalDoc { rev, body: serde_json::to_vec(&doc.body)? });
     Ok(format!("0-{rev}"))
 }
 
 fn missing_stub(doc: &Doc, name: &str) -> CouchError {
-    CouchError::precondition(
-        "missing_stub",
-        format!("Invalid attachment stub in {} for {}", doc.id, name),
-    )
+    CouchError::precondition("missing_stub", format!("Invalid attachment stub in {} for {}", doc.id, name))
 }
 
 /// Resolve stubs and write new attachment data, returning stored infos.
-fn prepare_atts(
-    snap: &Snapshot,
-    doc: &Doc,
-    prev: Option<&DiskBody>,
-    new_pos: u64,
-) -> Result<Vec<AttInfo>> {
+fn prepare_atts(w: &Writes, doc: &Doc, prev: Option<&DiskBody>, new_pos: u64) -> Result<Vec<AttInfo>> {
     let mut out = Vec::with_capacity(doc.atts.len());
     for a in &doc.atts {
         let info = match &a.data {
             AttData::Stub => {
-                let p = prev
-                    .and_then(|b| b.atts.iter().find(|x| x.name == a.name))
-                    .ok_or_else(|| missing_stub(doc, &a.name))?;
-                if let Some(rp) = a.revpos
-                    && rp != p.revpos && rp > new_pos {
+                let p = prev.and_then(|b| b.atts.iter().find(|x| x.name == a.name)).ok_or_else(|| missing_stub(doc, &a.name))?;
+                if let Some(rp) = a.revpos {
+                    if rp != p.revpos && rp > new_pos {
                         return Err(missing_stub(doc, &a.name));
                     }
+                }
                 p.clone()
             }
             AttData::Stored(chunks) => AttInfo {
@@ -1060,12 +933,8 @@ fn prepare_atts(
                 stored_length: a.stored_length,
             },
             AttData::Bytes(bytes) => {
-                let (chunks, stored_length) = write_att_chunks(&snap.file, bytes, snap.tagged_chunks())?;
-                let md5 = if a.md5.is_empty() || a.encoding.is_none() {
-                    Md5::digest(bytes).to_vec()
-                } else {
-                    a.md5.clone()
-                };
+                let (chunks, stored_length) = write_att_chunks(w.db, bytes)?;
+                let md5 = if a.md5.is_empty() || a.encoding.is_none() { Md5::digest(bytes).to_vec() } else { a.md5.clone() };
                 AttInfo {
                     name: a.name.clone(),
                     content_type: a.content_type.clone(),
@@ -1079,10 +948,7 @@ fn prepare_atts(
                 }
             }
             AttData::Follows => {
-                return Err(CouchError::bad_request(format!(
-                    "attachment {} data was not supplied",
-                    a.name
-                )));
+                return Err(CouchError::bad_request(format!("attachment {} data was not supplied", a.name)));
             }
         };
         out.push(info);
@@ -1090,63 +956,55 @@ fn prepare_atts(
     Ok(out)
 }
 
-/// Append attachment data as 64 KiB chunks, 16 MiB per write. In tagged
-/// (format 2) files each chunk is LZ4-compressed when that shrinks it.
-/// Returns the chunk positions and the bytes they occupy as stored.
-fn write_att_chunks(file: &CouchFile, bytes: &[u8], tagged: bool) -> Result<(Vec<Pos>, u64)> {
-    let mut chunks = Vec::with_capacity(bytes.len() / ATT_CHUNK + 1);
-    let mut stored = 0u64;
+/// Write attachment data as LZ4-encoded 64 KiB chunks under fresh ids.
+/// Returns the chunk ids and the bytes they occupy as stored.
+fn write_att_chunks(db: &Db, bytes: &[u8]) -> Result<(Vec<Pos>, u64)> {
     let pieces: Vec<&[u8]> = bytes.chunks(ATT_CHUNK).collect();
-    for group in pieces.chunks(256) {
-        let written = if tagged {
-            let encoded: Vec<Vec<u8>> = group.iter().map(|c| crate::file::encode_chunk(c)).collect();
-            stored += encoded.iter().map(|e| e.len() as u64).sum::<u64>();
-            file.append_raw_many(&encoded)?
-        } else {
-            stored += group.iter().map(|c| c.len() as u64).sum::<u64>();
-            file.append_raw_many(group)?
-        };
-        chunks.extend(written.into_iter().map(|(p, _)| p));
+    let first = db.alloc_ptrs(pieces.len() as u64);
+    let cf = db.store.cf(CF_ATT);
+    let mut stored = 0u64;
+    let mut chunks = Vec::with_capacity(pieces.len());
+    for (gi, group) in pieces.chunks(256).enumerate() {
+        let mut batch = WriteBatch::default();
+        for (i, c) in group.iter().enumerate() {
+            let id = first + (gi * 256 + i) as u64;
+            let e = crate::file::encode_chunk(c);
+            stored += e.len() as u64;
+            batch.put_cf(&cf, be(id), e);
+            chunks.push(id);
+        }
+        db.store.db.write(batch).map_err(rerr)?;
     }
     Ok((chunks, stored))
 }
 
-fn att_file_moved() -> CouchError {
-    CouchError::new(
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "att_file_moved",
-        "database file changed while attachments were being written; retry",
-    )
-}
-
-fn write_rev(snap: &Snapshot, doc: &Doc, atts: Vec<AttInfo>, body_json: Vec<u8>) -> Result<LeafVal> {
+fn write_rev(w: &mut Writes, doc: &Doc, atts: Vec<AttInfo>, body_json: Vec<u8>) -> Result<LeafVal> {
     let size = body_json.len() as u64 + atts.iter().map(|a| a.encoded_length).sum::<u64>();
     let att_stored: u64 = atts.iter().map(|a| a.stored_length).sum();
-    let encoded = crate::file::encode_value(&DiskBody { json: body_json, atts });
+    let body = DiskBody { json: body_json, atts };
+    let encoded = crate::file::encode_value(&body);
     let stored = encoded.len() as u64 + att_stored;
-    let (ptr, _) = snap.file.append_raw(&encoded)?;
-    Ok(LeafVal {
-        deleted: doc.deleted,
-        ptr,
-        seq: SEQ_PLACEHOLDER,
-        size,
-        stored,
-    })
+    let ptr = w.db.alloc_ptrs(1);
+    w.batch.put_cf(&w.db.store.cf(CF_BODY), be(ptr), encoded);
+    w.pending_bodies.insert(ptr, body);
+    Ok(LeafVal { deleted: doc.deleted, ptr, seq: SEQ_PLACEHOLDER, size, stored })
 }
 
-fn update_interactive(
-    snap: &Snapshot,
-    slot: &mut Option<FullDocInfo>,
-    doc: &Doc,
-    revs_limit: u64,
-) -> Result<(String, bool)> {
+fn read_prev_body(w: &Writes, snap: &Snapshot, ptr: Pos) -> Result<DiskBody> {
+    match w.pending_bodies.get(&ptr) {
+        Some(b) => Ok(b.clone()),
+        None => snap.read_body(ptr),
+    }
+}
+
+fn update_interactive(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDocInfo>, doc: &Doc, revs_limit: u64) -> Result<(String, bool)> {
     let parent: Option<RevInfo> = match (slot.as_ref(), doc.revs.1.first()) {
         (None, None) => None,
         (None, Some(_)) => return Err(CouchError::conflict()),
         (Some(f), None) => {
-            let w = f.winner();
-            if w.deleted {
-                Some(w)
+            let wn = f.winner();
+            if wn.deleted {
+                Some(wn)
             } else {
                 return Err(CouchError::conflict());
             }
@@ -1160,71 +1018,50 @@ fn update_interactive(
         }
     };
     let prev_body = match parent.as_ref().and_then(|p| p.val.leaf()) {
-        Some(l) => Some(snap.read_body(l.ptr)?),
+        Some(l) => Some(read_prev_body(w, snap, l.ptr)?),
         None => None,
     };
     let new_pos = parent.as_ref().map(|p| p.pos + 1).unwrap_or(1);
-    let atts = prepare_atts(snap, doc, prev_body.as_ref(), new_pos)?;
+    let atts = prepare_atts(w, doc, prev_body.as_ref(), new_pos)?;
     let body_json = serde_json::to_vec(&doc.body)?;
     let mut hash_doc = doc.clone();
     hash_doc.atts = atts.iter().map(Att::from_info).collect();
     let new_id = new_rev_id(&hash_doc, parent.as_ref().map(|p| (p.pos, p.id.as_str())), &body_json);
-    let leaf = write_rev(snap, doc, atts, body_json)?;
+    let leaf = write_rev(w, doc, atts, body_json)?;
     let path = match &parent {
-        Some(p) => Path {
-            start: p.pos,
-            revs: vec![(p.id.clone(), RevVal::Missing), (new_id.clone(), RevVal::Avail(leaf))],
-        },
-        None => Path {
-            start: 1,
-            revs: vec![(new_id.clone(), RevVal::Avail(leaf))],
-        },
+        Some(p) => Path { start: p.pos, revs: vec![(p.id.clone(), RevVal::Missing), (new_id.clone(), RevVal::Avail(leaf))] },
+        None => Path { start: 1, revs: vec![(new_id.clone(), RevVal::Avail(leaf))] },
     };
-    let fdi = slot.get_or_insert_with(|| FullDocInfo {
-        id: doc.id.clone(),
-        update_seq: 0,
-        deleted: false,
-        tree: Vec::new(),
-    });
+    let fdi = slot.get_or_insert_with(|| FullDocInfo { id: doc.id.clone(), update_seq: 0, deleted: false, tree: Vec::new() });
     keytree::merge(&mut fdi.tree, path, revs_limit);
     Ok((format!("{new_pos}-{new_id}"), true))
 }
 
-fn update_replicated(
-    snap: &Snapshot,
-    slot: &mut Option<FullDocInfo>,
-    doc: &Doc,
-    revs_limit: u64,
-) -> Result<(String, bool)> {
+fn update_replicated(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDocInfo>, doc: &Doc, revs_limit: u64) -> Result<(String, bool)> {
     let (pos, ids) = (&doc.revs.0, &doc.revs.1);
     if ids.is_empty() {
         return Err(CouchError::bad_request("Document rev and _revisions are required with new_edits=false"));
     }
     let rev_str = format!("{}-{}", pos, ids[0]);
-    if let Some(f) = slot.as_ref()
-        && let Some((RevVal::Avail(_), _)) = keytree::get(&f.tree, *pos, &ids[0]) {
+    if let Some(f) = slot.as_ref() {
+        if let Some((RevVal::Avail(_), _)) = keytree::get(&f.tree, *pos, &ids[0]) {
             return Ok((rev_str, false));
         }
+    }
     // Stubs refer to the nearest ancestor we have a body for.
     let mut prev_body = None;
     if let Some(f) = slot.as_ref() {
         for (i, id) in ids.iter().enumerate().skip(1) {
             if let Some((RevVal::Avail(l), _)) = keytree::get(&f.tree, pos - i as u64, id) {
-                prev_body = Some(snap.read_body(l.ptr)?);
+                prev_body = Some(read_prev_body(w, snap, l.ptr)?);
                 break;
             }
         }
         if prev_body.is_none() && doc.atts.iter().any(|a| matches!(a.data, AttData::Stub)) {
-            // Fall back to any leaf holding the stubbed attachments.
             for l in f.sorted_leafs() {
                 if let Some(lv) = l.val.leaf() {
-                    let b = snap.read_body(lv.ptr)?;
-                    if doc
-                        .atts
-                        .iter()
-                        .filter(|a| matches!(a.data, AttData::Stub))
-                        .all(|a| b.atts.iter().any(|x| x.name == a.name))
-                    {
+                    let b = read_prev_body(w, snap, lv.ptr)?;
+                    if doc.atts.iter().filter(|a| matches!(a.data, AttData::Stub)).all(|a| b.atts.iter().any(|x| x.name == a.name)) {
                         prev_body = Some(b);
                         break;
                     }
@@ -1232,81 +1069,54 @@ fn update_replicated(
             }
         }
     }
-    let atts = prepare_atts(snap, doc, prev_body.as_ref(), *pos)?;
+    let atts = prepare_atts(w, doc, prev_body.as_ref(), *pos)?;
     let body_json = serde_json::to_vec(&doc.body)?;
-    let leaf = write_rev(snap, doc, atts, body_json)?;
+    let leaf = write_rev(w, doc, atts, body_json)?;
     let n = ids.len();
     let start = pos + 1 - n as u64;
     let revs: Vec<(String, RevVal)> = ids
         .iter()
         .rev()
         .enumerate()
-        .map(|(i, id)| {
-            let v = if i == n - 1 {
-                RevVal::Avail(leaf.clone())
-            } else {
-                RevVal::Missing
-            };
-            (id.clone(), v)
-        })
+        .map(|(i, id)| (id.clone(), if i == n - 1 { RevVal::Avail(leaf.clone()) } else { RevVal::Missing }))
         .collect();
-    let fdi = slot.get_or_insert_with(|| FullDocInfo {
-        id: doc.id.clone(),
-        update_seq: 0,
-        deleted: false,
-        tree: Vec::new(),
-    });
+    let fdi = slot.get_or_insert_with(|| FullDocInfo { id: doc.id.clone(), update_seq: 0, deleted: false, tree: Vec::new() });
     keytree::merge(&mut fdi.tree, Path { start, revs }, revs_limit);
     Ok((rev_str, true))
 }
 
 fn do_purge(db: &Db, snap: Snapshot, req: Vec<(String, Vec<(u64, String)>)>) -> Result<Value> {
     let mut purged = Map::new();
-    let mut stored_delta = 0i128;
-    let mut new = snap.clone();
-    let mut seq = snap.header.update_seq;
-    let mut id_acts = Vec::new();
-    let mut seq_acts = Vec::new();
+    let mut header = snap.header.clone();
+    let mut seq = header.update_seq;
+    let mut batch = WriteBatch::default();
     for (id, revs) in req {
         let Some(mut fdi) = snap.get_fdi(&id)? else {
             purged.insert(id, json!([]));
             continue;
         };
-        let before = fdi.leaf_stored();
+        let before = fdi.clone();
         let removed = keytree::remove_leafs(&mut fdi.tree, &revs);
-        stored_delta += fdi.leaf_stored() as i128 - before as i128;
-        purged.insert(
-            id.clone(),
-            json!(removed.iter().map(|(p, r)| format!("{p}-{r}")).collect::<Vec<_>>()),
-        );
+        purged.insert(id.clone(), json!(removed.iter().map(|(p, r)| format!("{p}-{r}")).collect::<Vec<_>>()));
         if removed.is_empty() {
             continue;
         }
-        seq_acts.push(Action::Remove(fdi.update_seq));
+        count_doc(&mut header, Some(&before), -1);
+        batch.delete_cf(&db.store.cf(CF_SEQ), be(before.update_seq));
         if fdi.tree.is_empty() {
-            id_acts.push(Action::Remove(id));
+            batch.delete_cf(&db.store.cf(CF_ID), id.as_bytes());
         } else {
             seq += 1;
             fdi.update_seq = seq;
             fdi.deleted = fdi.winner().deleted;
-            id_acts.push(Action::Insert(
-                id,
-                FdiVal {
-                    update_seq: seq,
-                    deleted: fdi.deleted,
-                    tree: fdi.tree.clone(),
-                },
-            ));
-            seq_acts.push(Action::Insert(seq, fdi));
+            count_doc(&mut header, Some(&fdi), 1);
+            put_fdi(db, &mut batch, &fdi);
+            batch.put_cf(&db.store.cf(CF_SEQ), be(seq), enc(&fdi));
         }
     }
-    new.ids = new.ids.modify(id_acts)?;
-    new.seqs = new.seqs.modify(seq_acts)?;
-    new.header.update_seq = seq;
-    new.header.purge_seq += 1;
-    let stored = add_signed(snap.stored_live(), stored_delta);
-    new.header.set_prop_u64(STORED_LIVE, stored);
-    let purge_seq = new.header.purge_seq;
-    commit_and_swap(db, new)?;
+    header.update_seq = seq;
+    header.purge_seq += 1;
+    let purge_seq = header.purge_seq;
+    commit(db, batch, header)?;
     Ok(json!({"purge_seq": purge_seq, "purged": purged}))
 }

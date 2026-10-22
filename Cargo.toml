@@ -24,6 +24,7 @@ parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
 rand = "0.10.3"
 regex = "1.13.1"
+rocksdb = { version = "0.25.0", default-features = false, features = ["bindgen-runtime", "multi-threaded-cf"] }
 rquickjs = "0.14.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }

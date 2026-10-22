@@ -224,9 +224,7 @@ fn collect(snap: &Snapshot, args: &mut ChangesArgs, since: u64, limit: usize) ->
 }
 
 fn pending(snap: &Snapshot, last: u64) -> u64 {
-    let total = snap.seqs.full_reduce().unwrap_or(0);
-    let before = snap.seqs.reduce_before(&(last + 1), Dir::Fwd).ok().flatten().unwrap_or(0);
-    total.saturating_sub(before)
+    snap.pending_after(last)
 }
 
 pub async fn changes(req: Req, db: Arc<Db>) -> Result<Response> {

@@ -998,7 +998,7 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
         inclusive_end: args.inclusive_end,
     };
     let offset = match &start {
-        Some(s) => snap.ids.reduce_before(s, dir)?.map(|r| r.doc_count).unwrap_or(0),
+        Some(s) => snap.count_docs_before(s, dir)?,
         None => 0,
     };
     let mut skip = args.skip;
