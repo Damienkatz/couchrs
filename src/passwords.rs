@@ -13,7 +13,7 @@ pub fn is_hashed(stored: &str) -> bool {
     stored.starts_with("-hashed-") || stored.starts_with("-pbkdf2-") || stored.starts_with("-pbkdf2:")
 }
 
-fn pbkdf2_hex(prf: &str, password: &[u8], salt: &[u8], iterations: u32) -> Option<String> {
+pub fn pbkdf2_hex(prf: &str, password: &[u8], salt: &[u8], iterations: u32) -> Option<String> {
     macro_rules! derive {
         ($h:ty, $len:expr) => {{
             let mut out = [0u8; $len];
@@ -50,8 +50,12 @@ pub fn hash_admin_password(config: &Config, plain: &str) -> String {
     format!("-pbkdf2:{prf}-{derived},{salt},{iterations}")
 }
 
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    ct_eq(a.as_bytes(), b.as_bytes())
 }
 
 /// Successful checks, keyed by stored hash and a digest of the password,

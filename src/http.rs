@@ -8,7 +8,6 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use base64::Engine;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -24,6 +23,8 @@ pub struct Req {
     pub server: Arc<Server>,
     /// Whether the raw path ended in '/' (lost when splitting `path`).
     pub trailing_slash: bool,
+    /// Who is asking, as authenticated.
+    pub auth: crate::auth::Auth,
 }
 
 impl Req {
@@ -151,92 +152,41 @@ pub async fn handle(State(server): State<Arc<Server>>, req: Request) -> Response
         body,
         server,
         trailing_slash: raw_path.ends_with('/'),
+        auth: crate::auth::Auth::default(),
     };
     let is_head = method == Method::HEAD;
-    let resp = match authorize(&req) {
+    let mut req = req;
+    let renew = match crate::auth::authenticate(&req.server, &req.headers, &req.path) {
+        Ok(a) => {
+            let renew = a.renew.clone().zip(a.user.name.clone());
+            req.auth = a;
+            renew
+        }
+        Err(e) => return e.into_response(),
+    };
+    let server = req.server.clone();
+    let mut resp = match crate::auth::authorize_request(&req.server, &req.auth.user, &req.method, &req.path) {
         Ok(()) => match route(req).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         },
         Err(e) => e.into_response(),
     };
+    // Renew a session cookie past 10% of its life, unless the response
+    // (a login or logout) sets one itself.
+    if let Some((salt, name)) = renew
+        && !resp.headers().contains_key(header::SET_COOKIE)
+        && let Some(v) = crate::auth::make_cookie(&server, &name, &salt, now_secs())
+        && let Ok(h) = HeaderValue::from_str(&crate::auth::cookie_header(&server.config, &v, false))
+    {
+        resp.headers_mut().insert(header::SET_COOKIE, h);
+    }
     if is_head {
         let (mut parts, _) = resp.into_parts();
         parts.headers.remove(header::CONTENT_LENGTH);
         return Response::from_parts(parts, Body::empty());
     }
     resp
-}
-
-/// Basic or cookie auth against the configured admin. With no admin
-/// configured the server runs in "admin party" mode.
-fn authorize(req: &Req) -> Result<()> {
-    if admin_party(&req.server) {
-        return Ok(());
-    }
-    // Like CouchDB, the welcome, _up, _session and the web UI's static
-    // files need no credentials; Fauxton logs in through _session.
-    if req.path.is_empty() || matches!(req.path[0].as_str(), "_up" | "_session" | "_utils") {
-        return Ok(());
-    }
-    if basic_admin(req).is_some() || session_user(req).is_some() {
-        return Ok(());
-    }
-    Err(CouchError::unauthorized("You are not authorized to access this db."))
-}
-
-/// No admins configured: everyone is an admin.
-pub fn admin_party(server: &Server) -> bool {
-    server.config.section("admins").is_empty()
-}
-
-/// Whether name/password match a configured admin.
-fn check_admin(server: &Server, name: &str, password: &str) -> bool {
-    server
-        .config
-        .get("admins", name)
-        .is_some_and(|stored| crate::passwords::verify_admin(&stored, password))
-}
-
-/// The admin a Basic Authorization header names, if its password matches.
-fn basic_admin(req: &Req) -> Option<String> {
-    let h = req.header("authorization")?;
-    let d = crate::doc::B64.decode(h.strip_prefix("Basic ")?.trim()).ok()?;
-    let s = String::from_utf8(d).ok()?;
-    let (u, p) = s.split_once(':')?;
-    check_admin(&req.server, u, p).then(|| u.to_string())
-}
-
-fn session_secret(server: &Server) -> String {
-    server.config.get_or("chttpd_auth", "secret", &server.uuid)
-}
-
-fn session_token(server: &Server, name: &str, ts: u64) -> String {
-    use md5::{Digest, Md5};
-    let mac = hex::encode(Md5::digest(format!("{}:{name}:{ts}", session_secret(server))));
-    crate::doc::B64.encode(format!("{name}:{ts}:{mac}"))
-}
-
-fn session_user(req: &Req) -> Option<String> {
-    let cookie = req.header("cookie")?;
-    let tok = cookie
-        .split(';')
-        .map(|c| c.trim())
-        .find_map(|c| c.strip_prefix("AuthSession="))?;
-    let raw = String::from_utf8(crate::doc::B64.decode(tok).ok()?).ok()?;
-    let mut it = raw.splitn(3, ':');
-    let name = it.next()?;
-    let ts: u64 = it.next()?.parse().ok()?;
-    let timeout: u64 = req.server.config.get_int("chttpd_auth", "timeout", 600);
-    // The session ends with the admin it was issued to.
-    if session_token(&req.server, name, ts) == tok
-        && now_secs() < ts + timeout
-        && req.server.config.get("admins", name).is_some()
-    {
-        Some(name.to_string())
-    } else {
-        None
-    }
 }
 
 pub fn now_secs() -> u64 {
@@ -268,7 +218,12 @@ async fn route(req: Req) -> Result<Response> {
         Some("_up") => ok_json(json!({"status": "ok", "seeds": {}})),
         Some("_session") => session(&req),
         Some("_utils") => crate::fauxton::serve(&req),
-        Some("_active_tasks") => ok_json(json!([])),
+        Some("_active_tasks") => {
+            if !req.auth.user.is_server_admin() {
+                return Err(CouchError::unauthorized("You are not a server admin."));
+            }
+            ok_json(json!([]))
+        }
         Some("_membership") => ok_json(json!({
             "all_nodes": ["couchdb@127.0.0.1"], "cluster_nodes": ["couchdb@127.0.0.1"]
         })),
@@ -382,17 +337,35 @@ pub fn new_uuid() -> String {
     format!("{prefix}{:06x}", n & 0xffffff)
 }
 
+/// _session (couch_httpd_auth:handle_session_req): who is logged in, log
+/// in (JSON or form name/password; sets the AuthSession cookie), log out.
+/// `next` redirects after login or logout.
 fn session(req: &Req) -> Result<Response> {
-    let party = admin_party(&req.server);
+    let config = &req.server.config;
+    let redirect = |r: Response| -> Response {
+        match req.q("next") {
+            Some(next) => {
+                let (mut parts, body) = r.into_parts();
+                parts.status = StatusCode::FOUND;
+                if let Ok(v) = HeaderValue::from_str(next) {
+                    parts.headers.insert(header::LOCATION, v);
+                }
+                Response::from_parts(parts, body)
+            }
+            None => r,
+        }
+    };
     match req.method {
         Method::GET | Method::HEAD => {
-            let name = if party { None } else { session_user(req).or_else(|| basic_admin(req)) };
-            let roles = if party || name.is_some() { json!(["_admin"]) } else { json!([]) };
-            ok_json(json!({
-                "ok": true,
-                "userCtx": {"name": name, "roles": roles},
-                "info": {"authentication_handlers": ["cookie", "default"], "authenticated": "default"}
-            }))
+            let user = &req.auth.user;
+            if req.q("basic") == Some("true") && user.name.is_none() && !user.is_server_admin() {
+                return Err(CouchError::unauthorized("Authentication required."));
+            }
+            let mut info = json!({"authentication_handlers": ["cookie", "default"]});
+            if let Some(m) = req.auth.method {
+                info["authenticated"] = json!(m);
+            }
+            ok_json(json!({"ok": true, "userCtx": {"name": user.name, "roles": user.roles}, "info": info}))
         }
         Method::POST => {
             let creds: Value = if req.content_type().starts_with("application/x-www-form-urlencoded") {
@@ -405,28 +378,25 @@ fn session(req: &Req) -> Result<Response> {
             };
             let name = creds.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let pass = creds.get("password").and_then(|n| n.as_str()).unwrap_or("");
-            if party {
-                return ok_json(json!({"ok": true, "name": null, "roles": ["_admin"]}));
-            }
-            match check_admin(&req.server, name, pass) {
-                true => {
-                    let tok = session_token(&req.server, name, now_secs());
-                    let r = json_response(
-                        StatusCode::OK,
-                        &json!({"ok": true, "name": name, "roles": ["_admin"]}),
-                    );
-                    Ok(with_header(
-                        r,
-                        header::SET_COOKIE,
-                        &format!("AuthSession={tok}; Version=1; Path=/; HttpOnly"),
-                    ))
+            let clear = crate::auth::cookie_header(config, "", false);
+            match crate::auth::get_user_creds(&req.server, name).filter(|c| c.check_password(pass)) {
+                Some(c) => {
+                    let value = crate::auth::make_cookie(&req.server, name, &c.salt, now_secs())
+                        .ok_or_else(|| CouchError::internal("cookie auth secret is not set"))?;
+                    let r = json_response(StatusCode::OK, &json!({"ok": true, "name": name, "roles": c.roles}));
+                    let r = with_header(r, header::SET_COOKIE, &crate::auth::cookie_header(config, &value, false));
+                    Ok(redirect(r))
                 }
-                false => Err(CouchError::unauthorized("Name or password is incorrect.")),
+                None => {
+                    let r = CouchError::unauthorized("Name or password is incorrect.").into_response();
+                    Ok(with_header(r, header::SET_COOKIE, &clear))
+                }
             }
         }
         Method::DELETE => {
             let r = json_response(StatusCode::OK, &json!({"ok": true}));
-            Ok(with_header(r, header::SET_COOKIE, "AuthSession=; Version=1; Path=/; HttpOnly; Max-Age=0"))
+            let r = with_header(r, header::SET_COOKIE, &crate::auth::cookie_header(config, "", false));
+            Ok(redirect(r))
         }
         _ => not_allowed("GET,HEAD,POST,DELETE"),
     }
@@ -517,6 +487,9 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
     let addr = server.config.get_or("chttpd", "bind_address", "127.0.0.1");
     let port = server.config.get_or("chttpd", "port", "5984");
     let bind = if addr.contains(':') { format!("[{addr}]:{port}") } else { format!("{addr}:{port}") };
+    if let Err(e) = server.ensure_system_dbs().await {
+        tracing::error!("could not set up system databases: {}", e.reason);
+    }
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("couchdb-rs listening on http://{bind}");
     axum::serve(listener, app).await

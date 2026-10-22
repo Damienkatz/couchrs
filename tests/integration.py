@@ -561,6 +561,133 @@ def config_api():
         eq(req("DELETE", f"{c}/admins/{name}", headers=auth)[0], 200)
 
 
+def basic(user, pw):
+    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
+
+
+ANON = {"Authorization": ""}
+
+
+@test
+def users_and_security():
+    x = uuid.uuid4().hex[:8]
+    c = "/_node/_local/_config"
+    sa, sapw = f"sa_{x}", f"pw_{x}"
+    ADMIN = basic(sa, sapw)
+    eq(req("PUT", f"{c}/admins/{sa}", sapw)[0], 200)
+    try:
+        for _ in range(50):  # CouchDB hashes new admins in the background
+            if req("GET", "/_session", headers=ADMIN)[1].get("userCtx", {}).get("name") == sa:
+                break
+            time.sleep(0.1)
+        _users_and_security(x, ADMIN)
+    finally:
+        req("DELETE", f"{c}/admins/{sa}", headers=ADMIN)
+
+
+def _users_and_security(x, ADMIN):
+    db, bob, eve = f"sec_{x}", f"bob_{x}", f"eve_{x}"
+    BOB, EVE = basic(bob, "pw"), basic(eve, "pw")
+
+    def r(method, path, body=None, who=ADMIN):
+        s, b, h = req(method, path, body, headers=who)
+        return s, b
+
+    not_admin = {"error": "unauthorized", "reason": "You are not a server admin."}
+    eq(r("PUT", f"/{db}"), (201, {"ok": True}))
+    try:
+        eq(r("GET", f"/{db}/_security"), (200, {"members": {"roles": ["_admin"]}, "admins": {"roles": ["_admin"]}}))
+        eq(r("GET", f"/{db}", who=ANON), (401, {"error": "unauthorized", "reason": "You are not authorized to access this db."}))
+        for name, roles in [(bob, []), (eve, ["boss"])]:
+            s, b = r("PUT", f"/_users/org.couchdb.user:{name}",
+                     {"name": name, "password": "pw", "roles": roles, "type": "user"})
+            eq(s, 201, name)
+        # Passwords are stored hashed.
+        s, doc = r("GET", f"/_users/org.couchdb.user:{bob}")
+        assert "password" not in doc and doc["password_scheme"] == "pbkdf2", doc
+        assert doc["iterations"] == 600000 and len(doc["derived_key"]) == 64 and doc["pbkdf2_prf"] == "sha256", doc
+        # The users db is admin-only by default, even for one's own doc.
+        eq(r("GET", f"/_users/org.couchdb.user:{bob}", who=BOB),
+           (403, {"error": "forbidden", "reason": "You are not allowed to access this db."}))
+        eq(r("GET", "/_users/_all_docs", who=BOB), (401, not_admin))
+        eq(r("GET", "/_all_dbs", who=BOB), (401, not_admin))
+        s, b = r("GET", "/_session", who=BOB)
+        eq((b["userCtx"], b["info"]["authenticated"]), ({"name": bob, "roles": []}, "default"))
+        eq(r("GET", "/_session", who=EVE)[1]["userCtx"], {"name": eve, "roles": ["boss"]})
+        eq(r("GET", "/_session", who=basic(bob, "nope")), (401, {"error": "unauthorized", "reason": "Name or password is incorrect."}))
+        eq(r("GET", f"/{db}", who=BOB), (403, {"error": "forbidden", "reason": "You are not allowed to access this db."}))
+
+        # Members by name, db admins by role.
+        sec = {"members": {"names": [bob]}, "admins": {"roles": ["boss"]}}
+        eq(r("PUT", f"/{db}/_security", sec), (200, {"ok": True}))
+        eq(r("GET", f"/{db}", who=BOB)[0], 200)
+        eq(r("PUT", f"/{db}/d1", {"a": 1}, who=BOB)[0], 201)
+        eq(r("PUT", f"/{db}/_design/x", {"views": {}}, who=BOB),
+           (403, {"error": "forbidden", "reason": "You are not a db or server admin."}))
+        eq(r("GET", f"/{db}/_security", who=BOB), (200, sec))
+        eq(r("POST", f"/{db}/_compact", {}, who=BOB),
+           (401, {"error": "unauthorized", "reason": "You are not a server or db admin."}))
+        eq(r("GET", f"/{db}", who=EVE)[0], 200)
+        eq(r("POST", f"/{db}/_compact", {}, who=EVE), (202, {"ok": True}))
+        eq(r("POST", f"/{db}/_purge", {}, who=EVE), (401, not_admin))
+        eq(r("DELETE", f"/{db}", who=EVE), (401, not_admin))
+        eq(r("GET", f"/{db}", who=ANON), (401, {"error": "unauthorized", "reason": "You are not authorized to access this db."}))
+
+        # validate_doc_update sees the real user.
+        vdu = "function(n, o, u) { if (u.name !== '%s' && u.roles.indexOf('_admin') === -1) throw({forbidden: 'only bob'}); }" % bob
+        eq(r("PUT", f"/{db}/_design/v", {"validate_doc_update": vdu}, who=EVE)[0], 201)
+        eq(r("PUT", f"/{db}/d2", {"a": 1}, who=EVE), (403, {"error": "forbidden", "reason": "only bob"}))
+        eq(r("PUT", f"/{db}/d2", {"a": 1}, who=BOB)[0], 201)
+        vrev = r("GET", f"/{db}/_design/v", who=EVE)[1]["_rev"]
+        eq(r("DELETE", f"/{db}/_design/v?rev={vrev}", who=EVE)[0], 200)
+
+        # An open database: anyone may read and write documents, but design
+        # documents still need a db admin.
+        eq(r("PUT", f"/{db}/_security", {}), (200, {"ok": True}))
+        eq(r("GET", f"/{db}", who=ANON)[0], 200)
+        eq(r("PUT", f"/{db}/d3", {"a": 1}, who=ANON)[0], 201)
+        eq(r("PUT", f"/{db}/_design/y", {"views": {}}, who=ANON),
+           (401, {"error": "unauthorized", "reason": "You are not a db or server admin."}))
+
+        # The users db validator and security.
+        eq(r("PUT", "/_users/org.couchdb.user:" + bob + "x", {"name": bob + "x", "password": "p", "roles": []}),
+           (403, {"error": "forbidden", "reason": "doc.type must be user"}))
+        eq(r("PUT", "/_users/org.couchdb.user:" + bob + "x", {"name": "other", "password": "p", "roles": [], "type": "user"}),
+           (403, {"error": "forbidden", "reason": "Doc ID must be of the form org.couchdb.user:name"}))
+        eq(r("PUT", "/_users/_security", {}),
+           (403, {"error": "forbidden", "reason": "You can't edit the security object of the user database."}))
+
+        # Server-level rules for anonymous users.
+        eq(r("GET", "/_active_tasks", who=ANON), (401, not_admin))
+        eq(r("GET", "/_uuids", who=ANON)[0], 200)
+        eq(r("PUT", f"/{db}_anon", who=ANON), (401, not_admin))
+        eq(r("POST", "/_replicate", {}, who=ANON), (401, {"error": "unauthorized", "reason": "You are not an authenticated user"}))
+        s, b = r("GET", "/_session", who=ANON)
+        eq((s, b["userCtx"], "authenticated" in b["info"]), (200, {"name": None, "roles": []}, False))
+
+        # Cookie login.
+        s, b, h = req("POST", "/_session", {"name": bob, "password": "pw"}, headers=ANON)
+        eq((s, b), (200, {"ok": True, "name": bob, "roles": []}))
+        cookie = h["Set-Cookie"].split(";")[0]
+        assert cookie.startswith("AuthSession=") and len(cookie) > 20, h["Set-Cookie"]
+        assert "HttpOnly" in h["Set-Cookie"] and "Path=/" in h["Set-Cookie"], h["Set-Cookie"]
+        s, b, _ = req("GET", "/_session", headers={"Authorization": "", "Cookie": cookie})
+        eq((b["userCtx"]["name"], b["info"]["authenticated"]), (bob, "cookie"))
+        eq(req("GET", f"/{db}", headers={"Authorization": "", "Cookie": cookie})[0], 200)
+        s, b, h = req("POST", "/_session", {"name": bob, "password": "wrong"}, headers=ANON)
+        eq((s, b["reason"]), (401, "Name or password is incorrect."))
+        assert h["Set-Cookie"].startswith("AuthSession=;"), h["Set-Cookie"]
+        s, b, h = req("DELETE", "/_session", headers={"Authorization": "", "Cookie": cookie})
+        eq((s, b), (200, {"ok": True}))
+        assert h["Set-Cookie"].startswith("AuthSession=;"), h["Set-Cookie"]
+    finally:
+        r("DELETE", f"/{db}")
+        for name in (bob, eve):
+            s, d = r("GET", f"/_users/org.couchdb.user:{name}")
+            if s == 200:
+                r("DELETE", f"/_users/org.couchdb.user:{name}?rev={d['_rev']}")
+
+
 @test
 def show_content_negotiation():
     db = new_db()

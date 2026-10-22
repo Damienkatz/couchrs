@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod btree;
 pub mod changes;
 pub mod collate;

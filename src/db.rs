@@ -492,7 +492,18 @@ fn next_id_after(view: &View, cf: &str) -> Result<u64> {
 }
 
 impl Db {
+    /// Open an existing database, or create one when `create` is set.
     pub fn open(path: &FsPath, name: &str, create: bool) -> Result<Arc<Db>> {
+        Self::open_with(path, name, create.then_some(b"{}".as_slice()))
+    }
+
+    /// Create a database whose _security object starts as `security`.
+    pub fn create(path: &FsPath, name: &str, security: &Value) -> Result<Arc<Db>> {
+        Self::open_with(path, name, Some(&serde_json::to_vec(security)?))
+    }
+
+    fn open_with(path: &FsPath, name: &str, new_security: Option<&[u8]>) -> Result<Arc<Db>> {
+        let create = new_security.is_some();
         let mut open = OPEN_GENS.lock();
         let generation = if create {
             if exists(path) {
@@ -529,7 +540,7 @@ impl Db {
                     uuid: uuid::Uuid::new_v4().simple().to_string(),
                     update_seq: 0,
                     purge_seq: 0,
-                    security: b"{}".to_vec(),
+                    security: new_security.unwrap_or(b"{}").to_vec(),
                     revs_limit: 1000,
                     doc_count: 0,
                     del_count: 0,

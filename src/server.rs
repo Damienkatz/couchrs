@@ -59,7 +59,7 @@ impl Server {
         if dbs.contains_key(name) || crate::db::exists(&path) {
             return Err(CouchError::file_exists());
         }
-        let db = Db::open(&path, name, true)?;
+        let db = Db::create(&path, name, &crate::auth::default_security(&self.config))?;
         dbs.insert(name.to_string(), db.clone());
         let _ = self.db_events.send((name.to_string(), "created"));
         Ok(db)
@@ -98,6 +98,55 @@ impl Server {
         walk(&self.data_dir, &self.data_dir, &mut out);
         out.sort();
         out
+    }
+}
+
+impl Server {
+    /// What a single node does at start (setup's enable_single_node and
+    /// chttpd_auth_cache): the users and replicator databases exist, and
+    /// the users database has its _design/_auth validator.
+    pub async fn ensure_system_dbs(&self) -> Result<()> {
+        let users = crate::auth::users_db_name(&self.config);
+        if self.config.get_bool("couchdb", "single_node", true) {
+            for name in [users.as_str(), "_replicator"] {
+                if !crate::db::exists(&self.db_path(name)) {
+                    match self.create_db(name) {
+                        Ok(_) => {}
+                        Err(e) if e.error == "file_exists" => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        if let Ok(db) = self.open_db(&users) {
+            ensure_auth_ddoc(&db).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Write the users database's _design/_auth validator if it's missing
+/// or differs from this server's.
+pub async fn ensure_auth_ddoc(db: &Arc<Db>) -> Result<()> {
+    let snap = db.snapshot();
+    let mut ddoc = serde_json::json!({
+        "_id": "_design/_auth",
+        "language": "javascript",
+        "validate_doc_update": crate::auth::AUTH_VALIDATE,
+    });
+    if let Some(fdi) = snap.get_fdi("_design/_auth")?
+        && !fdi.deleted
+    {
+        let cur = snap.winner_json(&fdi, &crate::doc::DocOpts::default())?;
+        if cur.get("validate_doc_update").and_then(|v| v.as_str()) == Some(crate::auth::AUTH_VALIDATE) {
+            return Ok(());
+        }
+        ddoc["_rev"] = cur["_rev"].clone();
+    }
+    let doc = crate::doc::from_json(ddoc)?;
+    match db.update_docs(vec![doc], true).await?.pop() {
+        Some(Err(e)) if e.error != "conflict" => Err(e),
+        _ => Ok(()),
     }
 }
 

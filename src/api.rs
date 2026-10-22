@@ -120,7 +120,10 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
             if req.q("q").map(|q| q != "1").unwrap_or(false) || req.q("n").map(|q| q != "1").unwrap_or(false) {
                 // Single node: accept and ignore sharding parameters.
             }
-            req.server.create_db(name)?;
+            let db = req.server.create_db(name)?;
+            if crate::auth::is_users_db(&req.server.config, name) {
+                crate::server::ensure_auth_ddoc(&db).await?;
+            }
             let r = json_response(StatusCode::CREATED, &json!({"ok": true}));
             Ok(with_header(r, header::LOCATION, &format!("/{name}")))
         }
@@ -143,7 +146,7 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
             validate_docid(&doc.id)?;
             let id = doc.id.clone();
             let batch = req.q("batch") == Some("ok");
-            let rev = save_docs(&db, vec![doc], true).await?.pop().unwrap()?;
+            let rev = save_docs(req, &db, vec![doc], true).await?.pop().unwrap()?;
             let status = if batch { StatusCode::ACCEPTED } else { StatusCode::CREATED };
             let r = json_response(status, &json!({"ok": true, "id": id, "rev": rev}));
             let r = with_header(r, header::LOCATION, &format!("/{name}/{id}"));
@@ -153,14 +156,38 @@ async fn db_root(req: &Req, name: &str) -> Result<Response> {
     }
 }
 
-/// Run validation then submit docs to the writer.
-pub async fn save_docs(db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: bool) -> Result<Vec<Result<String>>> {
+/// Check, validate and submit docs to the writer, as `req`'s user:
+/// design documents need a database admin, users-db documents get their
+/// passwords hashed, and validate_doc_update functions see the user.
+pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: bool) -> Result<Vec<Result<String>>> {
     let snap = db.snapshot();
-    let pre = if crate::js::has_validators(db, &snap)? {
-        blocking(|| crate::js::validate_docs(db, &snap, &mut docs, new_edits))?
+    let sec = snap.security();
+    let user = &req.auth.user;
+    let config = &req.server.config;
+    let users_db = crate::auth::is_users_db(config, &db.name);
+    let mut early: Vec<Option<CouchError>> = vec![None; docs.len()];
+    for (d, e) in docs.iter_mut().zip(early.iter_mut()) {
+        if d.is_local() {
+            continue;
+        }
+        if d.is_design() {
+            *e = crate::auth::check_db_admin(user, &sec).err();
+        } else if users_db {
+            *e = crate::auth::before_users_doc_update(config, user, &sec, &mut d.body, &d.id).err();
+        }
+    }
+    let ctx = user.json(&db.name);
+    let mut pre = if crate::js::has_validators(db, &snap)? {
+        let skip: Vec<bool> = early.iter().map(|e| e.is_some()).collect();
+        blocking(|| crate::js::validate_docs(db, &snap, &mut docs, new_edits, &ctx, &skip))?
     } else {
         vec![None; docs.len()]
     };
+    for (p, e) in pre.iter_mut().zip(early) {
+        if e.is_some() {
+            *p = e;
+        }
+    }
     let mut idx = Vec::new();
     let mut to_save = Vec::new();
     for (i, (d, err)) in docs.into_iter().zip(pre.iter()).enumerate() {
@@ -261,7 +288,7 @@ async fn doc_request(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
                 let (p, r) = parse_rev(&rev)?;
                 doc.revs = (p, vec![r]);
             }
-            let rev = save_docs(db, vec![doc], true).await?.pop().unwrap()?;
+            let rev = save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
             let r = ok_json(json!({"ok": true, "id": id, "rev": rev}))?;
             Ok(with_header(r, header::ETAG, &format!("\"{rev}\"")))
         }
@@ -300,7 +327,10 @@ fn get_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         return Ok(with_header(empty(StatusCode::NOT_MODIFIED), header::ETAG, &etag));
     }
     // Inlined attachment bodies can be large; the doc alone is a point read.
-    let v = if opts.attachments { blocking(|| snap.doc_json(&fdi, &rev, &opts))? } else { snap.doc_json(&fdi, &rev, &opts)? };
+    let mut v = if opts.attachments { blocking(|| snap.doc_json(&fdi, &rev, &opts))? } else { snap.doc_json(&fdi, &rev, &opts)? };
+    if crate::auth::is_users_db(&req.server.config, &db.name) {
+        v = crate::auth::after_users_doc_read(&req.server.config, &req.auth.user, &snap.security(), id, v)?;
+    }
     Ok(with_header(json_response(StatusCode::OK, &v), header::ETAG, &etag))
 }
 
@@ -569,7 +599,7 @@ async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         doc.revs = (0, vec![doc.rev().unwrap_or_default().trim_start_matches("0-").to_string()]);
     }
     let new_edits = req.q_bool("new_edits")?.unwrap_or(true);
-    let rev = save_docs(db, vec![doc], new_edits).await?.pop().unwrap()?;
+    let rev = save_docs(req, db, vec![doc], new_edits).await?.pop().unwrap()?;
     let status = if req.q("batch") == Some("ok") {
         StatusCode::ACCEPTED
     } else {
@@ -607,7 +637,7 @@ async fn copy_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         }
         None => (0, vec![]),
     };
-    let new_rev = save_docs(db, vec![doc], true).await?.pop().unwrap()?;
+    let new_rev = save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
     let r = json_response(StatusCode::CREATED, &json!({"ok": true, "id": dest_id, "rev": new_rev}));
     Ok(with_header(r, header::ETAG, &format!("\"{new_rev}\"")))
 }
@@ -721,7 +751,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                     return Err(CouchError::not_found("Document is missing attachment"));
                 }
             }
-            let new_rev = save_docs(db, vec![doc], true).await?.pop().unwrap()?;
+            let new_rev = save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
             let status = if req.method == Method::PUT { StatusCode::CREATED } else { StatusCode::OK };
             let r = json_response(status, &json!({"ok": true, "id": id, "rev": new_rev}));
             Ok(with_header(r, header::ETAG, &format!("\"{new_rev}\"")))
@@ -1074,7 +1104,7 @@ async fn bulk_docs(req: &Req, db: &Arc<Db>) -> Result<Response> {
         parsed.push(doc);
     }
     let ids: Vec<String> = parsed.iter().map(|d| d.id.clone()).collect();
-    let results = save_docs(db, parsed, new_edits).await?;
+    let results = save_docs(req, db, parsed, new_edits).await?;
     let mut out = Vec::new();
     for (id, r) in ids.into_iter().zip(results) {
         match r {
@@ -1217,6 +1247,7 @@ async fn revs_limit(req: &Req, db: &Arc<Db>) -> Result<Response> {
     match req.method {
         Method::GET => ok_json(json!(db.snapshot().header.revs_limit)),
         Method::PUT => {
+            crate::auth::check_db_admin(&req.auth.user, &db.snapshot().security())?;
             let n = req
                 .json_body()?
                 .as_u64()
@@ -1233,16 +1264,13 @@ async fn security(req: &Req, db: &Arc<Db>) -> Result<Response> {
     match req.method {
         Method::GET => ok_json(db.snapshot().security()),
         Method::PUT => {
+            crate::auth::check_security_editable(&req.server.config, &db.name)?;
+            crate::auth::check_db_admin(&req.auth.user, &db.snapshot().security())?;
             let sec = req.json_body()?;
             if !sec.is_object() {
                 return Err(CouchError::bad_request("Security object must be a JSON object"));
             }
-            for k in ["admins", "members"] {
-                if let Some(v) = sec.get(k)
-                    && !v.is_object() {
-                        return Err(CouchError::bad_request(format!("{k} must be a JSON object")));
-                    }
-            }
+            crate::auth::validate_security(&sec)?;
             db.set_security(&sec).await?;
             ok_json(json!({"ok": true}))
         }

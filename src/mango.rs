@@ -503,7 +503,7 @@ async fn create_index(req: &Req, db: &Arc<Db>) -> Result<Response> {
         }
     doc_json["views"][&name] = view;
     let doc = from_json(doc_json)?;
-    save_docs(db, vec![doc], true).await?.pop().unwrap()?;
+    save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
     ok_json(json!({"result": "created", "id": ddoc_id, "name": name}))
 }
 
@@ -514,11 +514,11 @@ pub async fn http_delete_index(req: &Req, db: &Arc<Db>, ddoc: &str, kind: &str, 
     if kind != "json" {
         return Err(CouchError::not_found("Index not found"));
     }
-    delete_index(db, ddoc, name).await?;
+    delete_index(req, db, ddoc, name).await?;
     ok_json(json!({"ok": true}))
 }
 
-async fn delete_index(db: &Arc<Db>, ddoc: &str, name: &str) -> Result<()> {
+async fn delete_index(req: &Req, db: &Arc<Db>, ddoc: &str, name: &str) -> Result<()> {
     let id = if ddoc.starts_with("_design/") { ddoc.to_string() } else { format!("_design/{ddoc}") };
     let snap = db.snapshot();
     let fdi = snap.get_fdi(&id)?.filter(|f| !f.deleted).ok_or_else(|| CouchError::not_found("Index not found"))?;
@@ -531,7 +531,7 @@ async fn delete_index(db: &Arc<Db>, ddoc: &str, name: &str) -> Result<()> {
         d = json!({"_id": id, "_rev": d["_rev"], "_deleted": true});
     }
     let doc = from_json(d)?;
-    save_docs(db, vec![doc], true).await?.pop().unwrap()?;
+    save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
     Ok(())
 }
 
@@ -549,7 +549,7 @@ pub async fn http_index_bulk_delete(req: &Req, db: &Arc<Db>) -> Result<Response>
         match snap.get_fdi(id)?.filter(|f| !f.deleted) {
             Some(f) => {
                 let doc = from_json(json!({"_id": id, "_rev": f.winner().rev(), "_deleted": true}))?;
-                match save_docs(db, vec![doc], true).await?.pop().unwrap() {
+                match save_docs(req, db, vec![doc], true).await?.pop().unwrap() {
                     Ok(_) => success.push(json!({"id": id, "ok": true})),
                     Err(e) => fail.push(json!({"id": id, "error": e.error})),
                 }

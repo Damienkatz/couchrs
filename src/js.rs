@@ -513,16 +513,22 @@ pub fn has_validators(db: &Db, snap: &Snapshot) -> Result<bool> {
 
 /// Run every validate_doc_update function against each doc. Returns a
 /// per-doc error (None = valid).
-pub fn validate_docs(db: &Db, snap: &Snapshot, docs: &mut [doc::Doc], _new_edits: bool) -> Result<Vec<Option<CouchError>>> {
+pub fn validate_docs(
+    db: &Db,
+    snap: &Snapshot,
+    docs: &mut [doc::Doc],
+    _new_edits: bool,
+    user_ctx: &Value,
+    skip: &[bool],
+) -> Result<Vec<Option<CouchError>>> {
     let mut out = vec![None; docs.len()];
     let Some(funs) = vdu_funs(db, snap)? else {
         return Ok(out);
     };
     let n = funs.setup.matches("__funs.push").count();
-    let user_ctx = json!({"db": db.name, "name": null, "roles": ["_admin"]});
     let sec = snap.security();
     for (i, d) in docs.iter().enumerate() {
-        if d.is_local() || d.is_design() {
+        if d.is_local() || d.is_design() || skip.get(i).copied().unwrap_or(false) {
             continue;
         }
         let old = match snap.get_fdi(&d.id)? {
@@ -655,7 +661,7 @@ fn js_req(req: &Req, db: &Db, id: Option<&str>) -> Value {
         "peer": "127.0.0.1",
         "form": form,
         "cookie": {},
-        "userCtx": {"db": db.name, "name": null, "roles": ["_admin"]},
+        "userCtx": req.auth.user.json(&db.name),
         "secObj": db.snapshot().security(),
     })
 }
@@ -746,7 +752,7 @@ pub async fn http_ddoc_fun(req: &Req, db: &Arc<Db>, ddoc_id: &str, rest: &[&str]
                 if d.id.is_empty() {
                     d.id = id.clone().ok_or_else(|| CouchError::bad_request("Document id must be specified"))?;
                 }
-                let rev = crate::api::save_docs(db, vec![d.clone()], true).await?.pop().unwrap()?;
+                let rev = crate::api::save_docs(req, db, vec![d.clone()], true).await?.pop().unwrap()?;
                 let r = render_response(&resp, StatusCode::CREATED);
                 let r = with_header(r, header::HeaderName::from_static("x-couch-update-newrev"), &rev);
                 return Ok(with_header(r, header::HeaderName::from_static("x-couch-id"), &d.id));

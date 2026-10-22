@@ -126,7 +126,7 @@ fn parse_args(req: &Req, db: &Db) -> Result<ChangesArgs> {
         "query": req.query.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>(),
         "headers": {},
         "body": body.map(Value::Object).unwrap_or(json!("undefined")),
-        "userCtx": {"db": db.name, "name": null, "roles": ["_admin"]},
+        "userCtx": req.auth.user.json(&db.name),
         "info": {"db_name": db.name},
     });
     Ok(ChangesArgs {
