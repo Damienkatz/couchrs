@@ -764,6 +764,74 @@ pub fn validate_ddoc(ddoc: &Value, db_partitioned: bool) -> Result<()> {
     Ok(())
 }
 
+/// couch_mrview_util:ddoc_to_mrst/2's signature: the MD5 of the term
+/// {Views, Language, DesignOpts, SortedLib}, the views as #mrview{}
+/// records, one per map function and options, in order of those.
+fn view_signature(ddoc: &Value) -> String {
+    use crate::replicator::rep::{Term, ejson};
+    let props = |o: &Map<String, Value>| Term::List(o.iter().map(|(k, v)| Term::Tuple(vec![Term::Bin(k.as_bytes().to_vec()), ejson(v)])).collect());
+    let empty = Map::new();
+    let views = ddoc.get("views").and_then(Value::as_object).unwrap_or(&empty);
+    // ((map, options), map names, reduce funs), each list newest first.
+    let mut by_src: Vec<((Value, Value), Vec<String>, Vec<(String, Value)>)> = Vec::new();
+    for (name, v) in views {
+        let Some(map) = v.as_object().and_then(|o| o.get("map")) else { continue };
+        let opts = v.get("options").filter(|o| o.is_object()).cloned().unwrap_or_else(|| json!({}));
+        let key = (map.clone(), opts);
+        let i = match by_src.iter().position(|(k, ..)| k == &key) {
+            Some(i) => i,
+            None => {
+                by_src.push((key, Vec::new(), Vec::new()));
+                by_src.len() - 1
+            }
+        };
+        match v.get("reduce") {
+            None | Some(Value::Null) => by_src[i].1.insert(0, name.clone()),
+            Some(r) => by_src[i].2.insert(0, (name.clone(), r.clone())),
+        }
+    }
+    let cmp = crate::mango::cmp_raw;
+    by_src.sort_by(|a, b| cmp(&a.0.0, &b.0.0).then_with(|| cmp(&a.0.1, &b.0.1)));
+    let records = by_src
+        .into_iter()
+        .enumerate()
+        .map(|(n, ((map, opts), map_names, reduce_funs))| {
+            Term::Tuple(vec![
+                Term::Atom("mrview"),
+                Term::Int(n as i128),
+                Term::Int(0),
+                Term::Int(0),
+                Term::List(map_names.iter().map(|m| Term::Bin(m.as_bytes().to_vec())).collect()),
+                Term::List(reduce_funs.iter().map(|(n, r)| Term::Tuple(vec![Term::Bin(n.as_bytes().to_vec()), ejson(r)])).collect()),
+                ejson(&map),
+                Term::Atom("nil"),
+                props(opts.as_object().unwrap_or(&empty)),
+            ])
+        })
+        .collect();
+    let language = ddoc.get("language").map(ejson).unwrap_or_else(|| Term::Bin(b"javascript".to_vec()));
+    let design_opts = props(ddoc.get("options").and_then(Value::as_object).unwrap_or(&empty));
+    // couch_index_util:sort_lib/1: objects as lists, sorted by name.
+    fn sort_lib(o: &Map<String, Value>) -> Term {
+        let mut items: Vec<(&String, &Value)> = o.iter().collect();
+        items.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        Term::List(
+            items
+                .into_iter()
+                .map(|(k, v)| {
+                    let v = match v {
+                        Value::Object(inner) => sort_lib(inner),
+                        other => ejson(other),
+                    };
+                    Term::Tuple(vec![Term::Bin(k.as_bytes().to_vec()), v])
+                })
+                .collect(),
+        )
+    }
+    let lib = sort_lib(views.get("lib").and_then(Value::as_object).unwrap_or(&empty));
+    hex::encode(Md5::digest(Term::Tuple(vec![Term::List(records), language, design_opts, lib]).encode()))
+}
+
 impl IndexDef {
     /// `db_partitioned` is the default for options.partitioned.
     pub fn from_ddoc(ddoc: &Value, db_partitioned: bool) -> Result<IndexDef> {
@@ -847,19 +915,7 @@ impl IndexDef {
                 "partitioned option cannot be true in a non-partitioned database.",
             ));
         }
-        // Signature covers everything that affects index contents.
-        let mut sig_src = json!({
-            "language": language,
-            "views": views,
-            "options": opts,
-        });
-        if partitioned {
-            sig_src["partitioned"] = json!(true);
-        }
-        if language != "query" {
-            sig_src["lib"] = views.get("lib").cloned().unwrap_or(Value::Null);
-        }
-        let sig = hex::encode(Md5::digest(serde_json::to_vec(&sig_src)?));
+        let sig = view_signature(ddoc);
         Ok(IndexDef {
             sig,
             ddoc_id: id,
@@ -1407,17 +1463,18 @@ impl Index {
         json!({
             "name": name.trim_start_matches("_design/"),
             "view_index": {
-                "signature": self.def.sig,
-                "language": self.def.language,
-                "sizes": {"file": file.eof(), "external": 0, "active": active},
-                "update_seq": st.seq,
-                "purge_seq": st.purge_seq,
-                "updater_running": self.updater_running.load(std::sync::atomic::Ordering::Relaxed),
-                "compact_running": self.compact_running.load(std::sync::atomic::Ordering::Relaxed),
-                "waiting_clients": 0,
+                // In fabric_group_info's order.
+                "updates_pending": {"minimum": 0, "preferred": 0, "total": 0},
                 "waiting_commit": false,
-                "collator_versions": ["153.112"],
-                "updates_pending": {"minimum": 0, "preferred": 0, "total": 0}
+                "waiting_clients": 0,
+                "updater_running": self.updater_running.load(std::sync::atomic::Ordering::Relaxed),
+                "update_seq": st.seq,
+                "sizes": {"file": file.eof(), "external": 0, "active": active},
+                "signature": self.def.sig,
+                "purge_seq": st.purge_seq,
+                "language": self.def.language,
+                "compact_running": self.compact_running.load(std::sync::atomic::Ordering::Relaxed),
+                "collator_versions": ["153.136"]
             },
             "couchdb_rs_last_build": self.last_build.lock().clone()
         })
@@ -1990,4 +2047,15 @@ pub fn all_ddocs(snap: &Snapshot) -> Result<Vec<Value>> {
         out.push(crate::changes::load_ddoc(snap, &id)?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    #[test]
+    fn signatures_as_couchdb_computes_them() {
+        let ddoc = json!({"_id": "_design/v", "views": {"m": {"map": "function(d){emit(1,1)}"}}});
+        assert_eq!(view_signature(&ddoc), "41363480d8c47748b9cde303b08b598e");
+    }
 }

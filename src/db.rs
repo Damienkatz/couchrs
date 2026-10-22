@@ -46,6 +46,9 @@ const CFS: &[(&str, bool)] = &[(CF_ID, false), (CF_SEQ, false), (CF_LOCAL, false
 const HEADER_KEY: &[u8] = b"header";
 /// The database's properties ({"partitioned": true}), fixed at creation.
 const PROPS_KEY: &[u8] = b"props";
+/// When the database was created, in seconds (its instance_start_time,
+/// as a CouchDB shard's file name records it).
+const CREATED_KEY: &[u8] = b"created";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FdiVal {
@@ -101,6 +104,8 @@ pub struct Snapshot {
     pub name: String,
     pub header: Header,
     pub props: Arc<Value>,
+    /// instance_start_time.
+    pub created: Arc<str>,
     view: Arc<View>,
 }
 
@@ -232,6 +237,7 @@ impl Snapshot {
         let store = self.view.store();
         let meta: u64 = [CF_ID, CF_SEQ, CF_LOCAL].iter().map(|cf| store.prop(cf, "rocksdb.estimate-live-data-size")).sum();
         json!({
+            "instance_start_time": &*self.created,
             "db_name": self.name,
             "purge_seq": self.seq_str(self.header.purge_seq),
             "update_seq": self.seq_str(self.header.update_seq),
@@ -241,8 +247,7 @@ impl Snapshot {
             "doc_count": self.header.doc_count,
             "disk_format_version": 8,
             "compact_running": compacting,
-            "cluster": {"q": 1, "n": 1, "w": 1, "r": 1},
-            "instance_start_time": "0"
+            "cluster": {"q": 1, "n": 1, "w": 1, "r": 1}
         })
     }
 
@@ -667,11 +672,27 @@ impl Db {
             }
         };
         let props = Arc::new(props);
+        let created: Arc<str> = match store.db.get_cf(&store.cf(CF_META), CREATED_KEY).map_err(rerr)? {
+            Some(b) => String::from_utf8_lossy(&b).into(),
+            None if create => {
+                let t = crate::http::now_secs().to_string();
+                store.db.put_cf(&store.cf(CF_META), CREATED_KEY, t.as_bytes()).map_err(rerr)?;
+                t.into()
+            }
+            // Made before creation times were kept: when its files were.
+            None => std::fs::metadata(&generation)
+                .and_then(|m| m.created().or_else(|_| m.modified()))
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|| "0".into())
+                .into(),
+        };
         let view = View::new(store.clone());
         // Chunk ids are allocated before their doc commits; reusing one an
         // uncommitted upload took is harmless (it was never referenced).
         let next_ptr = next_id_after(&view, CF_BODY)?.max(next_id_after(&view, CF_ATT)?);
-        let snap = Snapshot { name: name.to_string(), header, props: props.clone(), view };
+        let snap = Snapshot { name: name.to_string(), header, props: props.clone(), created, view };
         let (tx, rx) = mpsc::channel();
         let (seq_tx, _) = watch::channel(snap.header.update_seq);
         let queued = Arc::new(AtomicU64::new(0));
@@ -994,8 +1015,11 @@ fn commit(db: &Db, mut batch: WriteBatch, header: Header) -> Result<()> {
     crate::stat!("fsync.count").inc();
     crate::stat!("couchdb.commits").inc();
     let seq = header.update_seq;
-    let props = db.state.read().props.clone();
-    *db.state.write() = Snapshot { name: db.name.clone(), header, props, view: View::new(db.store.clone()) };
+    let (props, created) = {
+        let st = db.state.read();
+        (st.props.clone(), st.created.clone())
+    };
+    *db.state.write() = Snapshot { name: db.name.clone(), header, props, created, view: View::new(db.store.clone()) };
     db.seq_tx.send_replace(seq);
     Ok(())
 }

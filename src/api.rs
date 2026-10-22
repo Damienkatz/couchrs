@@ -1728,7 +1728,9 @@ async fn purge(req: &Req, db: &Arc<Db>) -> Result<Response> {
     }
     let n = list.len() as i64;
     crate::stat!("couchdb.document_purges.total").add(n);
-    let r = db.purge(list).await?;
+    let mut r = db.purge(list).await?;
     crate::stat!("couchdb.document_purges.success").add(n);
+    // chttpd_db answers a null purge_seq (the cluster has no one seq).
+    r["purge_seq"] = Value::Null;
     Ok(json_response(StatusCode::CREATED, &r))
 }

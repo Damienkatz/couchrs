@@ -11,7 +11,7 @@ mod idx;
 mod opts;
 mod selector;
 
-pub use selector::{Selector, get_field, normalize_selector};
+pub use selector::{Selector, cmp_raw, get_field, normalize_selector};
 
 use crate::api::{blocking, require_json_ctype};
 use crate::db::Db;
