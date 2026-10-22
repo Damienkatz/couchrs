@@ -26,6 +26,11 @@ pub struct Endpoint {
     pub retries: u64,
     pub proxy: Option<String>,
     pub tls: Tls,
+    /// Log in at _session and use its cookie (couch_replicator_auth_session
+    /// first in [replicator] auth_plugins).
+    pub session_auth: bool,
+    /// Seconds between session refreshes when the cookie has no Max-Age.
+    pub session_refresh_secs: u64,
 }
 
 /// TLS settings for https endpoints ([replicator] verify_ssl_certificates,
@@ -328,6 +333,13 @@ fn parse_endpoint(v: &Value, proxy: &str, opts: &Options, server: &Server) -> Re
         retries: opts.retries,
         proxy: proxy_url,
         tls: tls_config(server),
+        session_auth: server
+            .config
+            .get_or("replicator", "auth_plugins", "couch_replicator_auth_session,couch_replicator_auth_noop")
+            .split(',')
+            .next()
+            .is_some_and(|p| p.trim() == "couch_replicator_auth_session"),
+        session_refresh_secs: server.config.get_int("replicator", "session_refresh_interval_sec", 550u64),
     })
 }
 
@@ -517,6 +529,8 @@ pub fn parse_without_id(doc: &Map<String, Value>, user_ctx: UserCtx, server: &Se
         retries: options.retries,
         proxy: None,
         tls: Tls::default(),
+        session_auth: false,
+        session_refresh_secs: 550,
     };
     let mut rep = Rep {
         id: (String::new(), String::new()),
@@ -832,6 +846,8 @@ mod tests {
             retries: 5,
             proxy: None,
             tls: Tls::default(),
+            session_auth: false,
+            session_refresh_secs: 550,
         };
         let id = |a: &str, b: &str| md5hex(&Term::List(vec![Term::Bin(b"6c5c5e7a1f0b4a3a9c2f0e1d2c3b4a59".to_vec()), v4_endpoint(&ep(a)), v4_endpoint(&ep(b))]));
         let _ = uuid;

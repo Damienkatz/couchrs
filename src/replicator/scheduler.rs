@@ -5,6 +5,12 @@
 //! ran least recently. A job that keeps crashing waits longer each time
 //! before it may run again (30 seconds, doubling, up to about 8 hours).
 //! A failed or finished job from _replicate is removed.
+//!
+//! Which jobs run is fair across replicator databases (and, for
+//! _replicate, users) by couch_replicator_share's measure: a job's
+//! priority grows with how long its database's jobs have run lately,
+//! divided by the database's `[replicator.shares]` squared (100 unless
+//! set), and the lowest priorities run first.
 
 use super::RepError;
 use super::job::{self, JobEnd, JobError, Live, Stats};
@@ -55,6 +61,93 @@ pub struct Scheduler {
     server: Weak<Server>,
     jobs: Mutex<BTreeMap<String, JobEntry>>,
     waiters: Mutex<HashMap<String, Vec<oneshot::Sender<Outcome>>>>,
+    share: Mutex<Share>,
+}
+
+/// couch_replicator_share's tables.
+#[derive(Default)]
+struct Share {
+    priorities: HashMap<String, i64>,
+    usage: HashMap<String, i64>,
+    charges: HashMap<String, i64>,
+    num_jobs: HashMap<String, i64>,
+}
+
+/// What a job's fair share is counted against: its replicator db, or the
+/// user who started it.
+fn share_key(rep: &Rep) -> String {
+    rep.db_name.clone().unwrap_or_else(|| rep.user_ctx.name.clone().unwrap_or_default())
+}
+
+impl Share {
+    fn shares(server: &Server, key: &str) -> i64 {
+        server.config.get_int("replicator.shares", key, 100i64).clamp(1, 1000)
+    }
+
+    fn coeff(server: &Server, key: &str, default: f64) -> f64 {
+        server.config.get("replicator", key).and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(default).clamp(0.0, 1.0)
+    }
+
+    fn added(&mut self, server: &Server, id: &str, rep: &Rep) {
+        *self.num_jobs.entry(share_key(rep)).or_default() += 1;
+        self.update_priority(server, id, rep);
+    }
+
+    fn removed(&mut self, id: &str, rep: &Rep) {
+        self.priorities.remove(id);
+        let key = share_key(rep);
+        if let Some(n) = self.num_jobs.get_mut(&key) {
+            *n -= 1;
+            if *n <= 0 {
+                self.num_jobs.remove(&key);
+            }
+        }
+    }
+
+    /// Charge a running job for its time running, up to an interval.
+    fn charge(&mut self, j: &JobEntry, interval_ms: u64) {
+        if j.running.is_none() {
+            return;
+        }
+        let ran = SystemTime::now().duration_since(Scheduler::last_started(j)).unwrap_or_default().as_micros() as i64;
+        *self.charges.entry(share_key(&j.rep)).or_default() += ran.clamp(0, interval_ms as i64 * 1000);
+    }
+
+    fn update_priority(&mut self, server: &Server, id: &str, rep: &Rep) {
+        let key = share_key(rep);
+        let shares = Self::shares(server, &key);
+        let p = (*self.usage.get(&key).unwrap_or(&0) as f64 * *self.num_jobs.get(&key).unwrap_or(&0) as f64) / (shares * shares) as f64;
+        *self.priorities.entry(id.to_string()).or_default() += p as i64;
+    }
+
+    fn decay(map: &mut HashMap<String, i64>, coeff: f64) {
+        for v in map.values_mut() {
+            *v = (*v as f64 * coeff) as i64;
+        }
+        map.retain(|_, v| *v > 0);
+    }
+
+    /// update/3, each reschedule: charge the running, roll charges into
+    /// usage, decay, and raise the running jobs' priorities.
+    fn update(&mut self, server: &Server, jobs: &BTreeMap<String, JobEntry>, interval_ms: u64) {
+        for j in jobs.values() {
+            self.charge(j, interval_ms);
+        }
+        Self::decay(&mut self.usage, Self::coeff(server, "usage_coeff", 0.5));
+        for (k, c) in std::mem::take(&mut self.charges) {
+            *self.usage.entry(k).or_default() += c;
+        }
+        Self::decay(&mut self.priorities, Self::coeff(server, "priority_coeff", 0.98));
+        for (id, j) in jobs {
+            if j.running.is_some() {
+                self.update_priority(server, id, &j.rep);
+            }
+        }
+    }
+
+    fn priority(&self, id: &str) -> i64 {
+        *self.priorities.get(id).unwrap_or(&0)
+    }
 }
 
 static SCHEDULER: OnceLock<Arc<Scheduler>> = OnceLock::new();
@@ -73,7 +166,14 @@ fn secs(t: SystemTime) -> u64 {
 
 pub fn start(server: &Arc<Server>) -> Arc<Scheduler> {
     let s = SCHEDULER
-        .get_or_init(|| Arc::new(Scheduler { server: Arc::downgrade(server), jobs: Mutex::new(BTreeMap::new()), waiters: Mutex::new(HashMap::new()) }))
+        .get_or_init(|| {
+            Arc::new(Scheduler {
+                server: Arc::downgrade(server),
+                jobs: Mutex::new(BTreeMap::new()),
+                waiters: Mutex::new(HashMap::new()),
+                share: Mutex::new(Share::default()),
+            })
+        })
         .clone();
     let s2 = s.clone();
     tokio::spawn(async move {
@@ -109,6 +209,10 @@ impl Scheduler {
         self.server.upgrade().map(|s| cfg(&s, "max_jobs", 500)).unwrap_or(500) as usize
     }
 
+    fn interval_ms(&self) -> u64 {
+        self.server.upgrade().map(|s| cfg(&s, "interval", 60_000)).unwrap_or(60_000)
+    }
+
     fn max_history(&self) -> usize {
         self.server.upgrade().map(|s| cfg(&s, "max_history", 20)).unwrap_or(20).max(1) as usize
     }
@@ -128,6 +232,9 @@ impl Scheduler {
             return rx;
         }
         self.remove_job_int(&id);
+        if let Some(server) = self.server.upgrade() {
+            self.share.lock().added(&server, &id, &rep);
+        }
         let entry = JobEntry { rep, running: None, history: vec![(Event::Added, SystemTime::now())], info: Value::Null };
         self.jobs.lock().insert(id.clone(), entry);
         crate::stat!("couch_replicator.jobs.adds").inc();
@@ -152,6 +259,9 @@ impl Scheduler {
     fn remove_job_int(&self, id: &str) -> bool {
         match self.jobs.lock().remove(id) {
             Some(j) => {
+                let mut share = self.share.lock();
+                share.charge(&j, self.interval_ms());
+                share.removed(id, &j.rep);
                 if let Some(r) = j.running {
                     let _ = r.stop.send(true);
                     crate::stat!("couch_replicator.jobs.stops").inc();
@@ -198,9 +308,13 @@ impl Scheduler {
     fn job_exited(self: &Arc<Self>, id: &str, pid: &str, r: Result<JobEnd, JobError>) {
         let mut jobs = self.jobs.lock();
         let current = jobs.get(id).is_some_and(|j| j.running.as_ref().is_some_and(|r| r.pid == pid));
+        if current && let Some(j) = jobs.get(id) {
+            self.share.lock().charge(j, self.interval_ms());
+        }
         let outcome = match r {
             Ok(JobEnd::Finished(h)) => {
                 if current && let Some(j) = jobs.remove(id) {
+                    self.share.lock().removed(id, &j.rep);
                     tracing::info!("couch_replicator_scheduler: Job {id} completed normally");
                     if let (Some(db), Some(doc)) = (&j.rep.db_name, &j.rep.doc_id) {
                         super::docs::completed(db.clone(), doc.clone(), j.rep.start_time, j.running.as_ref().map(|r| r.live.lock().info.clone()).unwrap_or(Value::Null));
@@ -214,7 +328,9 @@ impl Scheduler {
                     let transient = jobs.get(id).is_some_and(|j| j.rep.db_name.is_none());
                     if transient {
                         tracing::error!("couch_replicator_scheduler : Transient job {id} failed, removing. Error: {}", e.reason());
-                        jobs.remove(id);
+                        if let Some(j) = jobs.remove(id) {
+                            self.share.lock().removed(id, &j.rep);
+                        }
                     } else if let Some(j) = jobs.get_mut(id) {
                         j.info = j.running.take().map(|r| r.live.lock().info.clone()).unwrap_or(Value::Null);
                         self.push_history(j, Event::Crashed(e.reason()));
@@ -288,34 +404,40 @@ impl Scheduler {
         self.start_jobs(slots);
     }
 
-    /// Start up to `n` healthy waiting jobs, those that ran least recently
-    /// first.
+    /// Start up to `n` healthy waiting jobs: lowest priority, then those
+    /// that ran least recently, first.
     fn start_jobs(self: &Arc<Self>, n: usize) {
         if n == 0 {
             return;
         }
-        let mut pending: Vec<(SystemTime, String)> = {
+        let mut pending: Vec<(i64, SystemTime, String)> = {
             let jobs = self.jobs.lock();
-            jobs.iter().filter(|(_, j)| j.running.is_none() && self.healthy(j)).map(|(id, j)| (Self::last_started(j), id.clone())).collect()
+            let share = self.share.lock();
+            jobs.iter()
+                .filter(|(_, j)| j.running.is_none() && self.healthy(j))
+                .map(|(id, j)| (share.priority(id), Self::last_started(j), id.clone()))
+                .collect()
         };
         pending.sort();
-        for (_, id) in pending.into_iter().take(n) {
+        for (_, _, id) in pending.into_iter().take(n) {
             self.start_job(&id);
         }
     }
 
-    /// Stop up to `n` running jobs of a kind, those started longest ago
-    /// first.
+    /// Stop up to `n` running jobs of a kind: highest priority, then those
+    /// started longest ago, first.
     fn stop_jobs(&self, n: usize, continuous: bool) -> usize {
         let mut jobs = self.jobs.lock();
-        let mut running: Vec<(SystemTime, String)> = jobs
-            .iter()
-            .filter(|(_, j)| j.running.is_some() && j.rep.options.continuous == continuous)
-            .map(|(id, j)| (Self::last_started(j), id.clone()))
-            .collect();
+        let mut running: Vec<(i64, SystemTime, String)> = {
+            let share = self.share.lock();
+            jobs.iter()
+                .filter(|(_, j)| j.running.is_some() && j.rep.options.continuous == continuous)
+                .map(|(id, j)| (-share.priority(id), Self::last_started(j), id.clone()))
+                .collect()
+        };
         running.sort();
         let mut stopped = 0;
-        for (_, id) in running.into_iter().take(n) {
+        for (_, _, id) in running.into_iter().take(n) {
             if let Some(j) = jobs.get_mut(&id)
                 && let Some(r) = j.running.take()
             {
@@ -331,6 +453,10 @@ impl Scheduler {
 
     /// reschedule/1: trim to max_jobs, then rotate.
     fn reschedule(self: &Arc<Self>) {
+        if let Some(server) = self.server.upgrade() {
+            let jobs = self.jobs.lock();
+            self.share.lock().update(&server, &jobs, self.interval_ms());
+        }
         let max_jobs = self.max_jobs();
         let churn_max = self.server.upgrade().map(|s| cfg(&s, "max_churn", 20)).unwrap_or(20) as usize;
         let (_, running) = self.counts();

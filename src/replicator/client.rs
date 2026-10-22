@@ -51,6 +51,51 @@ pub struct Client {
     http: reqwest::Client,
     /// Seconds to wait before the next request after 429 responses.
     rate: parking_lot::Mutex<Duration>,
+    session: tokio::sync::Mutex<Session>,
+}
+
+/// Session cookie auth (couch_replicator_auth_session): log in at the
+/// server's /_session and send its AuthSession cookie, refreshing it
+/// before it expires and after auth failures; basic auth if the server
+/// has no sessions.
+#[derive(Default)]
+struct Session {
+    /// Not tried yet, in use, or given up on (basic auth instead).
+    state: SessionState,
+    cookie: String,
+    epoch: u64,
+    refreshed_at: u64,
+    next_refresh: u64,
+    require_valid_user: bool,
+}
+
+#[derive(Default, PartialEq, Clone, Copy)]
+enum SessionState {
+    #[default]
+    Untried,
+    Active,
+    Off,
+}
+
+const MIN_SESSION_UPDATE_SECS: u64 = 5;
+
+fn now_secs() -> u64 {
+    crate::http::now_secs()
+}
+
+/// The AuthSession cookie and its Max-Age, from Set-Cookie headers.
+fn auth_cookie(headers: &reqwest::header::HeaderMap) -> Option<(String, Option<u64>)> {
+    for v in headers.get_all(reqwest::header::SET_COOKIE) {
+        let v = v.to_str().ok()?;
+        let mut parts = v.split(';').map(str::trim);
+        let (k, val) = parts.next()?.split_once('=')?;
+        if !k.eq_ignore_ascii_case("AuthSession") {
+            continue;
+        }
+        let max_age = parts.filter_map(|p| p.split_once('=')).find(|(k, _)| k.eq_ignore_ascii_case("Max-Age")).and_then(|(_, v)| v.parse().ok());
+        return Some((val.to_string(), max_age));
+    }
+    None
 }
 
 /// A URL path segment for a doc id (couch_util:encode_doc_id/1): design
@@ -91,7 +136,115 @@ impl Client {
             b = b.identity(reqwest::Identity::from_pem(&pem).map_err(|e| RepError::Error(e.to_string()))?);
         }
         let http = b.build().map_err(|e| RepError::Error(e.to_string()))?;
-        Ok(Client { ep: ep.clone(), http, rate: parking_lot::Mutex::new(Duration::ZERO) })
+        let session = Session { state: if ep.session_auth && ep.basic.is_some() { SessionState::Untried } else { SessionState::Off }, ..Default::default() };
+        Ok(Client { ep: ep.clone(), http, rate: parking_lot::Mutex::new(Duration::ZERO), session: tokio::sync::Mutex::new(session) })
+    }
+
+    /// The server's /_session, resolved against the endpoint's URL.
+    fn session_url(&self) -> String {
+        match super::rep::parse_url(&self.ep.url) {
+            Some(u) => {
+                let host = if u.host.contains(':') { format!("[{}]", u.host) } else { u.host };
+                format!("{}://{host}:{}/_session", u.scheme, u.port)
+            }
+            None => format!("{}_session", self.ep.url),
+        }
+    }
+
+    /// Log in (refresh/1); false if the server can't do sessions.
+    async fn refresh_session(&self, s: &mut Session) -> bool {
+        let Some((user, pass)) = &self.ep.basic else { return false };
+        for attempt in 0..2 {
+            let body = form_urlencoded::Serializer::new(String::new()).append_pair("name", user).append_pair("password", pass).finish();
+            let mut r = self
+                .http
+                .post(self.session_url())
+                .header("User-Agent", super::rep::user_agent())
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body);
+            if s.require_valid_user {
+                r = r.basic_auth(user, Some(pass));
+            }
+            let Ok(resp) = r.send().await else { return false };
+            match resp.status().as_u16() {
+                200 => match auth_cookie(resp.headers()) {
+                    Some((c, max_age)) => {
+                        self.update_cookie(s, c, max_age);
+                        return true;
+                    }
+                    None => return false,
+                },
+                // A server requiring valid users wants basic auth to log in.
+                401 if attempt == 0 && resp.headers().contains_key(reqwest::header::WWW_AUTHENTICATE) => s.require_valid_user = true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn update_cookie(&self, s: &mut Session, cookie: String, max_age: Option<u64>) {
+        if cookie == s.cookie {
+            return;
+        }
+        let now = now_secs();
+        s.cookie = cookie;
+        s.epoch += 1;
+        s.refreshed_at = now;
+        s.state = SessionState::Active;
+        let next = match max_age {
+            Some(a) => now + a * 9 / 10,
+            None => now + self.ep.session_refresh_secs,
+        };
+        s.next_refresh = if s.next_refresh == 0 { next } else { s.next_refresh.min(next) };
+    }
+
+    /// The cookie to send (logging in or refreshing first if due), and
+    /// its epoch; None for basic auth.
+    async fn session_cookie(&self) -> Option<(String, u64)> {
+        let mut s = self.session.lock().await;
+        match s.state {
+            SessionState::Off => return None,
+            SessionState::Untried => {
+                if !self.refresh_session(&mut s).await {
+                    s.state = SessionState::Off;
+                    return None;
+                }
+            }
+            SessionState::Active if now_secs() >= s.next_refresh => {
+                s.next_refresh = u64::MAX;
+                self.refresh_session(&mut s).await;
+            }
+            SessionState::Active => {}
+        }
+        Some((s.cookie.clone(), s.epoch))
+    }
+
+    /// After a response: pick up a renewed cookie, and on 401/403 decide
+    /// whether to log in again and retry (process_response/4).
+    async fn session_response(&self, epoch: u64, resp: &reqwest::Response) -> bool {
+        let mut s = self.session.lock().await;
+        if s.state != SessionState::Active {
+            return false;
+        }
+        let code = resp.status().as_u16();
+        if code == 401 || code == 403 {
+            if s.epoch > epoch {
+                return true;
+            }
+            let now = now_secs();
+            if now.saturating_sub(s.refreshed_at) < MIN_SESSION_UPDATE_SECS {
+                s.next_refresh = s.next_refresh.min(now + MIN_SESSION_UPDATE_SECS);
+                return false;
+            }
+            s.next_refresh = now;
+            return true;
+        }
+        if (200..300).contains(&code)
+            && let Some((c, max_age)) = auth_cookie(resp.headers())
+        {
+            self.update_cookie(&mut s, c, max_age);
+        }
+        false
     }
 
     /// full_url/2: the base, a path, and quoted query arguments.
@@ -106,7 +259,7 @@ impl Client {
         u
     }
 
-    fn request(&self, method: &Method, url: &str, headers: &[(&str, String)], body: Option<&Bytes>) -> reqwest::RequestBuilder {
+    fn request(&self, method: &Method, url: &str, headers: &[(&str, String)], body: Option<&Bytes>, cookie: Option<&str>) -> reqwest::RequestBuilder {
         let mut r = self.http.request(method.clone(), url);
         for (k, v) in &self.ep.headers {
             if !v.is_empty() && !headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(k)) {
@@ -116,8 +269,10 @@ impl Client {
         for (k, v) in headers {
             r = r.header(*k, v.as_str());
         }
-        if let Some((u, p)) = &self.ep.basic {
-            r = r.basic_auth(u, Some(p));
+        match (cookie, &self.ep.basic) {
+            (Some(c), _) => r = r.header("Cookie", format!("AuthSession={c}")),
+            (None, Some((u, p))) => r = r.basic_auth(u, Some(p)),
+            (None, None) => {}
         }
         if let Some(b) = body {
             r = r.body(b.clone());
@@ -158,6 +313,7 @@ impl Client {
         let mut retries = retries.unwrap_or(self.ep.retries);
         let mut wait = Duration::from_millis(250);
         let mut first_error: Option<Instant> = None;
+        let mut session_retried = false;
         loop {
             crate::stat!("couch_replicator.requests").inc();
             let delay = *self.rate.lock();
@@ -165,7 +321,17 @@ impl Client {
                 tokio::time::sleep(delay).await;
             }
             let fail = |error: String, code: Option<u16>| HttpFail { method: method.to_string(), url: url_strip_password(&url), error, code };
-            let err = match self.request(&method, &url, headers, body.as_ref()).send().await {
+            let session = self.session_cookie().await;
+            let sent = self.request(&method, &url, headers, body.as_ref(), session.as_ref().map(|(c, _)| c.as_str())).send().await;
+            if let (Ok(r), Some((_, epoch))) = (&sent, &session)
+                && self.session_response(*epoch, r).await
+                && !session_retried
+            {
+                // Logged in again: the same request, once, with the new cookie.
+                session_retried = true;
+                continue;
+            }
+            let err = match sent {
                 Ok(r) if r.status().as_u16() == 429 => {
                     let mut d = self.rate.lock();
                     *d = (*d * 2).clamp(Duration::from_millis(25), Duration::from_secs(25));
