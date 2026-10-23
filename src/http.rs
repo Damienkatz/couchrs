@@ -50,6 +50,11 @@ pub fn url_encode(s: &str) -> String {
     out
 }
 
+/// A multipart Content-Type's boundary parameter, unquoted.
+pub fn multipart_boundary(ct: &str) -> Option<String> {
+    ct.split(';').filter_map(|p| p.trim().strip_prefix("boundary=")).next().map(|b| b.trim_matches('"').to_string())
+}
+
 /// chttpd:absolute_uri/2: a path on this server as the client reached it,
 /// through a proxy's X-Forwarded-Host and -Ssl or -Proto if there's one.
 pub fn absolute_uri(req: &Req, path: &str) -> String {

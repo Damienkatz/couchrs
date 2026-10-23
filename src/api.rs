@@ -750,16 +750,18 @@ enum Piece {
 /// An attachment's part headers in a multipart document
 /// (couch_httpd_multipart), the bytes sent as stored.
 fn att_part_headers(name: &str, att: &AttInfo) -> String {
-    let enc = match &att.encoding {
+    mp_att_headers(name, &att.content_type, att.encoded_length, att.encoding.as_deref())
+}
+
+/// The headers ahead of an attachment's `len` bytes in a multipart
+/// document (couch_httpd_multipart:atts_to_mp/4), after the boundary:
+/// the name as it is, since readers go by position.
+pub fn mp_att_headers(name: &str, content_type: &str, len: u64, encoding: Option<&str>) -> String {
+    let enc = match encoding {
         Some(e) => format!("Content-Encoding: {e}\r\n"),
         None => String::new(),
     };
-    format!(
-        "\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Type: {}\r\nContent-Length: {}\r\n{enc}\r\n",
-        name.replace('"', "\\\""),
-        att.content_type,
-        att.encoded_length
-    )
+    format!("\r\nContent-Disposition: attachment; filename=\"{name}\"\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n{enc}\r\n")
 }
 
 /// A document with its attachments as multipart/related
@@ -828,17 +830,13 @@ fn stream_pieces(snap: Snapshot, pieces: Vec<Piece>) -> Body {
     Body::from_stream(stream)
 }
 
-/// Parse a multipart/related document upload: JSON first, then one part
-/// per attachment marked `"follows": true`, in order.
+/// Parse a multipart/related document upload: JSON first, then the
+/// bodies of its attachments marked `"follows": true`, one part each in
+/// their order, each as long as the JSON says (part headers are ignored,
+/// as couch_httpd_multipart does).
 async fn parse_multipart_doc(req: &Req) -> Result<Doc> {
-    let ct = req.content_type();
     // multer's parse_boundary only accepts multipart/form-data.
-    let boundary = ct
-        .split(';')
-        .filter_map(|p| p.trim().strip_prefix("boundary="))
-        .next()
-        .map(|b| b.trim_matches('"').to_string())
-        .ok_or_else(|| CouchError::bad_request("multipart boundary missing"))?;
+    let boundary = crate::http::multipart_boundary(req.content_type()).ok_or_else(|| CouchError::bad_request("multipart boundary missing"))?;
     let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(req.body.clone())));
     let mut mp = multer::Multipart::new(stream, boundary);
     let first = mp
@@ -848,36 +846,21 @@ async fn parse_multipart_doc(req: &Req) -> Result<Doc> {
         .ok_or_else(|| CouchError::bad_request("empty multipart body"))?;
     let json_bytes = first.bytes().await.map_err(|e| CouchError::bad_request(e.to_string()))?;
     let mut doc = from_json(crate::json::parse(&json_bytes).ok_or_else(|| CouchError::bad_request("invalid UTF-8 JSON"))?)?;
-    let mut parts: Vec<(Option<String>, bytes::Bytes)> = Vec::new();
-    while let Some(f) = mp.next_field().await.map_err(|e| CouchError::bad_request(e.to_string()))? {
-        let name = f.file_name().map(String::from);
-        let data = f.bytes().await.map_err(|e| CouchError::bad_request(e.to_string()))?;
-        parts.push((name, data));
-    }
-    let mut it = parts.into_iter();
-    let mut pending: Vec<(Option<String>, bytes::Bytes)> = Vec::new();
     for a in doc.atts.iter_mut().filter(|a| matches!(a.data, AttData::Follows)) {
-        let p = match pending.iter().position(|(n, _)| n.as_deref() == Some(a.name.as_str())) {
-            Some(i) => pending.remove(i),
-            None => loop {
-                match it.next() {
-                    Some((n, d)) if n.is_none() || n.as_deref() == Some(a.name.as_str()) => break (n, d),
-                    Some(other) => pending.push(other),
-                    None => {
-                        return Err(CouchError::bad_request(format!(
-                            "attachment {} data missing from multipart body",
-                            a.name
-                        )));
-                    }
-                }
-            },
+        let bytes = match mp.next_field().await.map_err(|e| CouchError::bad_request(e.to_string()))? {
+            Some(f) => f.bytes().await.map_err(|e| CouchError::bad_request(e.to_string()))?,
+            None => bytes::Bytes::new(),
         };
-        let bytes = p.1;
+        // write_streamed_attachment/3's checks.
+        match (bytes.len() as u64).cmp(&a.encoded_length) {
+            std::cmp::Ordering::Greater => return Err(CouchError::bad_request("attachment longer than expected")),
+            std::cmp::Ordering::Less => return Err(CouchError::bad_request("attachment shorter than expected")),
+            std::cmp::Ordering::Equal => {}
+        }
         if a.encoding.is_none() {
             a.length = bytes.len() as u64;
             a.md5 = Md5::digest(&bytes).to_vec();
         }
-        a.encoded_length = bytes.len() as u64;
         a.data = AttData::Bytes(bytes);
     }
     Ok(doc)
@@ -1686,7 +1669,10 @@ async fn bulk_get(req: &Req, db: &Arc<Db>) -> Result<Response> {
             continue;
         }
         let mut opts = base.clone();
-        if let Some(Value::Array(a)) = d.get("atts_since") {
+        // bulk_get_parse_atts_since/3: an empty list asks for nothing.
+        if let Some(Value::Array(a)) = d.get("atts_since")
+            && !a.is_empty()
+        {
             opts.atts_since = Some(a.iter().filter_map(|r| r.as_str().and_then(|s| parse_rev(s).ok())).collect());
         }
         let spec = match d.get("rev").and_then(|r| r.as_str()) {
