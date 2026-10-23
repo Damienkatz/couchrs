@@ -534,6 +534,42 @@ def validate_doc_update():
 
 
 @test
+def validate_doc_update_inputs():
+    # The docs a validation function gets, as CouchDB renders them: newDoc
+    # with _revisions, _deleted after the body and attachment stubs (an
+    # existing one as it is on disk), oldDoc with up to 20 revisions.
+    db = new_db()
+    eq(req("PUT", f"/{db}/_design/v", {"validate_doc_update": "function(n, o) { if (n.probe || (n._deleted && n.probe_del !== false) || "
+       "(n._attachments && n._attachments['new.txt'])) throw({forbidden: JSON.stringify({n: n, o: o})}); }"})[0], 201)
+    def seen(method, path, body=None, **kw):
+        s, b, _ = req(method, path, body, **kw)
+        assert s == 403, (s, b)
+        return json.loads(b["reason"])
+    att = lambda s: {"content_type": "text/plain", "data": base64.b64encode(s).decode()}
+    rev = req("PUT", f"/{db}/a", {"v": 1, "_attachments": {"x.txt": att(b"xx")}})[1]["rev"]
+    disk = req("GET", f"/{db}/a")[1]["_attachments"]["x.txt"]
+    v = seen("PUT", f"/{db}/a", {"_rev": rev, "probe": True, "_attachments": {"x.txt": {"stub": True}, "y.txt": dict(att(b"yy"), revpos=9)}})
+    eq(list(v["n"]), ["_id", "_rev", "probe", "_revisions", "_attachments"])
+    eq(v["n"]["_revisions"], {"start": 1, "ids": [rev.split("-")[1]]})
+    eq(v["n"]["_attachments"], {"x.txt": disk, "y.txt": {"content_type": "text/plain", "revpos": 9, "length": 2, "stub": True}})
+    eq(list(v["o"]), ["_id", "_rev", "v", "_revisions", "_attachments"])
+    v = seen("PUT", f"/{db}/a", {"_rev": rev, "_deleted": True, "why": "gone"})
+    eq(list(v["n"]), ["_id", "_rev", "why", "_deleted", "_revisions"])
+    # An upload's length isn't known yet.
+    v = seen("PUT", f"/{db}/a/new.txt?rev={rev}", b"new", headers={"Content-Type": "text/plain"})
+    eq(v["n"]["_attachments"]["new.txt"], {"content_type": "text/plain", "revpos": 0, "length": "undefined", "stub": True})
+    r = rev
+    for i in range(24):
+        r = req("PUT", f"/{db}/a", {"_rev": r, "v": i})[1]["rev"]
+    eq(len(seen("PUT", f"/{db}/a", {"_rev": r, "probe": True})["o"]["_revisions"]["ids"]), 20)
+    # A write that conflicts isn't validated.
+    eq(req("PUT", f"/{db}/a", {"probe": True})[0], 409)
+    # A replicated write's error names its revision.
+    s, b, _ = req("POST", f"/{db}/_bulk_docs", {"new_edits": False, "docs": [{"_id": "b", "_rev": "1-abc", "probe": True}]})
+    eq((b[0]["id"], b[0]["rev"], b[0]["error"]), ("b", "1-abc", "forbidden"))
+
+
+@test
 def mango():
     db = new_db()
     try:

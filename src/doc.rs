@@ -262,6 +262,17 @@ pub struct Att {
     /// Stored (deflated) bytes once written; 0 until then.
     pub stored_length: u64,
     pub data: AttData,
+    /// What validate_doc_update sees of new data.
+    pub declared: Declared,
+}
+
+/// What couch_att knows of new attachment data before it is written, as
+/// validate_doc_update sees it: inline base64 has its length but no
+/// digest, a multipart part what its JSON declared, an upload neither.
+#[derive(Clone, Debug, Default)]
+pub struct Declared {
+    pub md5: Option<Vec<u8>>,
+    pub length: Option<u64>,
 }
 
 impl Att {
@@ -276,6 +287,7 @@ impl Att {
             encoded_length: i.encoded_length,
             stored_length: i.stored_length,
             data: AttData::Stored(i.chunks.clone()),
+            declared: Declared::default(),
         }
     }
 }
@@ -472,14 +484,17 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
                 encoding,
                 stored_length: 0,
                 data: AttData::Stub,
+                declared: Declared::default(),
             });
         } else if a.get("follows").and_then(|s| s.as_bool()) == Some(true) {
-            let length = a.get("length").and_then(|l| l.as_u64()).unwrap_or(0);
+            let declared_length = a.get("length").and_then(|l| l.as_u64());
+            let length = declared_length.unwrap_or(0);
             atts.push(Att {
                 name: name.clone(),
                 content_type,
                 revpos,
                 length,
+                declared: Declared { md5: (!md5.is_empty()).then(|| md5.clone()), length: declared_length },
                 md5,
                 encoded_length: a.get("encoded_length").and_then(|l| l.as_u64()).unwrap_or(length),
                 encoding,
@@ -502,6 +517,7 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
                 encoding: None,
                 encoded_length: bytes.len() as u64,
                 stored_length: 0,
+                declared: Declared { md5: None, length: Some(bytes.len() as u64) },
                 data: AttData::Bytes(bytes::Bytes::from(bytes)),
             });
         } else {

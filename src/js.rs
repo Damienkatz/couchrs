@@ -737,31 +737,94 @@ fn vdu_funs(db: &Db, snap: &Snapshot) -> Result<Option<JsFuns>> {
     Ok(funs)
 }
 
-pub fn doc_to_vdu_json(d: &doc::Doc) -> Value {
+/// A doc as validate_doc_update gets it (couch_doc:to_json_obj(Doc,
+/// [revs])): _id, _rev, the body, _deleted, _revisions, then attachment
+/// stubs. A stub shows the attachment it stands for on the revision being
+/// extended (merge_stubs/2), new data what is known of it before it's
+/// written.
+pub fn doc_to_vdu_json(d: &doc::Doc, parent: &[doc::Att]) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("_id".into(), json!(d.id));
     if let Some(r) = d.rev() {
         m.insert("_rev".into(), json!(r));
     }
+    m.extend(d.body.clone());
     if d.deleted {
         m.insert("_deleted".into(), json!(true));
     }
-    m.extend(d.body.clone());
+    if !d.revs.1.is_empty() {
+        m.insert("_revisions".into(), json!({"start": d.revs.0, "ids": d.revs.1}));
+    }
     if !d.atts.is_empty() {
+        let digest = |md5: &[u8]| format!("md5-{}", base64::Engine::encode(&doc::B64, md5));
         let atts: serde_json::Map<String, Value> = d
             .atts
             .iter()
             .map(|a| {
-                (
-                    a.name.clone(),
-                    json!({"content_type": a.content_type, "length": a.length, "stub": true,
-                           "digest": format!("md5-{}", base64::Engine::encode(&doc::B64, &a.md5))}),
-                )
+                let on_disk = match a.data {
+                    doc::AttData::Stub => parent.iter().find(|p| p.name == a.name),
+                    doc::AttData::Stored(_) => Some(a),
+                    _ => None,
+                };
+                let mut j = serde_json::Map::new();
+                match on_disk {
+                    Some(p) => {
+                        j.insert("content_type".into(), json!(p.content_type));
+                        j.insert("revpos".into(), json!(p.revpos.unwrap_or(0)));
+                        if !p.md5.is_empty() {
+                            j.insert("digest".into(), json!(digest(&p.md5)));
+                        }
+                        j.insert("length".into(), json!(p.length));
+                    }
+                    None => {
+                        let (md5, length) = match a.data {
+                            doc::AttData::Stub => ((!a.md5.is_empty()).then_some(&a.md5), Some(a.length)),
+                            _ => (a.declared.md5.as_ref(), a.declared.length),
+                        };
+                        j.insert("content_type".into(), json!(a.content_type));
+                        j.insert("revpos".into(), json!(a.revpos.unwrap_or(0)));
+                        if let Some(md5) = md5 {
+                            j.insert("digest".into(), json!(digest(md5)));
+                        }
+                        // An upload's length isn't known yet: jiffy writes
+                        // the atom.
+                        j.insert("length".into(), length.map(|l| json!(l)).unwrap_or(json!("undefined")));
+                    }
+                }
+                j.insert("stub".into(), json!(true));
+                (a.name.clone(), Value::Object(j))
             })
             .collect();
         m.insert("_attachments".into(), Value::Object(atts));
     }
     Value::Object(m)
+}
+
+/// The revision validate_doc_update compares a write with, as couch_db
+/// finds it: for an edit the leaf it extends (none for a new doc, or one
+/// re-created over a deletion); for a replicated write the nearest
+/// ancestor on disk (make_first_doc_on_disk/4). None when CouchDB doesn't
+/// validate: an edit that conflicts, a replicated revision already there.
+fn vdu_parent(fdi: &doc::FullDocInfo, d: &doc::Doc, new_edits: bool) -> Option<Option<doc::RevInfo>> {
+    let (pos, ids) = (d.revs.0, &d.revs.1);
+    if new_edits {
+        return match ids.first() {
+            None if fdi.winner().deleted => Some(None),
+            None => None,
+            Some(id) => fdi.sorted_leafs().into_iter().find(|l| l.pos == pos && &l.id == id).map(Some),
+        };
+    }
+    let id = ids.first()?;
+    if crate::keytree::contains(&fdi.tree, pos, id) {
+        return None;
+    }
+    // The first ancestor the tree has, then on down its path.
+    let known = ids.iter().enumerate().skip(1).find_map(|(i, a)| Snapshot::find_rev(fdi, pos.checked_sub(i as u64)?, a))?;
+    let found = known.path.iter().enumerate().find_map(|(k, a)| {
+        let r = Snapshot::find_rev(fdi, known.pos.checked_sub(k as u64)?, a)?;
+        r.val.leaf().is_some().then_some(r)
+    });
+    Some(found)
 }
 
 /// Whether any design doc has a validate_doc_update function (cached).
@@ -775,9 +838,10 @@ pub fn validate_docs(
     db: &Db,
     snap: &Snapshot,
     docs: &mut [doc::Doc],
-    _new_edits: bool,
+    new_edits: bool,
     user_ctx: &Value,
     skip: &[bool],
+    revs_limit: usize,
 ) -> Result<Vec<Option<CouchError>>> {
     let mut out = vec![None; docs.len()];
     let Some(funs) = vdu_funs(db, snap)? else {
@@ -789,24 +853,23 @@ pub fn validate_docs(
         if d.is_local() || d.is_design() || skip.get(i).copied().unwrap_or(false) {
             continue;
         }
-        let old = match snap.get_fdi(&d.id)? {
-            Some(f) => {
-                let w = f.winner();
-                if w.deleted && d.revs.1.is_empty() {
-                    Value::Null
-                } else {
-                    let target = d
-                        .revs
-                        .1
-                        .first()
-                        .and_then(|id| Snapshot::find_rev(&f, d.revs.0, id))
-                        .unwrap_or(w);
-                    snap.doc_json(&f, &target, &DocOpts::default()).unwrap_or(Value::Null)
+        let (old, parent_atts) = match snap.get_fdi(&d.id)? {
+            None => (Value::Null, Vec::new()),
+            Some(f) => match vdu_parent(&f, d, new_edits) {
+                // Not validated: it conflicts, or is already there.
+                None => continue,
+                Some(None) => (Value::Null, Vec::new()),
+                Some(Some(r)) => {
+                    // json_doc/1: revs, up to [query_server_config] revs_limit.
+                    let mut old = snap.doc_json(&f, &r, &DocOpts { revs: true, ..Default::default() })?;
+                    if let Some(Value::Array(ids)) = old.get_mut("_revisions").and_then(|v| v.get_mut("ids")) {
+                        ids.truncate(revs_limit);
+                    }
+                    (old, snap.load_doc(&f, &r)?.atts)
                 }
-            }
-            None => Value::Null,
+            },
         };
-        let new = doc_to_vdu_json(d);
+        let new = doc_to_vdu_json(d, &parent_atts);
         let t = Instant::now();
         for fi in 0..n {
             let r = funs.validate(fi, &new, &old, &user_ctx, &sec)?;

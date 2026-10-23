@@ -270,7 +270,7 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
             // Design documents must describe valid indexes (couch_mrview
             // validate), including the partitioned option.
             if e.is_none() && !d.deleted && !d.id.starts_with("_design/_") {
-                *e = crate::views::validate_ddoc(&crate::js::doc_to_vdu_json(d), snap.partitioned()).err();
+                *e = crate::views::validate_ddoc(&crate::js::doc_to_vdu_json(d, &[]), snap.partitioned()).err();
             }
         } else if users_db {
             *e = crate::auth::before_users_doc_update(config, user, &sec, &mut d.body, &d.id).err();
@@ -286,7 +286,9 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
     let ctx = user.json(&db.name);
     let mut pre = if crate::js::has_validators(db, &snap)? {
         let skip: Vec<bool> = early.iter().map(|e| e.is_some()).collect();
-        blocking(|| crate::js::validate_docs(db, &snap, &mut docs, new_edits, &ctx, &skip))?
+        // json_doc/1 sends the disk doc's revs up to this many.
+        let revs_limit = config.get_int("query_server_config", "revs_limit", 20u64) as usize;
+        blocking(|| crate::js::validate_docs(db, &snap, &mut docs, new_edits, &ctx, &skip, revs_limit))?
     } else {
         vec![None; docs.len()]
     };
@@ -1055,6 +1057,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                     encoding,
                     encoded_length: data.len() as u64,
                     stored_length: 0,
+                    declared: crate::doc::Declared { md5: None, length: None },
                     data: AttData::Bytes(data),
                 });
             } else {
@@ -1649,17 +1652,21 @@ async fn bulk_docs(req: &Req, db: &Arc<Db>) -> Result<Response> {
         validate_docid(&doc.id)?;
         parsed.push(doc);
     }
-    let ids: Vec<String> = parsed.iter().map(|d| d.id.clone()).collect();
+    let ids: Vec<(String, Option<String>)> = parsed.iter().map(|d| (d.id.clone(), d.rev())).collect();
     let results = save_docs(req, db, parsed, new_edits).await?;
     let mut out = Vec::new();
-    for (id, r) in ids.into_iter().zip(results) {
+    for ((id, doc_rev), r) in ids.into_iter().zip(results) {
         match r {
             Ok(rev) => {
                 if new_edits {
                     out.push(json!({"ok": true, "id": id, "rev": rev}));
                 }
             }
-            Err(e) => out.push(json!({"id": id, "error": e.error, "reason": e.reason})),
+            // A replicated write's error names its revision ({{Id, Rev}, Error}).
+            Err(e) => match doc_rev.filter(|_| !new_edits) {
+                Some(rev) => out.push(json!({"id": id, "rev": rev, "error": e.error, "reason": e.reason})),
+                None => out.push(json!({"id": id, "error": e.error, "reason": e.reason})),
+            },
         }
     }
     Ok(json_response(StatusCode::CREATED, &Value::Array(out)))
