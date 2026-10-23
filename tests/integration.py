@@ -663,6 +663,36 @@ def encoding_parity():
 
 
 @test
+def exact_numbers():
+    """Integers exact whatever their size, compared with floats by value
+    as Erlang does (not as doubles), in Mango and in view collation."""
+    db = new_db()
+    try:
+        big = 123456789012345678901234567890123456789
+        req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": "a", "n": 9007199254740993}, {"_id": "b", "n": 9007199254740992},
+                                                    {"_id": "c", "n": 1000000000000000000001}, {"_id": "d", "n": 0.30000000000000004},
+                                                    {"_id": "e", "n": big}]})
+        assert b'"n":123456789012345678901234567890123456789' in req("GET", f"/{db}/e", raw=True)[1]
+        def ids(sel):
+            return [d["_id"] for d in req("POST", f"/{db}/_find", {"selector": {"n": sel}, "fields": ["_id"]})[1]["docs"]]
+        eq(ids({"$gt": 9007199254740992.0}), ["a", "c", "e"])
+        eq(ids({"$eq": 9007199254740992.0}), ["b"])
+        eq(ids({"$gt": 1e21}), ["c", "e"])
+        eq(ids({"$lt": 1e21}), ["a", "b", "d"])
+        eq(ids({"$eq": big}), ["e"])
+        eq(ids({"$gt": 0.3, "$lt": 0.31}), ["d"])
+        # JS prints 1e21 as 1e+21, a float to jiffy; the integer key just
+        # above it is excluded.
+        req("PUT", f"/{db}/_design/v", {"views": {"k": {"map": "function(d) { if (d._id == 'a') { emit(1e21, 1); emit(2e21, 2); } }"}}})
+        rows = req("GET", f"/{db}/_design/v/_view/k?startkey=1000000000000000000001")[1]["rows"]
+        eq([r["value"] for r in rows], [2])
+        rows = req("GET", f"/{db}/_design/v/_view/k?key=1000000000000000000000")[1]["rows"]
+        eq([r["value"] for r in rows], [1])
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
 def compaction_preserves_data():
     db = new_db()
     for i in range(20):

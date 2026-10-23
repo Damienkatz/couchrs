@@ -42,7 +42,7 @@ pub struct Resp {
 
 impl Resp {
     pub fn json(&self) -> Value {
-        if self.body.is_empty() { Value::Null } else { serde_json::from_slice(&self.body).unwrap_or(Value::Null) }
+        if self.body.is_empty() { Value::Null } else { crate::json::parse(&self.body).unwrap_or(Value::Null) }
     }
 }
 

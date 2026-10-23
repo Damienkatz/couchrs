@@ -296,35 +296,79 @@ fn as_failure(v: &Value) -> Option<(String, String)> {
     Some((f.first()?.as_str()?.to_string(), f.get(1)?.as_str()?.to_string()))
 }
 
-fn int_of(n: &serde_json::Number) -> Option<i128> {
-    n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from))
+/// A number mid-reduction, kept native so a long _sum or _stats doesn't
+/// reparse and reformat its accumulator at each step.
+#[derive(Clone)]
+enum Num {
+    Int(i128),
+    Float(f64),
+    /// An integer beyond 128 bits, as written.
+    Big(serde_json::Number),
 }
 
-fn from_int(i: i128) -> Option<Value> {
-    i64::try_from(i).map(Value::from).or_else(|_| u64::try_from(i).map(Value::from)).ok()
-}
-
-/// Erlang arithmetic: integers stay integers.
-fn arith(a: &serde_json::Number, b: &serde_json::Number, op: fn(i128, i128) -> Option<i128>, fop: fn(f64, f64) -> f64) -> Result<Value> {
-    if let (Some(x), Some(y)) = (int_of(a), int_of(b))
-        && let Some(v) = op(x, y).and_then(from_int)
-    {
-        return Ok(v);
+impl Num {
+    fn of(n: &serde_json::Number) -> Num {
+        match crate::json::int128(n) {
+            Some(i) => Num::Int(i),
+            None if crate::json::is_integer(n) => Num::Big(n.clone()),
+            None => Num::Float(n.as_f64().unwrap_or(0.0)),
+        }
     }
-    serde_json::Number::from_f64(fop(a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0)))
-        .map(Value::Number)
-        .ok_or_else(|| CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, "unknown_error", "badarith"))
+
+    fn f64(&self) -> f64 {
+        match self {
+            Num::Int(i) => *i as f64,
+            Num::Float(f) => *f,
+            // Beyond doubles it's infinite, and so badarith, as in Erlang.
+            Num::Big(n) => n.as_str().parse().unwrap_or(0.0),
+        }
+    }
+
+    /// Erlang arithmetic: integers stay integers.
+    fn arith(&self, o: &Num, op: fn(i128, i128) -> Option<i128>, fop: fn(f64, f64) -> f64) -> Result<Num> {
+        if let (Num::Int(x), Num::Int(y)) = (self, o)
+            && let Some(v) = op(*x, *y)
+        {
+            return Ok(Num::Int(v));
+        }
+        let f = fop(self.f64(), o.f64());
+        if !f.is_finite() {
+            return Err(CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, "unknown_error", "badarith"));
+        }
+        Ok(Num::Float(f))
+    }
+
+    fn add(&self, o: &Num) -> Result<Num> {
+        self.arith(o, i128::checked_add, |x, y| x + y)
+    }
+
+    fn cmp(&self, o: &Num) -> Ordering {
+        // Integers this small are exact as doubles.
+        const EXACT: u128 = 1 << 53;
+        match (self, o) {
+            (Num::Int(x), Num::Int(y)) => x.cmp(y),
+            (Num::Float(x), Num::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+            (Num::Int(x), Num::Float(y)) if x.unsigned_abs() <= EXACT => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
+            (Num::Float(x), Num::Int(y)) if y.unsigned_abs() <= EXACT => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+            _ => crate::json::cmp_numbers(&self.number(), &o.number()),
+        }
+    }
+
+    fn number(&self) -> serde_json::Number {
+        match self {
+            Num::Int(i) => serde_json::Number::from_string_unchecked(i.to_string()),
+            Num::Float(f) => serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
+            Num::Big(n) => n.clone(),
+        }
+    }
+
+    fn value(&self) -> Value {
+        Value::Number(self.number())
+    }
 }
 
 fn add(a: &serde_json::Number, b: &serde_json::Number) -> Result<Value> {
-    arith(a, b, i128::checked_add, |x, y| x + y)
-}
-
-fn num_cmp(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
-    match (int_of(a), int_of(b)) {
-        (Some(x), Some(y)) => x.cmp(&y),
-        _ => a.as_f64().unwrap_or(0.0).partial_cmp(&b.as_f64().unwrap_or(0.0)).unwrap_or(Ordering::Equal),
-    }
+    Num::of(a).add(&Num::of(b)).map(|n| n.value())
 }
 
 /// Why a _sum stopped: an error object to return, or a crash.
@@ -359,7 +403,7 @@ fn sum_values(v: &Value, acc: &Value) -> std::result::Result<Value, SumStop> {
                 }
             }
             match acc {
-                Value::Number(n) if int_of(n) == Some(0) => Ok(v.clone()),
+                Value::Number(n) if crate::json::int128(n) == Some(0) => Ok(v.clone()),
                 Value::Object(acc_props) => sum_objects(props, acc_props),
                 other => Err(SumStop::Crash(format!("{{case_clause,{}}}", crate::mango::erl_w(other)), String::new())),
             }
@@ -418,19 +462,31 @@ fn sum_arrays(xs: &[Value], ys: &[Value]) -> std::result::Result<Value, SumStop>
 /// builtin_sum_rows/2: the values summed, or the error that stopped it.
 fn builtin_sum<'a>(vals: impl Iterator<Item = &'a Value>) -> Value {
     let mut acc = json!(0);
+    // A run of numbers is summed natively, `acc` being stale meanwhile.
+    let mut num = Some(Num::Int(0));
     for v in vals {
+        if let (Some(n), Value::Number(x)) = (&num, v) {
+            match n.add(&Num::of(x)) {
+                Ok(sum) => num = Some(sum),
+                Err(e) => return failure(&e.error, e.reason),
+            }
+            continue;
+        }
+        if let Some(n) = num.take() {
+            acc = n.value();
+        }
         acc = match sum_values(v, &acc) {
             Ok(a) => a,
             Err(SumStop::Value(e)) => return e,
             Err(SumStop::Crash(e, r)) => return failure(&e, r),
         };
     }
-    acc
+    num.map(|n| n.value()).unwrap_or(acc)
 }
 
 /// One _stats accumulator: sum, count, min, max and sum of squares.
 #[derive(Clone)]
-struct Stat([Value; 5]);
+struct Stat([Num; 5]);
 
 enum StatAcc {
     One(Box<Stat>),
@@ -444,8 +500,9 @@ fn invalid_value(reason: String) -> (String, String) {
 }
 
 fn stat_of(n: &serde_json::Number) -> StatResult<Stat> {
-    let sqr = arith(n, n, i128::checked_mul, |x, y| x * y).map_err(|e| (e.error, e.reason))?;
-    Ok(Stat([Value::Number(n.clone()), json!(1), Value::Number(n.clone()), Value::Number(n.clone()), sqr]))
+    let n = Num::of(n);
+    let sqr = n.arith(&n, i128::checked_mul, |x, y| x * y).map_err(|e| (e.error, e.reason))?;
+    Ok(Stat([n.clone(), Num::Int(1), n.clone(), n, sqr]))
 }
 
 /// An object's members as ~p shows a proplist.
@@ -456,10 +513,10 @@ fn proplist_p(o: &Map<String, Value>) -> String {
 
 /// unpack_stats/1: a pre-reduced {sum, count, min, max, sumsqr}.
 fn unpack_stats(o: &Map<String, Value>) -> StatResult<Stat> {
-    let mut out: [Value; 5] = Default::default();
+    let mut out: [Num; 5] = std::array::from_fn(|_| Num::Int(0));
     for (i, k) in ["sum", "count", "min", "max", "sumsqr"].iter().enumerate() {
         out[i] = match o.get(*k) {
-            Some(v @ Value::Number(_)) => v.clone(),
+            Some(Value::Number(n)) => Num::of(n),
             None => return Err(invalid_value(format!("user _stats input missing required field {k} ({})", proplist_p(o)))),
             Some(other) => {
                 return Err(invalid_value(format!("non-numeric _stats input received for {k}: {}", crate::mango::erl_w(other))));
@@ -498,21 +555,17 @@ fn stat_values(v: &Value, acc: StatAcc) -> StatResult<StatAcc> {
 }
 
 fn combine_stats(new: Stat, acc: Stat) -> StatResult<Stat> {
-    let n = |v: &Value| match v {
-        Value::Number(n) => n.clone(),
-        _ => serde_json::Number::from(0),
-    };
-    let sum = |i: usize| add(&n(&new.0[i]), &n(&acc.0[i])).map_err(|e| (e.error, e.reason));
+    let sum = |i: usize| new.0[i].add(&acc.0[i]).map_err(|e| (e.error, e.reason));
     // min/2 and max/2 give the first of equals.
-    let min = if num_cmp(&n(&new.0[2]), &n(&acc.0[2])) == Ordering::Greater { acc.0[2].clone() } else { new.0[2].clone() };
-    let max = if num_cmp(&n(&new.0[3]), &n(&acc.0[3])) == Ordering::Less { acc.0[3].clone() } else { new.0[3].clone() };
+    let min = if new.0[2].cmp(&acc.0[2]) == Ordering::Greater { acc.0[2].clone() } else { new.0[2].clone() };
+    let max = if new.0[3].cmp(&acc.0[3]) == Ordering::Less { acc.0[3].clone() } else { new.0[3].clone() };
     Ok(Stat([sum(0)?, sum(1)?, min, max, sum(4)?]))
 }
 
 fn pack_stats(a: StatAcc) -> Value {
     match a {
         StatAcc::One(stat) => {
-            let Stat([sum, count, min, max, sumsqr]) = *stat;
+            let [sum, count, min, max, sumsqr] = stat.0.each_ref().map(Num::value);
             json!({"sum": sum, "count": count, "min": min, "max": max, "sumsqr": sumsqr})
         }
         StatAcc::Many(l) => Value::Array(l.into_iter().map(pack_stats).collect()),
@@ -948,12 +1001,23 @@ type IdSorter = Sorter<(String, IdEntry), SortCmp<(String, IdEntry)>>;
 type Mapped = Vec<(String, Vec<Vec<(Json, VVal)>>, IdEntry)>;
 
 /// Hand a mapped batch to the external sorters.
+/// About how long a value's JSON is, without writing it.
+fn approx_len(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) => 5,
+        Value::Number(n) => n.as_str().len(),
+        Value::String(s) => s.len() + 2,
+        Value::Array(a) => a.iter().map(|x| approx_len(x) + 1).sum::<usize>() + 2,
+        Value::Object(o) => o.iter().map(|(k, x)| k.len() + 4 + approx_len(x)).sum::<usize>() + 2,
+    }
+}
+
 fn feed_sorters(mapped: Mapped, views: &mut [ViewSorter], ids: &mut IdSorter) -> std::io::Result<()> {
     for (id, per_view, entry) in mapped {
         for (vi, rows) in per_view.into_iter().enumerate() {
             for (k, val) in rows {
                 // Rough size for the memory budget; exactness doesn't matter.
-                let approx = 64 + id.len() + k.0.to_string().len();
+                let approx = 64 + id.len() + approx_len(&k.0);
                 views[vi].push(((k, IdBound::Id(id.clone())), val), approx)?;
             }
         }
@@ -1263,7 +1327,7 @@ impl Index {
             .map(|(i, t)| {
                 let spec = t.spec.clone();
                 let cmp: Cmp<(VKey, VVal)> = Box::new(move |a, b| spec.cmp(&a.0, &b.0));
-                Sorter::new(scratch(&format!("v{i}")), budget, cmp)
+                Sorter::new(scratch(&format!("v{i}")), budget, cmp).with_prefix(|kv| crate::collate::sort_prefix(&kv.0.0.0))
             })
             .collect();
         let id_cmp: Cmp<(String, IdEntry)> = Box::new(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));

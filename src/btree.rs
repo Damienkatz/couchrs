@@ -40,6 +40,13 @@ enum Node<K, V, R> {
     Kv(Vec<(K, V)>),
 }
 
+/// A node to write, borrowing its entries; encodes exactly as `Node`.
+#[derive(Serialize)]
+enum NodeRef<'a, K, V, R> {
+    Kp(&'a [(K, NodePtr<R>)]),
+    Kv(&'a [(K, V)]),
+}
+
 type NodeOf<S> = Node<<S as Spec>::K, <S as Spec>::V, <S as Spec>::R>;
 
 /// Small shared cache of decoded inner nodes, which are hot on every lookup.
@@ -260,29 +267,14 @@ impl<S: Spec> Btree<S> {
             None => Arc::new(Node::Kv(Vec::new())),
             Some(p) => self.read_node(p)?,
         };
+        // Leaves aren't cached, so one just read is ours to take apart.
+        let node = match Arc::try_unwrap(node) {
+            Ok(Node::Kv(entries)) => return self.modify_kv(entries, actions),
+            Ok(n) => Arc::new(n),
+            Err(shared) => shared,
+        };
         match &*node {
-            Node::Kv(entries) => {
-                let mut out: Vec<(S::K, S::V)> = Vec::with_capacity(entries.len() + actions.len());
-                let mut ei = entries.iter().peekable();
-                for a in actions {
-                    while let Some((k, _)) = ei.peek() {
-                        if self.spec.cmp(k, a.key()) == Ordering::Less {
-                            out.push(ei.next().unwrap().clone());
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Some((k, _)) = ei.peek()
-                        && self.spec.cmp(k, a.key()) == Ordering::Equal {
-                            ei.next();
-                        }
-                    if let Action::Insert(k, v) = a {
-                        out.push((k, v));
-                    }
-                }
-                out.extend(ei.cloned());
-                self.write_kv(out)
-            }
+            Node::Kv(entries) => self.modify_kv(entries.clone(), actions),
             Node::Kp(entries) => {
                 let mut out: Vec<(S::K, NodePtr<S::R>)> = Vec::with_capacity(entries.len() + 4);
                 let mut actions = actions.into_iter().peekable();
@@ -309,6 +301,29 @@ impl<S: Spec> Btree<S> {
                 }
             }
         }
+    }
+
+    fn modify_kv(&self, entries: Vec<(S::K, S::V)>, actions: Vec<Action<S::K, S::V>>) -> io::Result<Vec<(S::K, NodePtr<S::R>)>> {
+        let mut out: Vec<(S::K, S::V)> = Vec::with_capacity(entries.len() + actions.len());
+        let mut ei = entries.into_iter().peekable();
+        for a in actions {
+            while let Some((k, _)) = ei.peek() {
+                if self.spec.cmp(k, a.key()) == Ordering::Less {
+                    out.push(ei.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+            if let Some((k, _)) = ei.peek()
+                && self.spec.cmp(k, a.key()) == Ordering::Equal {
+                    ei.next();
+                }
+            if let Action::Insert(k, v) = a {
+                out.push((k, v));
+            }
+        }
+        out.extend(ei);
+        self.write_kv(out)
     }
 
     fn chunkify<T: Serialize>(items: &[T]) -> Vec<std::ops::Range<usize>> {
@@ -346,8 +361,7 @@ impl<S: Spec> Btree<S> {
         for r in ranges {
             let chunk = &kvs[r];
             let red = self.spec.reduce(chunk);
-            let node: NodeOf<S> = Node::Kv(chunk.to_vec());
-            payloads.push(crate::file::encode_term(&node));
+            payloads.push(crate::file::encode_term(&NodeRef::<S::K, S::V, S::R>::Kv(chunk)));
             meta.push((chunk.last().unwrap().0.clone(), red));
         }
         let ptrs = self.file.append_raw_many(&payloads)?;
@@ -370,8 +384,7 @@ impl<S: Spec> Btree<S> {
             let reds: Vec<S::R> = chunk.iter().map(|(_, p)| p.red.clone()).collect();
             let red = self.spec.rereduce(&reds);
             let child_size: u64 = chunk.iter().map(|(_, p)| p.size).sum();
-            let node: NodeOf<S> = Node::Kp(chunk.to_vec());
-            payloads.push(crate::file::encode_term(&node));
+            payloads.push(crate::file::encode_term(&NodeRef::<S::K, S::V, S::R>::Kp(chunk)));
             meta.push((chunk.last().unwrap().0.clone(), red, child_size));
         }
         let ptrs = self.file.append_raw_many(&payloads)?;
@@ -783,13 +796,12 @@ impl<S: Spec> Btree<S> {
 
 impl<S: Spec> BulkBuilder<S> {
     pub fn push(&mut self, k: S::K, v: S::V) -> io::Result<()> {
-        if let Some(last) = &self.last {
-            if self.tree.spec.cmp(last, &k) != Ordering::Less {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "bulk build keys out of order"));
-            }
+        if let Some(last) = self.leaf.last().map(|(k, _)| k).or(self.last.as_ref())
+            && self.tree.spec.cmp(last, &k) != Ordering::Less
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bulk build keys out of order"));
         }
         self.leaf_bytes += bincode::serialized_size(&(&k, &v)).unwrap_or(64) as usize;
-        self.last = Some(k.clone());
         self.leaf.push((k, v));
         if self.leaf_bytes >= BULK_FLUSH {
             self.flush_leaf()?;
@@ -798,6 +810,7 @@ impl<S: Spec> BulkBuilder<S> {
     }
 
     fn flush_leaf(&mut self) -> io::Result<()> {
+        self.last = self.leaf.last().map(|(k, _)| k.clone());
         let kvs = std::mem::take(&mut self.leaf);
         self.leaf_bytes = 0;
         for e in self.tree.write_kv(kvs)? {
@@ -886,6 +899,16 @@ mod tests {
         let p = std::env::temp_dir().join(format!("bt-{}", uuid::Uuid::new_v4()));
         let f = Arc::new(CouchFile::open(&p, true).unwrap());
         Btree::new(f, None, Arc::new(CountSpec))
+    }
+
+    #[test]
+    fn borrowed_nodes_encode_as_nodes() {
+        let kvs: Vec<(u64, u64)> = (0..300).map(|i| (i, i * 7)).collect();
+        let kps: Vec<(u64, NodePtr<u64>)> = (0..3).map(|i| (i, NodePtr { pos: i * 100, red: i, size: 9 })).collect();
+        let owned: Node<u64, u64, u64> = Node::Kv(kvs.clone());
+        assert_eq!(crate::file::encode_term(&owned), crate::file::encode_term(&NodeRef::<u64, u64, u64>::Kv(&kvs)));
+        let owned: Node<u64, u64, u64> = Node::Kp(kps.clone());
+        assert_eq!(crate::file::encode_term(&owned), crate::file::encode_term(&NodeRef::<u64, u64, u64>::Kp(&kps)));
     }
 
     #[test]

@@ -514,6 +514,8 @@ fn pack_bookmark(key: &Value, docid: &str) -> String {
 enum T {
     Atom(String),
     Int(i128),
+    /// An integer beyond 128 bits, in decimal.
+    Big(String),
     Float(f64),
     Bin(Vec<u8>),
     List(Vec<T>),
@@ -587,19 +589,38 @@ impl TermReader<'_> {
                 let n = self.u32()?;
                 T::Bin(self.take(n)?.to_vec())
             }
-            110 => {
-                let n = self.u8()? as usize;
+            tag @ (110 | 111) => {
+                let n = if tag == 110 { self.u8()? as usize } else { self.u32()? };
                 let sign = self.u8()?;
                 let digits = self.take(n)?;
-                if n > 15 {
-                    return None;
+                if n <= 15 {
+                    let mag = digits.iter().rev().fold(0i128, |acc, d| (acc << 8) | *d as i128);
+                    T::Int(if sign == 1 { -mag } else { mag })
+                } else {
+                    T::Big(format!("{}{}", if sign == 1 { "-" } else { "" }, decimal(digits)))
                 }
-                let mag = digits.iter().rev().fold(0i128, |acc, d| (acc << 8) | *d as i128);
-                T::Int(if sign == 1 { -mag } else { mag })
             }
             _ => return None,
         })
     }
+}
+
+/// A magnitude's bytes (least significant first) in decimal.
+fn decimal(le: &[u8]) -> String {
+    let mut dec: Vec<u8> = vec![0];
+    for b in le.iter().rev() {
+        let mut carry = *b as u32;
+        for d in dec.iter_mut() {
+            let x = *d as u32 * 256 + carry;
+            *d = (x % 10) as u8;
+            carry = x / 10;
+        }
+        while carry > 0 {
+            dec.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    dec.iter().rev().map(|d| (b'0' + d) as char).collect()
 }
 
 /// A key as JSON, the way jiffy would have decoded it.
@@ -609,7 +630,8 @@ fn term_json(t: &T) -> Option<Value> {
         T::Atom(a) if a == "true" => Value::Bool(true),
         T::Atom(a) if a == "false" => Value::Bool(false),
         T::Atom(_) => return None,
-        T::Int(i) => i64::try_from(*i).map(Value::from).or_else(|_| u64::try_from(*i).map(Value::from)).ok()?,
+        T::Int(i) => crate::json::from_int128(*i),
+        T::Big(s) => Value::Number(serde_json::Number::from_string_unchecked(s.clone())),
         T::Float(f) => Value::from(*f),
         T::Bin(b) => Value::String(String::from_utf8(b.clone()).ok()?),
         T::List(l) => Value::Array(l.iter().map(term_json).collect::<Option<_>>()?),

@@ -585,6 +585,9 @@ pub enum Term {
     Str(Vec<u8>),
     Bin(Vec<u8>),
     Int(i128),
+    /// An integer too big for Int: negative?, and its magnitude's bytes,
+    /// least significant first.
+    Big(bool, Vec<u8>),
     Float(f64),
     List(Vec<Term>),
     Tuple(Vec<Term>),
@@ -639,6 +642,17 @@ impl Term {
                 out.push(if *i < 0 { 1 } else { 0 });
                 out.extend_from_slice(&digits);
             }
+            Term::Big(neg, mag) => {
+                if mag.len() <= 255 {
+                    out.push(110);
+                    out.push(mag.len() as u8);
+                } else {
+                    out.push(111);
+                    out.extend_from_slice(&(mag.len() as u32).to_be_bytes());
+                }
+                out.push(*neg as u8);
+                out.extend_from_slice(mag);
+            }
             Term::Float(f) => {
                 out.push(70);
                 out.extend_from_slice(&f.to_bits().to_be_bytes());
@@ -684,6 +698,32 @@ impl Term {
     fn str(s: &str) -> Term {
         Term::Str(s.as_bytes().to_vec())
     }
+
+    /// An integer from its decimal digits (an optional "-", then digits).
+    pub fn integer(s: &str) -> Term {
+        let (neg, digits) = s.strip_prefix('-').map(|d| (true, d)).unwrap_or((false, s));
+        if let Ok(i) = s.parse::<i128>() {
+            return Term::Int(i);
+        }
+        // Base 10 to base 256 by repeated division.
+        let mut dec: Vec<u8> = digits.bytes().map(|b| b - b'0').collect();
+        let mut mag = Vec::new();
+        while !dec.is_empty() {
+            let mut rem = 0u32;
+            let mut next = Vec::with_capacity(dec.len());
+            for d in &dec {
+                let cur = rem * 10 + *d as u32;
+                let q = cur / 256;
+                rem = cur % 256;
+                if !next.is_empty() || q != 0 {
+                    next.push(q as u8);
+                }
+            }
+            mag.push(rem as u8);
+            dec = next;
+        }
+        Term::Big(neg, mag)
+    }
 }
 
 /// JSON as jiffy decodes it: objects {[{K, V}]}, strings binaries.
@@ -692,11 +732,8 @@ pub fn ejson(v: &Value) -> Term {
         Value::Null => Term::Atom("null"),
         Value::Bool(true) => Term::Atom("true"),
         Value::Bool(false) => Term::Atom("false"),
-        Value::Number(n) => match (n.as_i64(), n.as_u64()) {
-            (Some(i), _) => Term::Int(i as i128),
-            (None, Some(u)) => Term::Int(u as i128),
-            _ => Term::Float(n.as_f64().unwrap_or(0.0)),
-        },
+        Value::Number(n) if crate::json::is_integer(n) => Term::integer(n.as_str()),
+        Value::Number(n) => Term::Float(n.as_f64().unwrap_or(0.0)),
         Value::String(s) => Term::Bin(s.as_bytes().to_vec()),
         Value::Array(a) => Term::List(a.iter().map(ejson).collect()),
         Value::Object(o) => Term::Tuple(vec![Term::List(

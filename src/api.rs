@@ -820,7 +820,7 @@ async fn parse_multipart_doc(req: &Req) -> Result<Doc> {
         .map_err(|e| CouchError::bad_request(e.to_string()))?
         .ok_or_else(|| CouchError::bad_request("empty multipart body"))?;
     let json_bytes = first.bytes().await.map_err(|e| CouchError::bad_request(e.to_string()))?;
-    let mut doc = from_json(serde_json::from_slice(&json_bytes)?)?;
+    let mut doc = from_json(crate::json::parse(&json_bytes).ok_or_else(|| CouchError::bad_request("invalid UTF-8 JSON"))?)?;
     let mut parts: Vec<(Option<String>, bytes::Bytes)> = Vec::new();
     while let Some(f) = mp.next_field().await.map_err(|e| CouchError::bad_request(e.to_string()))? {
         let name = f.file_name().map(String::from);
@@ -1188,7 +1188,7 @@ impl QueryArgs {
         for (k, v) in &req.query {
             let jv = match k.as_str() {
                 "key" | "keys" | "startkey" | "start_key" | "endkey" | "end_key" => {
-                    serde_json::from_str(v).map_err(|_| qerr(format!("Invalid JSON for {k}: {v}")))?
+                    crate::json::parse(v.as_bytes()).ok_or_else(|| qerr(format!("Invalid JSON for {k}: {v}")))?
                 }
                 _ => Value::String(v.clone()),
             };

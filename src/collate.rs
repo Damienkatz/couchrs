@@ -28,6 +28,51 @@ fn type_rank(v: &Value) -> u8 {
     }
 }
 
+/// A value's leading collation bits (raw or not), as an extsort prefix:
+/// the type, then a number's value, or an array's first element's type and
+/// number value, numbers as the nearest double rounded down to the bits
+/// left; and when that pins the first element down exactly, its second
+/// element's likewise.
+pub fn sort_prefix(v: &Value) -> crate::extsort::Prefix {
+    let rank = (type_rank(v) as u64) << 61;
+    match v {
+        Value::Number(n) => (rank | num_bits(n) >> 3, None),
+        Value::Array(a) => match a.first() {
+            None => (rank, None),
+            Some(x) => {
+                let (bits, exact) = elem_bits(x);
+                (rank | bits, exact.then(|| a.get(1).map_or(0, |y| elem_bits(y).0)))
+            }
+        },
+        _ => (rank, None),
+    }
+}
+
+/// An array element's type and number value in 61 bits (0 for none), and
+/// whether they pin it down exactly: null, a boolean, or an integer whose
+/// double loses nothing to the rounding.
+fn elem_bits(x: &Value) -> (u64, bool) {
+    let rank = (type_rank(x) as u64 + 1) << 58;
+    match x {
+        Value::Null | Value::Bool(_) => (rank, true),
+        Value::Number(n) => {
+            let exact = n.as_str().len() <= 15
+                && crate::json::is_integer(n)
+                && n.as_str().parse::<f64>().is_ok_and(|f| f.to_bits() & 63 == 0);
+            (rank | num_bits(n) >> 6, exact)
+        }
+        _ => (rank, false),
+    }
+}
+
+/// A number's nearest double as a u64 in the same order. Rounding to
+/// nearest never reorders two numbers, only ties them.
+fn num_bits(n: &serde_json::Number) -> u64 {
+    let f: f64 = n.as_str().parse().unwrap_or(0.0);
+    let b = if f == 0.0 { 0 } else { f.to_bits() };
+    if b >> 63 == 1 { !b } else { b | 1 << 63 }
+}
+
 pub fn cmp_str(a: &str, b: &str) -> Ordering {
     if a == b {
         return Ordering::Equal;
@@ -36,13 +81,9 @@ pub fn cmp_str(a: &str, b: &str) -> Ordering {
     collator().compare(a, b)
 }
 
+/// By value, as couch_ejson_compare's enif_compare: integers exactly.
 pub fn cmp_num(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
-    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
-        return x.cmp(&y);
-    }
-    let x = a.as_f64().unwrap_or(0.0);
-    let y = b.as_f64().unwrap_or(0.0);
-    x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+    crate::json::cmp_numbers(a, b)
 }
 
 pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
@@ -162,6 +203,30 @@ mod serde_bytes_compat {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sort_prefix_never_misorders() {
+        let vals: Vec<Value> = [
+            "null", "false", "true", "-1e300", "-3", "-0.0", "0", "0.5", "3", "3.0", "9007199254740992.0", "9007199254740993",
+            "1e21", "1000000000000000000001", "123456789012345678901234567890123456789", "\"a\"", "\"B\"", "[]", "[null]",
+            "[1]", "[1,2]", "[1.5]", "[2]", "[\"a\"]", "[[1]]", "{}", "{\"a\":1}", "[1,1.5]", "[1.0,2]", "[1,\"a\"]", "[1,null]",
+            "[1,2,3]", "[null,1]", "[null,0.5]", "[true,3]", "[false,9]", "[3,-1]", "[-3,1]", "[-3,-1.5]", "[0,0]", "[-0.0,1]", "[0.0,2]",
+            "[9007199254740993,1]", "[9007199254740992.0,2]", "[123456789012345,5]", "[1234567890123456,4]", "[1e21,0]", "[\"a\",1]",
+        ]
+        .iter()
+        .map(|t| serde_json::from_str(t).unwrap())
+        .collect();
+        for a in &vals {
+            for b in &vals {
+                for cmp in [cmp_json, cmp_json_raw] {
+                    let p = crate::extsort::cmp_prefix(&sort_prefix(a), &sort_prefix(b));
+                    if p != Ordering::Equal {
+                        assert_eq!(cmp(a, b), p, "{a} vs {b}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn couch_collation_order() {

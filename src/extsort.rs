@@ -20,8 +20,26 @@ pub fn budget_bytes() -> usize {
     })
 }
 
+/// A record's leading sort bits: heads order records consistently with
+/// the full comparison (a smaller head means a smaller record), and tails,
+/// present when the head pins down everything it covers, order records
+/// whose heads are equal.
+pub type Prefix = (u64, Option<u64>);
+
+/// What two prefixes say of their records' order: Equal when they can't
+/// tell.
+pub fn cmp_prefix(a: &Prefix, b: &Prefix) -> Ordering {
+    a.0.cmp(&b.0).then_with(|| match (a.1, b.1) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => Ordering::Equal,
+    })
+}
+
 pub struct Sorter<T, F: Fn(&T, &T) -> Ordering> {
     cmp: F,
+    /// Optional cheap key computed once per record so most comparisons in
+    /// a sort skip `cmp`; see `cmp_prefix`.
+    prefix: Option<fn(&T) -> Prefix>,
     buf: Vec<T>,
     buf_bytes: usize,
     limit: usize,
@@ -36,7 +54,14 @@ impl<T: Serialize + DeserializeOwned, F: Fn(&T, &T) -> Ordering> Sorter<T, F> {
     /// `path` is a scratch file, created only if the data spills; it is
     /// removed when the sorter's output is dropped.
     pub fn new(path: PathBuf, limit_bytes: usize, cmp: F) -> Self {
-        Sorter { cmp, buf: Vec::new(), buf_bytes: 0, limit: limit_bytes, path, file: None, runs: Vec::new(), written: 0 }
+        Sorter { cmp, prefix: None, buf: Vec::new(), buf_bytes: 0, limit: limit_bytes, path, file: None, runs: Vec::new(), written: 0 }
+    }
+
+    /// Sorts by `prefix` first, then `cmp` where prefixes can't tell;
+    /// prefixes must never order two records against `cmp`.
+    pub fn with_prefix(mut self, prefix: fn(&T) -> Prefix) -> Self {
+        self.prefix = Some(prefix);
+        self
     }
 
     pub fn push(&mut self, item: T, approx_bytes: usize) -> io::Result<()> {
@@ -50,7 +75,14 @@ impl<T: Serialize + DeserializeOwned, F: Fn(&T, &T) -> Ordering> Sorter<T, F> {
 
     fn sort_buf(&mut self) {
         let cmp = &self.cmp;
-        self.buf.sort_unstable_by(|a, b| cmp(a, b));
+        match self.prefix {
+            None => self.buf.sort_unstable_by(|a, b| cmp(a, b)),
+            Some(prefix) => {
+                let mut keyed: Vec<(Prefix, T)> = self.buf.drain(..).map(|t| (prefix(&t), t)).collect();
+                keyed.sort_unstable_by(|a, b| cmp_prefix(&a.0, &b.0).then_with(|| cmp(&a.1, &b.1)));
+                self.buf.extend(keyed.into_iter().map(|(_, t)| t));
+            }
+        }
     }
 
     fn spill(&mut self) -> io::Result<()> {

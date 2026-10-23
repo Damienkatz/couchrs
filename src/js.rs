@@ -546,10 +546,14 @@ impl JsFuns {
 
     pub fn map(&self, doc: &Value) -> Result<Vec<Vec<(Value, Value)>>> {
         let out = self.call("__map", CallArgs::S(doc.to_string()))?;
+        let items = |v: Value| match v {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
         let mut res = Vec::new();
-        for per_fun in out.as_array().cloned().unwrap_or_default() {
+        for per_fun in items(out) {
             let mut rows = Vec::new();
-            for kv in per_fun.as_array().cloned().unwrap_or_default() {
+            for kv in items(per_fun) {
                 if let Value::Array(mut a) = kv {
                     let v = a.pop().unwrap_or(Value::Null);
                     let k = a.pop().unwrap_or(Value::Null);

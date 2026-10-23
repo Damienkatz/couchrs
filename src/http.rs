@@ -103,9 +103,9 @@ impl Req {
     pub fn q_json(&self, k: &str) -> Result<Option<Value>> {
         match self.q(k) {
             None => Ok(None),
-            Some(v) => serde_json::from_str(v).map(Some).map_err(|_| {
-                CouchError::bad_request(format!("Invalid JSON for query parameter {k}: {v}"))
-            }),
+            Some(v) => crate::json::parse(v.as_bytes())
+                .map(Some)
+                .ok_or_else(|| CouchError::bad_request(format!("Invalid JSON for query parameter {k}: {v}"))),
         }
     }
 
@@ -114,9 +114,7 @@ impl Req {
             return Err(CouchError::bad_request("Request body must be a JSON object"));
         }
         let body = self.decoded_body()?;
-        serde_json::from_slice(&body).map_err(|_| {
-            CouchError::new(StatusCode::BAD_REQUEST, "bad_request", "invalid UTF-8 JSON")
-        })
+        crate::json::parse(&body).ok_or_else(|| CouchError::new(StatusCode::BAD_REQUEST, "bad_request", "invalid UTF-8 JSON"))
     }
 
     /// The body, gunzipped if sent with Content-Encoding: gzip

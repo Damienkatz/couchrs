@@ -100,7 +100,7 @@ fn value_str(v: &Value) -> String {
     match v {
         Value::String(s) if is_number_string(s) => format!("\"{s}\""),
         Value::String(s) => format!("\"{}\"", escape_query_value(s)),
-        Value::Number(n) if n.is_i64() || n.is_u64() => n.to_string(),
+        Value::Number(n) if crate::json::is_integer(n) => n.as_str().to_string(),
         Value::Number(n) => erl_float(n.as_f64().unwrap_or(0.0)),
         Value::Bool(b) => b.to_string(),
         _ => "true".into(),

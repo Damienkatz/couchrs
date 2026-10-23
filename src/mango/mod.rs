@@ -126,10 +126,7 @@ fn write_term(v: &Value, pretty: bool, out: &mut String) {
 }
 
 fn erl_number(n: &Number) -> String {
-    match n.as_f64() {
-        Some(f) if !n.is_i64() && !n.is_u64() => erl_short_float(f),
-        _ => n.to_string(),
-    }
+    if crate::json::is_integer(n) { n.as_str().to_string() } else { erl_short_float(n.as_f64().unwrap_or(0.0)) }
 }
 
 fn erl_short_float(f: f64) -> String {

@@ -48,7 +48,7 @@ pub fn normalize_selector(v: &Value) -> Result<Value> {
 }
 
 fn is_int(v: &Value) -> bool {
-    v.is_i64() || v.is_u64()
+    v.as_number().is_some_and(crate::json::is_integer)
 }
 
 fn norm_ops(v: &Value) -> Result<Value> {
@@ -246,7 +246,7 @@ fn compile(v: &Value) -> Sel {
     let Some((k, arg)) = single(v) else { return Sel::Unnormalized(v.clone()) };
     let list = |a: &Value| a.as_array().map(|a| a.iter().map(compile).collect()).unwrap_or_default();
     let values = |a: &Value| a.as_array().cloned().unwrap_or_default();
-    let int = |x: &Value| x.as_i64().map(i128::from).or_else(|| x.as_u64().map(i128::from));
+    let int = |x: &Value| x.as_number().and_then(crate::json::int128);
     match k {
         "$and" => Sel::And(list(arg)),
         "$or" => Sel::Or(list(arg)),
@@ -311,11 +311,7 @@ pub fn cmp_raw(a: &Value, b: &Value) -> Ordering {
         }
     }
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
-            (Some(i), Some(j), _, _) => i.cmp(&j),
-            (_, _, Some(i), Some(j)) => i.cmp(&j),
-            _ => x.as_f64().unwrap_or(0.0).partial_cmp(&y.as_f64().unwrap_or(0.0)).unwrap_or(Ordering::Equal),
-        },
+        (Value::Number(x), Value::Number(y)) => crate::json::cmp_numbers(x, y),
         (Value::String(x), Value::String(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Array(x), Value::Array(y)) => {
             for (p, q) in x.iter().zip(y) {
@@ -345,11 +341,8 @@ pub fn cmp_raw(a: &Value, b: &Value) -> Ordering {
 pub fn erl_eq(a: &Value, b: &Value, exact: bool) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
-            let ints = |n: &serde_json::Number| n.is_i64() || n.is_u64();
-            if ints(x) != ints(y) {
-                return !exact && x.as_f64() == y.as_f64();
-            }
-            if ints(x) { x == y } else { x.as_f64() == y.as_f64() }
+            let ints = crate::json::is_integer;
+            (!exact || ints(x) == ints(y)) && crate::json::cmp_numbers(x, y) == Ordering::Equal
         }
         (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| erl_eq(p, q, exact)),
         (Value::Object(x), Value::Object(y)) => {
@@ -429,9 +422,9 @@ fn eval(s: &Sel, v: &Value, raw: bool) -> Result<bool> {
         },
         Sel::Exists(e) => *e,
         Sel::Type(t) => type_name(v) == t,
-        Sel::Mod(d, r) => match v.as_i64().map(i128::from).or_else(|| v.as_u64().map(i128::from)) {
-            Some(_) if *d == 0 => return Err(error(500, "unknown_error", "badarith")),
-            Some(x) => x % d == *r,
+        // Value rem D, for integers of any size.
+        Sel::Mod(d, r) => match v.as_number().filter(|n| crate::json::is_integer(n)) {
+            Some(n) => crate::json::int_rem(n, *d).ok_or_else(|| error(500, "unknown_error", "badarith"))? == *r,
             None => false,
         },
         Sel::BeginsWith(p) => v.as_str().is_some_and(|s| s.starts_with(p.as_str())),
