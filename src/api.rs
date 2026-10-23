@@ -1169,9 +1169,16 @@ impl QueryArgs {
                 self.start_key = Some(v.clone());
                 self.end_key = Some(v);
             }
+            // couch_mrview_http:parse_param/4: a single key is a range of
+            // just that key (unless a handler keeps the keys it was given).
             "keys" => match v {
+                Value::Array(mut a) if a.len() == 1 => {
+                    let k = a.pop().unwrap_or(Value::Null);
+                    self.start_key = Some(k.clone());
+                    self.end_key = Some(k);
+                }
                 Value::Array(a) => self.keys = Some(a),
-                _ => return Err(qerr("`keys` member must be an array.")),
+                _ => return Err(qerr("`keys` must be an array of strings.")),
             },
             "startkey" | "start_key" => self.start_key = Some(v),
             "endkey" | "end_key" => self.end_key = Some(v),
@@ -1211,7 +1218,12 @@ impl QueryArgs {
     }
 
     pub fn from_req(req: &Req) -> Result<QueryArgs> {
-        let mut a = QueryArgs::default();
+        QueryArgs::default().with_query_string(req)
+    }
+
+    /// These args with the query string's over them.
+    pub fn with_query_string(self, req: &Req) -> Result<QueryArgs> {
+        let mut a = self;
         for (k, v) in &req.query {
             let jv = match k.as_str() {
                 "key" | "keys" | "startkey" | "start_key" | "endkey" | "end_key" => {
@@ -1232,15 +1244,48 @@ impl QueryArgs {
         Ok(a)
     }
 
-    /// A /queries query: as from_obj/2, but a single key in `keys` is a
-    /// range of just that key, as couch_mrview_http:parse_param/4 makes it.
-    pub fn from_query(obj: &Map<String, Value>, base: QueryArgs) -> Result<QueryArgs> {
-        let mut a = QueryArgs::from_obj(obj, base)?;
-        if let Some(keys) = a.keys.take_if(|k| k.len() == 1) {
-            a.start_key = keys.first().cloned();
-            a.end_key = keys.first().cloned();
+    /// A view's or all-docs request's args, body first and then the query
+    /// string (couch_mrview_http:parse_body_and_query/2,3). All-docs keys,
+    /// from the query string or the body, stay keys even when there's one
+    /// (chttpd_db hands them over as the initial keys).
+    pub fn from_request(req: &Req, all_docs: bool) -> Result<QueryArgs> {
+        let mut a = QueryArgs::default();
+        match req.method {
+            Method::POST => {
+                let body = req.json_obj_body()?;
+                match body.get("keys") {
+                    None | Some(Value::Array(_)) => {}
+                    Some(_) if all_docs => return Err(CouchError::bad_request("`keys` body member must be an array.")),
+                    Some(_) => return Err(CouchError::bad_request("`keys` member must be an array.")),
+                }
+                if all_docs {
+                    a.keys = body.get("keys").and_then(Value::as_array).cloned();
+                }
+                a = QueryArgs::from_obj(&body, a)?;
+            }
+            _ if all_docs => {
+                a.keys = match req.q("keys").map(|k| crate::json::parse(k.as_bytes())) {
+                    Some(Some(Value::Array(k))) => Some(k),
+                    Some(Some(_)) => return Err(CouchError::bad_request("`keys` parameter must be an array.")),
+                    _ => None,
+                };
+            }
+            _ => {}
         }
-        Ok(a)
+        a.with_query_string(req)
+    }
+
+    /// couch_mrview_util:validate_args/1 on keys: given with a range only
+    /// when there's one key and the range is just it.
+    pub fn validate_keys(&self) -> Result<()> {
+        let same = |a: &Option<Value>, k: &Value| a.as_ref().is_some_and(|a| crate::mango::erl_eq(a, k, true));
+        match (&self.keys, &self.start_key, &self.end_key) {
+            (None, _, _) => Ok(()),
+            (Some(k), _, _) if k.is_empty() => Ok(()),
+            (Some(k), s, e) if k.len() == 1 && same(s, &k[0]) && same(e, &k[0]) => Ok(()),
+            (Some(_), None, None) => Ok(()),
+            _ => Err(qerr("`keys` is incompatible with `key`, `start_key` and `end_key`")),
+        }
     }
 
     pub fn doc_opts(&self) -> DocOpts {
@@ -1254,15 +1299,11 @@ impl QueryArgs {
 }
 
 async fn all_docs(req: &Req, db: &Arc<Db>, kind: AllDocsKind) -> Result<Response> {
-    let mut args = QueryArgs::from_req(req)?;
-    match req.method {
-        Method::GET | Method::HEAD => {}
-        Method::POST => {
-            let body = req.json_obj_body()?;
-            args = QueryArgs::from_obj(&body, args)?;
-        }
-        _ => return not_allowed("GET,HEAD,POST"),
+    if !matches!(req.method, Method::GET | Method::HEAD | Method::POST) {
+        return not_allowed("GET,HEAD,POST");
     }
+    let args = QueryArgs::from_request(req, true)?;
+    args.validate_keys()?;
     let snap = db.snapshot();
     let v = blocking(|| run_all_docs(&snap, &args, kind))?;
     Ok(crate::http::rows_response(&v))
@@ -1281,7 +1322,8 @@ async fn multi_query(req: &Req, db: &Arc<Db>, kind: AllDocsKind) -> Result<Respo
     let mut results = Vec::new();
     for q in queries {
         let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
-        let args = QueryArgs::from_query(obj, QueryArgs::default())?;
+        let args = QueryArgs::from_obj(obj, QueryArgs::default())?;
+        args.validate_keys()?;
         results.push(blocking(|| run_all_docs(&snap, &args, kind))?);
     }
     Ok(crate::http::rows_response(&json!({"results": results})))
@@ -1312,22 +1354,19 @@ async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[Str
             _ => not_allowed("GET,HEAD"),
         },
         ["_all_docs"] => {
-            let mut args = QueryArgs::from_req(req)?;
-            match req.method {
-                Method::GET | Method::HEAD => {}
-                Method::POST => args = QueryArgs::from_obj(&req.json_obj_body()?, args)?,
-                _ => return not_allowed("GET,HEAD,POST"),
+            if !matches!(req.method, Method::GET | Method::HEAD | Method::POST) {
+                return not_allowed("GET,HEAD,POST");
             }
+            let args = QueryArgs::from_request(req, true)?;
+            args.validate_keys()?;
             let snap = db.snapshot();
             Ok(crate::http::rows_response(&blocking(|| run_partition_all_docs(&snap, &args, partition))?))
         }
         ["_design", ddoc, "_view", view] => {
-            let mut args = QueryArgs::from_req(req)?;
-            match req.method {
-                Method::GET | Method::HEAD => {}
-                Method::POST => args = QueryArgs::from_obj(&req.json_obj_body()?, args)?,
-                _ => return not_allowed("GET,POST,HEAD"),
+            if !matches!(req.method, Method::GET | Method::HEAD | Method::POST) {
+                return not_allowed("GET,POST,HEAD");
             }
+            let mut args = QueryArgs::from_request(req, false)?;
             args.partition = Some(partition.to_string());
             ok_json(crate::views::view_json(req, db, &format!("_design/{ddoc}"), view, &args)?)
         }
@@ -1345,7 +1384,7 @@ async fn partition_request(req: &Req, db: &Arc<Db>, partition: &str, rest: &[Str
             let mut results = Vec::new();
             for q in &queries {
                 let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
-                let mut args = QueryArgs::from_query(obj, base.clone())?;
+                let mut args = QueryArgs::from_obj(obj, base.clone())?;
                 args.partition = Some(partition.to_string());
                 results.push(crate::views::view_json(req, db, &format!("_design/{ddoc}"), view, &args)?);
             }
@@ -1398,6 +1437,9 @@ pub fn run_partition_all_docs(snap: &Snapshot, args: &QueryArgs, partition: &str
 pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Result<Value> {
     let opts = args.doc_opts();
     let mut rows = Vec::new();
+    if let Some(keys) = &args.keys {
+        return all_docs_keys(snap, args, kind, keys);
+    }
     if kind == AllDocsKind::Local {
         let range = Range {
             start: args.start_key.as_ref().and_then(key_str).or(Some("_local/".into())),
@@ -1426,39 +1468,14 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
             rows.push(row);
             rows.len() < args.limit
         })?;
-        return Ok(json!({"total_rows": null, "offset": null, "rows": rows}));
+        let mut out = json!({"total_rows": null, "offset": null});
+        if args.update_seq {
+            out["update_seq"] = Value::Null;
+        }
+        out["rows"] = Value::Array(rows);
+        return Ok(out);
     }
     let total = snap.doc_count();
-    if let Some(keys) = &args.keys {
-        let keys: Vec<&Value> = if args.descending { keys.iter().rev().collect() } else { keys.iter().collect() };
-        for k in keys.into_iter().skip(args.skip).take(args.limit) {
-            let Some(id) = k.as_str() else {
-                rows.push(json!({"key": k, "error": "not_found"}));
-                continue;
-            };
-            match snap.get_fdi(id)? {
-                None => rows.push(json!({"key": id, "error": "not_found"})),
-                Some(fdi) => {
-                    let w = fdi.winner();
-                    if w.deleted {
-                        let mut row = json!({"id": id, "key": id, "value": {"rev": w.rev(), "deleted": true}});
-                        if args.include_docs {
-                            row["doc"] = Value::Null;
-                        }
-                        rows.push(row);
-                    } else {
-                        let mut row = json!({"id": id, "key": id, "value": {"rev": w.rev()}});
-                        if args.include_docs {
-                            row["doc"] = snap.doc_json(&fdi, &w, &opts)?;
-                            crate::db::count_reads(snap, 1);
-                        }
-                        rows.push(row);
-                    }
-                }
-            }
-        }
-        return Ok(rows_out(snap, args, json!(total), Value::Null, rows));
-    }
     let dir = if args.descending { Dir::Rev } else { Dir::Fwd };
     let mut start = args.start_key.as_ref().and_then(key_str);
     let mut end = args.end_key.as_ref().and_then(key_str);
@@ -1517,6 +1534,76 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
 }
 
 /// {total_rows, offset, update_seq (when asked), rows}, in that order.
+/// fabric_view_all_docs with keys: in order (reversed when descending),
+/// skipped and limited, then those of the namespace looked up one by one,
+/// local docs included; no offset or update seq.
+fn all_docs_keys(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind, keys: &[Value]) -> Result<Value> {
+    let opts = args.doc_opts();
+    let ordered: Vec<&Value> = if args.descending { keys.iter().rev().collect() } else { keys.iter().collect() };
+    let prefix = match kind {
+        AllDocsKind::Local => Some("_local/"),
+        AllDocsKind::Design => Some("_design/"),
+        _ => None,
+    };
+    let mut rows = Vec::new();
+    for k in ordered.into_iter().skip(args.skip).take(args.limit) {
+        if prefix.is_some_and(|p| !k.as_str().is_some_and(|id| id.starts_with(p))) {
+            continue;
+        }
+        let not_found = || json!({"key": k, "error": "not_found"});
+        let Some(id) = k.as_str() else {
+            rows.push(not_found());
+            continue;
+        };
+        if id.starts_with("_local/") {
+            match snap.get_local(id)? {
+                Some(l) => {
+                    let mut row = json!({"id": id, "key": id, "value": {"rev": format!("0-{}", l.rev)}});
+                    if args.include_docs {
+                        row["doc"] = local_json(id, &l);
+                    }
+                    rows.push(row);
+                }
+                None => rows.push(not_found()),
+            }
+            continue;
+        }
+        match snap.get_fdi(id)? {
+            None => rows.push(not_found()),
+            Some(fdi) => {
+                let w = fdi.winner();
+                if w.deleted {
+                    let mut row = json!({"id": id, "key": id, "value": {"rev": w.rev(), "deleted": true}});
+                    if args.include_docs {
+                        row["doc"] = Value::Null;
+                    }
+                    rows.push(row);
+                } else {
+                    let mut row = json!({"id": id, "key": id, "value": {"rev": w.rev()}});
+                    if args.include_docs {
+                        row["doc"] = snap.doc_json(&fdi, &w, &opts)?;
+                        crate::db::count_reads(snap, 1);
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+    }
+    let total = match kind {
+        AllDocsKind::Local => Value::Null,
+        AllDocsKind::Design => json!(crate::views::design_doc_ids(snap)?.len()),
+        _ => json!(snap.doc_count()),
+    };
+    let mut out = Map::new();
+    out.insert("total_rows".into(), total);
+    out.insert("offset".into(), Value::Null);
+    if args.update_seq {
+        out.insert("update_seq".into(), Value::Null);
+    }
+    out.insert("rows".into(), Value::Array(rows));
+    Ok(Value::Object(out))
+}
+
 fn rows_out(snap: &Snapshot, args: &QueryArgs, total: Value, offset: Value, rows: Vec<Value>) -> Value {
     let mut out = Map::new();
     out.insert("total_rows".into(), total);

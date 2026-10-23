@@ -1874,12 +1874,18 @@ pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, a
     let vdef = &def.views[vi];
     // fabric_view's reduce context: the view, as a path.
     let ctx = format!("{}/{}/_view/{}", snap.name, def.ddoc_id, vdef.name);
+    // In couch_mrview_util:validate_args/1's order.
     let has_reduce = !matches!(vdef.reducer, Reducer::None);
     let reduce = args.reduce.unwrap_or(has_reduce);
     if reduce && !has_reduce
         && args.reduce == Some(true) {
             return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Reduce is invalid for map-only views."));
         }
+    // Keys reduce only grouped exactly (group=true, no group_level).
+    if reduce && has_reduce && args.keys.is_some() && !(args.group && args.group_level.is_none()) {
+        return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Multi-key fetches for reduce views must use `group=true`"));
+    }
+    args.validate_keys()?;
     // A map view, or a reduce view read with reduce=false, can't group
     // (group_level=0 is no grouping).
     if !(reduce && has_reduce) && (args.group || args.group_level.is_some_and(|l| l > 0)) {
@@ -1888,9 +1894,6 @@ pub fn query_view(snap: &Snapshot, st: &IndexState, def: &IndexDef, vi: usize, a
     let reduce = reduce && has_reduce;
     if reduce && args.include_docs {
         return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "`include_docs` is invalid for reduce"));
-    }
-    if reduce && args.keys.is_some() && !(args.group || args.group_level.is_some()) {
-        return Err(CouchError::new(StatusCode::BAD_REQUEST, "query_parse_error", "Multi-key fetches for reduce views must use `group=true`"));
     }
     let dir = if args.descending { Dir::Rev } else { Dir::Fwd };
     let spec = tree.spec.clone();
@@ -2113,15 +2116,10 @@ fn partition_args(args: &QueryArgs, p: &str) -> QueryArgs {
 }
 
 pub async fn http_view(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &str) -> Result<Response> {
-    let mut args = QueryArgs::from_req(req)?;
-    match req.method {
-        Method::GET | Method::HEAD => {}
-        Method::POST => {
-            let body = req.json_obj_body()?;
-            args = QueryArgs::from_obj(&body, args)?;
-        }
-        _ => return not_allowed("GET,POST,HEAD"),
+    if !matches!(req.method, Method::GET | Method::HEAD | Method::POST) {
+        return not_allowed("GET,POST,HEAD");
     }
+    let args = QueryArgs::from_request(req, false)?;
     crate::stat!("couchdb.httpd.view_reads").inc();
     Ok(crate::http::rows_response(&view_json(req, db, ddoc_id, view, &args)?))
 }
@@ -2144,7 +2142,7 @@ pub async fn http_view_queries(req: &Req, db: &Arc<Db>, ddoc_id: &str, view: &st
         let mut results = Vec::new();
         for q in &queries {
             let obj = q.as_object().ok_or_else(|| CouchError::bad_request("query must be an object"))?;
-            let args = QueryArgs::from_query(obj, base.clone())?;
+            let args = QueryArgs::from_obj(obj, base.clone())?;
             check_partition(&idx.def, &args)?;
             results.push(view_response(query_view(&snap, &st, &idx.def, vi, &args)?, &args));
         }

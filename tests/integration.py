@@ -777,6 +777,49 @@ def view_reads_while_rebuilding():
 
 
 @test
+def all_docs_keys():
+    """keys= on _local_docs, _design_docs and _all_docs (GET, POST and
+    /queries) as fabric_view_all_docs looks them up, and keys with a
+    range as couch_mrview validates them."""
+    db = new_db()
+    try:
+        for i, v in (("_local/a", 1), ("_local/b", 2), ("_local/gone", 3)):
+            req("PUT", f"/{db}/{i}", {"v": v})
+        req("DELETE", f"/{db}/_local/gone")
+        req("PUT", f"/{db}/d1", {"n": 1})
+        req("PUT", f"/{db}/_design/x", {"views": {"n": {"map": "function(d) { if (d.n) emit(d.n, 1); }", "reduce": "_count"}}})
+        keys = ["_local/a", "_local/missing", "d1", 1, None, "_local/b", "_local/gone", "_design/x"]
+        q = lambda v: urllib.parse.quote(json.dumps(v))
+        row = lambda i, v: {"id": i, "key": i, "value": {"rev": "0-1"}, "doc": {"_id": i, "_rev": "0-1", "v": v}}
+        missing = lambda k: {"key": k, "error": "not_found"}
+        want = [row("_local/a", 1), missing("_local/missing"), row("_local/b", 2), missing("_local/gone")]
+        b = req("GET", f"/{db}/_local_docs?keys={q(keys)}&include_docs=true&update_seq=true")[1]
+        eq(b, {"total_rows": None, "offset": None, "update_seq": None, "rows": want})
+        eq(req("POST", f"/{db}/_local_docs", {"keys": keys, "include_docs": True})[1]["rows"], want)
+        # Reversed, skipped and limited before other namespaces' keys go.
+        eq([r["key"] for r in req("GET", f"/{db}/_local_docs?keys={q(keys)}&descending=true&skip=1&limit=4")[1]["rows"]], ["_local/gone", "_local/b"])
+        b = req("POST", f"/{db}/_local_docs/queries", {"queries": [{"keys": ["_local/b", "_local/a"]}, {"keys": ["_local/a"]}]})[1]
+        eq([[r["id"] for r in res["rows"]] for res in b["results"]], [["_local/b", "_local/a"], ["_local/a"]])
+        b = req("GET", f"/{db}/_design_docs?keys={q(keys)}")[1]
+        eq((b["total_rows"], [r["id"] for r in b["rows"]]), (1, ["_design/x"]))
+        b = req("GET", f"/{db}/_all_docs?keys={q(['_local/a', 'd1'])}")[1]
+        eq([r["value"]["rev"][:2] for r in b["rows"]], ["0-", "1-"])
+        # Errors.
+        eq(req("GET", f"/{db}/_local_docs?keys={q('x')}")[:2], (400, {"error": "bad_request", "reason": "`keys` parameter must be an array."}))
+        eq(req("POST", f"/{db}/_all_docs", {"keys": "x"})[:2], (400, {"error": "bad_request", "reason": "`keys` body member must be an array."}))
+        incompatible = (400, {"error": "query_parse_error", "reason": "`keys` is incompatible with `key`, `start_key` and `end_key`"})
+        eq(req("GET", f"/{db}/_local_docs?keys={q(['_local/a'])}&startkey={q('_local/z')}")[:2], incompatible)
+        eq(req("GET", f"/{db}/_all_docs?keys={q(['d1'])}&key={q('d1')}")[0], 200)
+        eq(req("GET", f"/{db}/_design/x/_view/n?keys={q([1, 2])}&key=1&reduce=false")[:2], incompatible)
+        eq(req("GET", f"/{db}/_design/x/_view/n?keys={q([1, 2])}&group_level=1")[1]["reason"], "Multi-key fetches for reduce views must use `group=true`")
+        # A view's single key is a range of it, so it reduces without group.
+        eq(req("GET", f"/{db}/_design/x/_view/n?keys={q([1])}")[1]["rows"], [{"key": None, "value": 1}])
+        eq(req("GET", f"/{db}/_design/x/_view/n?keys={q([1])}&reduce=false&inclusive_end=false")[1]["rows"], [])
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
 def compaction_preserves_data():
     db = new_db()
     for i in range(20):
