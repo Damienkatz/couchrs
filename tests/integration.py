@@ -2343,6 +2343,81 @@ def streamed_uploads():
 
 
 
+@test
+def attachment_names_and_revs():
+    """What chttpd_db asks of an attachment's name and revision, of _local
+    paths, and of docs written with new_edits=false."""
+    db = new_db()
+    T = {"Content-Type": "text/plain"}
+    bad = lambda reason: (400, {"error": "bad_request", "reason": reason})
+    try:
+        # No attachment name may start with '_', however it comes.
+        prohibited = bad("Attachment name '_x' starts with prohibited character '_'")
+        rev = req("PUT", f"/{db}/d", {"x": 1})[1]["rev"]
+        inline = {"_x": {"data": "eHl6", "content_type": "text/plain"}}
+        eq(req("PUT", f"/{db}/p", {"_attachments": inline})[:2], prohibited)
+        eq(req("POST", f"/{db}", {"_id": "p", "_attachments": inline})[:2], prohibited)
+        eq(req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": "ok"}, {"_id": "p", "_attachments": inline}]})[:2], prohibited)
+        eq(req("GET", f"/{db}/ok")[0], 404)
+        eq(req("PUT", f"/{db}/p", {"_attachments": {"_x": {"stub": True}}})[:2], prohibited)
+        eq(req("PUT", f"/{db}/d/_x?rev={rev}", b"zz", headers=T)[:2], prohibited)
+        eq(req("DELETE", f"/{db}/d/_x?rev={rev}")[:2], prohibited)
+        eq(req("GET", f"/{db}/d/_x")[:2], (404, {"error": "not_found", "reason": "Document is missing attachment"}))
+        # Under a design doc, '_x' is an action; one there is none of is an
+        # attachment, once the design doc is there.
+        eq(req("PUT", f"/{db}/_design/none/_x", b"zz", headers=T)[:2], (404, {"error": "not_found", "reason": "missing"}))
+        req("PUT", f"/{db}/_design/dd", {})
+        eq(req("PUT", f"/{db}/_design/dd/_x", b"zz", headers=T)[:2], prohibited)
+        # _local docs have no attachments.
+        no_atts = bad("_local documents do not accept attachments.")
+        for method in ("GET", "PUT", "DELETE"):
+            eq(req(method, f"/{db}/_local/l/f.txt", b"zz" if method == "PUT" else None, headers=T)[:2], no_atts)
+
+        # The rev comes from the query or If-Match, which must agree. One
+        # that isn't there is missing_rev.
+        missing_rev = (409, {"error": "not_found", "reason": "missing_rev"})
+        eq(req("PUT", f"/{db}/d/f.txt?rev=1-abc", b"zz", headers=T)[:2], missing_rev)
+        eq(req("PUT", f"/{db}/d/f.txt", b"zz", headers={**T, "If-Match": '"1-abc"'})[:2], missing_rev)
+        eq(req("PUT", f"/{db}/nodoc/f.txt?rev=1-abc", b"zz", headers=T)[:2], missing_rev)
+        eq(req("DELETE", f"/{db}/d/f.txt?rev=1-abc")[:2], missing_rev)
+        eq(req("DELETE", f"/{db}/nodoc/f.txt?rev=1-abc")[:2], missing_rev)
+        eq(req("PUT", f"/{db}/d/f.txt?rev=abc", b"zz", headers=T)[:2], bad("Invalid rev format"))
+        rev2 = req("PUT", f"/{db}/d/f.txt", b"zz", headers={**T, "If-Match": f'"{rev}"'})[1]["rev"]
+        eq(req("PUT", f"/{db}/d/g.txt?rev={rev2}", b"zz", headers={**T, "If-Match": f'"{rev}"'})[:2],
+           bad("Document rev and etag have different values"))
+        eq(req("PUT", f"/{db}/d/g.txt?rev={rev}", b"zz", headers=T)[:2], (409, {"error": "conflict", "reason": "Document update conflict."}))
+        # Deleting without a rev needs the doc and the attachment, and then
+        # conflicts.
+        missing_att = (404, {"error": "not_found", "reason": "Document is missing attachment"})
+        eq(req("DELETE", f"/{db}/d/nope.txt")[:2], missing_att)
+        eq(req("DELETE", f"/{db}/d/f.txt")[:2], (409, {"error": "conflict", "reason": "Document update conflict."}))
+        eq(req("DELETE", f"/{db}/nodoc/f.txt")[:2], (404, {"error": "not_found", "reason": "missing"}))
+        eq(req("DELETE", f"/{db}/d/nope.txt?rev={rev2}")[:2], missing_att)
+
+        # A deleted doc takes no edit from a revision, only a recreation.
+        drev = req("DELETE", f"/{db}/d?rev={rev2}")[1]["rev"]
+        conflict = (409, {"error": "conflict", "reason": "Document update conflict."})
+        eq(req("PUT", f"/{db}/d/f.txt?rev={drev}", b"zz", headers=T)[:2], conflict)
+        eq(req("PUT", f"/{db}/d?rev={drev}", {"_deleted": True})[:2], conflict)
+        eq(req("PUT", f"/{db}/d", {"_rev": drev, "x": 2})[:2], conflict)
+        eq(req("PUT", f"/{db}/d", {"_deleted": True})[:2], conflict)
+        eq(req("DELETE", f"/{db}/d/f.txt")[:2], (404, {"error": "not_found", "reason": "deleted"}))
+        s, b, _ = req("PUT", f"/{db}/d/f.txt", b"zz", headers=T)
+        eq((s, b["rev"].split("-")[0]), (201, "4"))
+
+        # With new_edits=false a doc must say its revision; the whole
+        # request fails if one doesn't. One with no id gets one.
+        revs_required = bad("When `new_edits: false`, the document needs `_rev` or `_revisions` specified")
+        eq(req("PUT", f"/{db}/r?new_edits=false", {"x": 1})[:2], revs_required)
+        eq(req("PUT", f"/{db}/r?new_edits=false", {"_revisions": {"start": 1, "ids": ["a" * 32]}})[0], 201)
+        docs = [{"_id": "b", "_rev": "1-" + "b" * 32}, {"_id": "c"}]
+        eq(req("POST", f"/{db}/_bulk_docs", {"new_edits": False, "docs": docs})[:2], revs_required)
+        eq(req("GET", f"/{db}/b")[0], 404)
+        eq(req("POST", f"/{db}/_bulk_docs", {"new_edits": False, "docs": [{"_rev": "1-" + "c" * 32}]})[:2], (201, []))
+    finally:
+        req("DELETE", f"/{db}")
+
+
 NOUVEAU_DDOC = {
     # Built when searched (not in the background), to see it not built.
     "autoupdate": False,
