@@ -1,8 +1,10 @@
 //! Talking to a replication endpoint (couch_replicator_httpc and
 //! couch_replicator_api_wrap): requests with CouchDB's retry and backoff
-//! rules, and the calls replication makes. Documents travel as JSON:
-//! open_revs and _bulk_get with revs and latest, attachments inline (or
-//! stubs, given atts_since), written back with new_edits=false.
+//! rules, and the calls replication makes. Documents without attachments
+//! travel as JSON (_bulk_get, _bulk_docs); open_revs comes back as
+//! multipart/mixed, and a doc's attachment bodies (those newer than
+//! atts_since) are piped from that response into a multipart/related PUT
+//! with new_edits=false, a chunk at a time.
 
 use super::RepError;
 use super::rep::{Endpoint, quote_plus, url_strip_password};
@@ -13,6 +15,10 @@ use serde_json::{Map, Value, json};
 use std::time::{Duration, Instant};
 
 const MAX_WAIT: Duration = Duration::from_secs(5 * 60);
+/// The longest open_revs URL atts_since may grow, and how short a 414
+/// may make it.
+const MAX_URL_LEN: usize = 7000;
+const MIN_URL_LEN: usize = 200;
 /// Half the scheduler's health threshold: a request failing for longer
 /// gives up even with retries left.
 const MAX_ERROR_TIME: Duration = Duration::from_secs(60);
@@ -78,6 +84,9 @@ impl Resp {
 pub struct Client {
     pub ep: Endpoint,
     http: reqwest::Client,
+    /// For bodies streamed as they're read: no timeout until all is sent,
+    /// as ibrowse starts its inactivity timer only then.
+    upload: reqwest::Client,
     /// Seconds to wait before the next request after 429 responses.
     rate: parking_lot::Mutex<Duration>,
     session: tokio::sync::Mutex<Session>,
@@ -141,9 +150,20 @@ pub fn encode_doc_id(id: &str) -> String {
 
 impl Client {
     pub fn new(ep: &Endpoint) -> Result<Client, RepError> {
+        let http = Self::builder(ep)?.read_timeout(Self::idle_timeout(ep)).build().map_err(|e| RepError::Error(e.to_string()))?;
+        let upload = Self::builder(ep)?.build().map_err(|e| RepError::Error(e.to_string()))?;
+        let session = Session { state: if ep.session_auth && ep.basic.is_some() { SessionState::Untried } else { SessionState::Off }, ..Default::default() };
+        Ok(Client { ep: ep.clone(), http, upload, rate: parking_lot::Mutex::new(Duration::ZERO), session: tokio::sync::Mutex::new(session) })
+    }
+
+    /// How long a request may wait on the other end.
+    fn idle_timeout(ep: &Endpoint) -> Duration {
+        Duration::from_millis(ep.timeout_ms.max(1000) + 500)
+    }
+
+    fn builder(ep: &Endpoint) -> Result<reqwest::ClientBuilder, RepError> {
         let mut b = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(ep.timeout_ms.max(1000)))
-            .read_timeout(Duration::from_millis(ep.timeout_ms.max(1000) + 500))
             .pool_max_idle_per_host(ep.http_connections.max(1) as usize)
             .redirect(reqwest::redirect::Policy::limited(10));
         if let Some(p) = &ep.proxy {
@@ -164,9 +184,7 @@ impl Client {
             pem.extend(std::fs::read(key).map_err(|e| RepError::Error(format!("{key}: {e}")))?);
             b = b.identity(reqwest::Identity::from_pem(&pem).map_err(|e| RepError::Error(e.to_string()))?);
         }
-        let http = b.build().map_err(|e| RepError::Error(e.to_string()))?;
-        let session = Session { state: if ep.session_auth && ep.basic.is_some() { SessionState::Untried } else { SessionState::Off }, ..Default::default() };
-        Ok(Client { ep: ep.clone(), http, rate: parking_lot::Mutex::new(Duration::ZERO), session: tokio::sync::Mutex::new(session) })
+        Ok(b)
     }
 
     /// The server's /_session, resolved against the endpoint's URL.
@@ -288,8 +306,8 @@ impl Client {
         u
     }
 
-    fn request(&self, method: &Method, url: &str, headers: &[(&str, String)], body: Option<&Bytes>, cookie: Option<&str>) -> reqwest::RequestBuilder {
-        let mut r = self.http.request(method.clone(), url);
+    fn request(&self, http: &reqwest::Client, method: &Method, url: &str, headers: &[(&str, String)], cookie: Option<&str>) -> reqwest::RequestBuilder {
+        let mut r = http.request(method.clone(), url);
         for (k, v) in &self.ep.headers {
             if !v.is_empty() && !headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(k)) {
                 r = r.header(k.as_str(), v.as_str());
@@ -302,9 +320,6 @@ impl Client {
             (Some(c), _) => r = r.header("Cookie", format!("AuthSession={c}")),
             (None, Some((u, p))) => r = r.basic_auth(u, Some(p)),
             (None, None) => {}
-        }
-        if let Some(b) = body {
-            r = r.body(b.clone());
         }
         r
     }
@@ -351,7 +366,11 @@ impl Client {
             }
             let fail = |error: String, code: Option<u16>| HttpFail { method: method.to_string(), url: url_strip_password(&url), error, code };
             let session = self.session_cookie().await;
-            let sent = self.request(&method, &url, headers, body.as_ref(), session.as_ref().map(|(c, _)| c.as_str())).send().await;
+            let mut req = self.request(&self.http, &method, &url, headers, session.as_ref().map(|(c, _)| c.as_str()));
+            if let Some(b) = &body {
+                req = req.body(b.clone());
+            }
+            let sent = req.send().await;
             if let (Ok(r), Some((_, epoch))) = (&sent, &session)
                 && self.session_response(*epoch, r).await
                 && !session_retried
@@ -389,6 +408,58 @@ impl Client {
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(MAX_WAIT);
             retries -= 1;
+        }
+    }
+
+    /// A request whose body can be sent only once (retries = 0): errors,
+    /// 408, 429 and 5xx fail it, and a renewed session isn't retried.
+    /// `sent` resolves once the body is all handed over; the reply may
+    /// then take as long as any request may idle.
+    async fn send_once(
+        &self,
+        method: Method,
+        path: &str,
+        qs: &[(String, String)],
+        headers: &[(&str, String)],
+        body: reqwest::Body,
+        sent: impl Future<Output = ()>,
+    ) -> Result<Resp, HttpFail> {
+        let url = self.url(path, qs);
+        let fail = |error: String, code: Option<u16>| HttpFail { method: method.to_string(), url: url_strip_password(&url), error, code };
+        crate::stat!("couch_replicator.requests").inc();
+        let delay = *self.rate.lock();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let session = self.session_cookie().await;
+        let reply = async {
+            let r = self.request(&self.upload, &method, &url, headers, session.as_ref().map(|(c, _)| c.as_str())).body(body).send().await?;
+            let status = r.status().as_u16();
+            if let Some((_, epoch)) = &session {
+                self.session_response(*epoch, &r).await;
+            }
+            Ok::<_, reqwest::Error>((status, r.bytes().await?))
+        };
+        let mut reply = std::pin::pin!(reply);
+        let got = tokio::select! {
+            r = &mut reply => r,
+            () = sent => match tokio::time::timeout(Self::idle_timeout(&self.ep), &mut reply).await {
+                Ok(r) => r,
+                Err(_) => return Err(fail("{error,req_timedout}".into(), None)),
+            },
+        };
+        match got {
+            Ok((status, _)) if status == 408 || status == 429 || status >= 500 => {
+                crate::stat!("couch_replicator.responses.failure").inc();
+                Err(fail(format!("{{code,{status}}}"), Some(status)))
+            }
+            Ok((status, body)) => {
+                crate::stat!("couch_replicator.responses.success").inc();
+                Ok(Resp { status, body })
+            }
+            Err(e) if e.is_timeout() => Err(fail("{error,req_timedout}".into(), None)),
+            Err(e) if e.is_connect() => Err(fail(format!("{{error,{{conn_failed,{{error,{}}}}}}}", conn_error(&e)), None)),
+            Err(e) => Err(fail(e.to_string(), None)),
         }
     }
 
@@ -511,34 +582,104 @@ impl Client {
     }
 
     /// open_doc_revs/6: these revisions (or their latest descendants),
-    /// with history, attachments since the given ancestors inline.
-    pub async fn open_doc_revs(&self, id: &str, revs: &[String], atts_since: &[String]) -> Result<Vec<Value>, RepError> {
-        let mut qs = vec![
-            ("revs".to_string(), "true".to_string()),
-            ("open_revs".to_string(), json!(revs).to_string()),
-            ("latest".to_string(), "true".to_string()),
-            ("attachments".to_string(), "true".to_string()),
-        ];
-        if !atts_since.is_empty() {
-            qs.push(("atts_since".to_string(), json!(atts_since).to_string()));
+    /// with history, each handed to `h` as it's read from the
+    /// multipart/mixed response, with the bodies of its attachments newer
+    /// than the given ancestors to stream. The request isn't retried on
+    /// its own: a failure anywhere, writes included, starts it over.
+    pub async fn open_doc_revs<H: DocHandler>(&self, id: &str, revs: &[String], atts_since: &[String], h: &mut H) -> Result<(), RepError> {
+        let path = encode_doc_id(id);
+        let mut max_url_len = MAX_URL_LEN;
+        let mut retries = self.ep.retries;
+        let mut wait = Duration::from_millis(250);
+        loop {
+            let qs = self.open_revs_qs(&path, revs, atts_since, max_url_len);
+            let err = match self.open_revs_once(&path, &qs, h).await {
+                Ok(()) => return Ok(()),
+                Err(OpenRevsError::Fail(e)) => return Err(e),
+                Err(OpenRevsError::UriTooLong) => {
+                    max_url_len /= 2;
+                    if max_url_len < MIN_URL_LEN {
+                        return Err(RepError::Other("request_uri_too_long".into()));
+                    }
+                    tracing::info!("Reducing url length to {max_url_len} because of 414 response");
+                    continue;
+                }
+                Err(OpenRevsError::Retry(e)) => e,
+            };
+            let url = url_strip_password(&self.url(&path, &qs));
+            if retries <= 1 {
+                tracing::error!("Replication crashing because GET {url} failed. Error {err}");
+                return Err(RepError::Other("open_doc_revs_failed".into()));
+            }
+            retries -= 1;
+            wait = 2 * (wait * 2).min(MAX_WAIT);
+            tracing::info!("Retrying GET to {url} in {:?} seconds due to error {err}", wait.as_secs_f64());
+            tokio::time::sleep(wait).await;
         }
-        let headers = [("Accept", "application/json".to_string())];
-        let r = self.send(Method::GET, &encode_doc_id(id), &qs, &headers, None, None).await.map_err(RepError::Http)?;
-        if r.status == 404 {
-            return Err(RepError::MissingDoc);
+    }
+
+    /// options_to_query_args/3: atts_since first, as many ancestors as
+    /// keep the request line under `max_url_len`.
+    fn open_revs_qs(&self, path: &str, revs: &[String], atts_since: &[String], max_url_len: usize) -> Vec<(String, String)> {
+        let mut qs = vec![("revs".to_string(), "true".to_string()), ("open_revs".to_string(), json!(revs).to_string()), ("latest".to_string(), "true".to_string())];
+        if atts_since.is_empty() {
+            return qs;
         }
-        if r.status != 200 {
-            return Err(RepError::Other(format!("open_revs of {id} failed: {}", r.status)));
+        // GET <url> HTTP/1.1\r\n, &atts_since= and its %-encoded [ and ].
+        let mut len = "GET ".len() + self.url(path, &qs).len() + " HTTP/1.1\r\n".len() + "&atts_since=".len() + 6;
+        let mut since = Vec::new();
+        for (i, pa) in atts_since.iter().enumerate() {
+            // Its %-encoded quotes, and a comma unless it's the last.
+            len += pa.len() + if i + 1 == atts_since.len() { 6 } else { 9 };
+            if len >= max_url_len {
+                break;
+            }
+            since.push(pa.clone());
         }
-        let mut out = Vec::new();
-        for row in r.json().as_array().cloned().unwrap_or_default() {
-            match (row.get("ok"), row.get("missing")) {
-                (Some(d), _) => out.push(d.clone()),
-                (_, Some(_)) => return Err(RepError::MissingDoc),
-                _ => {}
+        qs.insert(0, ("atts_since".to_string(), json!(since).to_string()));
+        qs
+    }
+
+    /// One open_revs request, read through.
+    async fn open_revs_once<H: DocHandler>(&self, path: &str, qs: &[(String, String)], h: &mut H) -> Result<(), OpenRevsError> {
+        let resp = self.send_streaming(Method::GET, path, qs, &[("Accept", "multipart/mixed".to_string())], None, Some(0)).await.map_err(|e| OpenRevsError::Retry(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 => {}
+            414 => return Err(OpenRevsError::UriTooLong),
+            code => return Err(OpenRevsError::Retry(format!("{{code,{code}}}"))),
+        }
+        let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let Some(boundary) = crate::http::multipart_boundary(&ct) else {
+            return Err(OpenRevsError::Retry(format!("unexpected content type {ct}")));
+        };
+        let retry = |e: multer::Error| OpenRevsError::Retry(e.to_string());
+        let mut parts = multer::Multipart::new(OneChunk { inner: resp.bytes_stream(), ready: false }, boundary);
+        while let Some(part) = parts.next_field().await.map_err(retry)? {
+            let ct = part.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            let json = |b: &[u8]| crate::json::parse(b).ok_or_else(|| OpenRevsError::Retry("invalid_json".into()));
+            if ct.starts_with("multipart/related") {
+                let Some(inner) = crate::http::multipart_boundary(&ct) else {
+                    return Err(OpenRevsError::Retry(format!("unexpected content type {ct}")));
+                };
+                let mut atts = AttParts { parts: multer::Multipart::new(part, inner), failed: None };
+                let doc = match atts.parts.next_field().await.map_err(retry)? {
+                    Some(f) => json(&f.bytes().await.map_err(retry)?)?,
+                    None => return Err(OpenRevsError::Retry("empty multipart/related part".into())),
+                };
+                let r = h.doc(doc, Some(&mut atts)).await;
+                if let Some(e) = atts.failed {
+                    return Err(OpenRevsError::Retry(e));
+                }
+                r.map_err(OpenRevsError::from)?;
+            } else if ct.contains("error=\"true\"") {
+                // {{not_found, missing}, Rev}: remote_doc_handler throws missing_doc.
+                return Err(OpenRevsError::Fail(RepError::MissingDoc));
+            } else {
+                let doc = json(&part.bytes().await.map_err(retry)?)?;
+                h.doc(doc, None).await.map_err(OpenRevsError::from)?;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// open_doc/3, as JSON.
@@ -557,22 +698,93 @@ impl Client {
         let r = self
             .send(Method::PUT, &encode_doc_id(id), &qs, &Self::json_headers(), Some(Bytes::from(doc.to_string())), Some(0))
             .await
-            .map_err(|e| DocWriteError::Other(e.to_string()))?;
-        let v = r.json();
-        let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        match r.status {
-            200..=202 => Ok(field("rev")),
-            409 => Err(DocWriteError::Conflict),
-            401 if field("error") == "unauthorized" => Err(DocWriteError::Skip("unauthorized".into(), field("reason"))),
-            403 if field("error") == "forbidden" => Err(DocWriteError::Skip("forbidden".into(), field("reason"))),
-            412 if field("error") == "missing_stub" => Err(DocWriteError::MissingStub),
-            413 => Err(DocWriteError::Skip("request_body_too_large".into(), String::new())),
-            415 => Err(DocWriteError::Skip("unsupported_media_type".into(), String::new())),
-            400 if field("error") == "bad_request" && field("reason").starts_with("Attachment name ") => {
-                Err(DocWriteError::Skip("invalid_attachment_name".into(), field("reason")))
-            }
-            code => Err(DocWriteError::Other(format!("{{{},{}}}", field("error"), if field("reason").is_empty() { code.to_string() } else { field("reason") }))),
+            .map_err(DocWriteError::Http)?;
+        doc_write_result(&r)
+    }
+
+    /// update_doc/4 of a replicated doc whose attachments marked "follows"
+    /// have their bodies next in `atts`: a multipart/related PUT of known
+    /// length (couch_doc:doc_to_multi_part_stream/5, attachments as
+    /// encoded), each body piped from the source as it arrives.
+    pub async fn update_doc_streaming(&self, doc: &Value, atts: &mut AttParts<'_>) -> Result<String, DocWriteError> {
+        let boundary = uuid::Uuid::new_v4().simple().to_string();
+        // Each attachment's part headers and length.
+        let follows: Vec<(String, u64)> = doc
+            .get("_attachments")
+            .and_then(Value::as_object)
+            .map(|a| {
+                a.iter()
+                    .filter(|(_, v)| v.get("follows") == Some(&Value::Bool(true)))
+                    .map(|(name, v)| {
+                        let encoding = v.get("encoding").and_then(Value::as_str);
+                        let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+                        let len = if encoding.is_some() { n("encoded_length") } else { n("length") };
+                        let ct = v.get("content_type").and_then(Value::as_str).unwrap_or("application/octet-stream");
+                        (crate::api::mp_att_headers(name, ct, len, encoding), len)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if follows.is_empty() {
+            return self.update_doc(doc, true).await;
         }
+        let head = format!("--{boundary}\r\nContent-Type: application/json\r\n\r\n{doc}\r\n--{boundary}");
+        let delim = format!("\r\n--{boundary}");
+        let len = head.len() as u64 + follows.iter().map(|(h, n)| h.len() as u64 + n + delim.len() as u64).sum::<u64>() + 2;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let body = reqwest::Body::wrap_stream(async_stream::stream! {
+            while let Some(b) = rx.recv().await {
+                yield b;
+            }
+            let _ = done_tx.send(());
+        });
+        let pump = async move {
+            let fail = |atts: &mut AttParts<'_>, e: String| {
+                atts.failed = Some(e.clone());
+                Err(std::io::Error::other(e))
+            };
+            let r: std::io::Result<()> = async {
+                tx.send(Ok(Bytes::from(head))).await.map_err(std::io::Error::other)?;
+                for (headers, len) in follows {
+                    tx.send(Ok(Bytes::from(headers))).await.map_err(std::io::Error::other)?;
+                    let mut field = match atts.parts.next_field().await {
+                        Ok(Some(f)) => f,
+                        Ok(None) => return fail(atts, "attachment data missing from multipart body".into()),
+                        Err(e) => return fail(atts, e.to_string()),
+                    };
+                    let mut sent = 0u64;
+                    loop {
+                        match field.chunk().await {
+                            Ok(Some(c)) => {
+                                sent += c.len() as u64;
+                                if sent > len {
+                                    return fail(atts, "attachment longer than its length".into());
+                                }
+                                tx.send(Ok(c)).await.map_err(std::io::Error::other)?;
+                            }
+                            Ok(None) if sent < len => return fail(atts, "attachment shorter than its length".into()),
+                            Ok(None) => break,
+                            Err(e) => return fail(atts, e.to_string()),
+                        }
+                    }
+                    tx.send(Ok(Bytes::from(delim.clone()))).await.map_err(std::io::Error::other)?;
+                }
+                tx.send(Ok(Bytes::from_static(b"--"))).await.map_err(std::io::Error::other)
+            }
+            .await;
+            // A failed source cuts the body short, failing the PUT.
+            if let Err(e) = r {
+                let _ = tx.send(Err(e)).await;
+            }
+            drop(tx);
+            let _ = done_rx.await;
+        };
+        let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default();
+        let headers = [("Content-Type", format!("multipart/related; boundary=\"{boundary}\"")), ("Content-Length", len.to_string())];
+        let qs = vec![("new_edits".to_string(), "false".to_string())];
+        let r = self.send_once(Method::PUT, &encode_doc_id(id), &qs, &headers, body, pump).await.map_err(DocWriteError::Http)?;
+        doc_write_result(&r)
     }
 
     /// update_docs/4 with new_edits=false: the docs that failed, as
@@ -673,14 +885,90 @@ fn is_view_arg(k: &str) -> bool {
     )
 }
 
+/// What update_doc/4's reply means.
+fn doc_write_result(r: &Resp) -> Result<String, DocWriteError> {
+    let v = r.json();
+    let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    match r.status {
+        200..=202 => Ok(field("rev")),
+        409 => Err(DocWriteError::Conflict),
+        401 if field("error") == "unauthorized" => Err(DocWriteError::Skip("unauthorized".into(), field("reason"))),
+        403 if field("error") == "forbidden" => Err(DocWriteError::Skip("forbidden".into(), field("reason"))),
+        412 if field("error") == "missing_stub" => Err(DocWriteError::MissingStub(field("reason"))),
+        413 => Err(DocWriteError::Skip("request_body_too_large".into(), String::new())),
+        415 => Err(DocWriteError::Skip("unsupported_media_type".into(), String::new())),
+        400 if field("error") == "bad_request" && field("reason").starts_with("Attachment name ") => {
+            Err(DocWriteError::Skip("invalid_attachment_name".into(), field("reason")))
+        }
+        code => Err(DocWriteError::Other(format!("{{{},{}}}", field("error"), if field("reason").is_empty() { code.to_string() } else { field("reason") }))),
+    }
+}
+
 #[derive(Debug)]
 pub enum DocWriteError {
     Conflict,
-    MissingStub,
+    MissingStub(String),
     /// Skipped and counted as a write failure (unauthorized, forbidden,
     /// too large, ...).
     Skip(String, String),
+    /// The request failed (send_req's exit): open_doc_revs starts over.
+    Http(HttpFail),
     Other(String),
+}
+
+/// Takes the revisions open_doc_revs reads (its user fun).
+pub trait DocHandler {
+    /// One revision: the doc's JSON and, if it has attachments marked
+    /// "follows", their bodies next in the response.
+    fn doc(&mut self, doc: Value, atts: Option<&mut AttParts<'_>>) -> impl Future<Output = Result<(), RepError>> + Send;
+}
+
+/// The attachment bodies after a doc's JSON in a multipart/related part,
+/// one part each in the order the JSON lists them.
+pub struct AttParts<'r> {
+    parts: multer::Multipart<'r>,
+    /// Why reading them failed, if it did: the source's failure, which
+    /// starts open_doc_revs over whatever the write made of it.
+    failed: Option<String>,
+}
+
+/// A response body a chunk per poll. multer takes in all a stream has
+/// ready at once, which from a fast source is the whole body; this way
+/// it holds a chunk at a time and comes back for more as it's consumed.
+struct OneChunk<S> {
+    inner: S,
+    /// A chunk was just handed over: the next poll yields to the reader.
+    ready: bool,
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for OneChunk<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<S::Item>> {
+        if std::mem::take(&mut self.ready) {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        let r = self.inner.poll_next_unpin(cx);
+        self.ready = matches!(r, std::task::Poll::Ready(Some(_)));
+        r
+    }
+}
+
+enum OpenRevsError {
+    /// Starts the request over, while retries last.
+    Retry(String),
+    UriTooLong,
+    Fail(RepError),
+}
+
+impl From<RepError> for OpenRevsError {
+    fn from(e: RepError) -> Self {
+        match e {
+            RepError::Http(f) => OpenRevsError::Retry(f.to_string()),
+            e => OpenRevsError::Fail(e),
+        }
+    }
 }
 
 /// A sequence as sent in `since` (seq_encode/1): strings as they are,
@@ -898,6 +1186,39 @@ mod tests {
         }
         assert_eq!(got, vec!["x".to_string(), "y\"}".to_string()]);
         assert!(scan.done);
+    }
+
+    #[test]
+    fn atts_since_fits_the_url() {
+        let ep = Endpoint {
+            url: "http://127.0.0.1:5984/db/".into(),
+            basic: None,
+            headers: vec![],
+            auth_props: Map::new(),
+            timeout_ms: 30000,
+            http_connections: 1,
+            retries: 1,
+            proxy: None,
+            tls: Default::default(),
+            session_auth: false,
+            session_refresh_secs: 0,
+        };
+        let c = Client::new(&ep).unwrap();
+        let revs = ["301-abc".to_string()];
+        eq_keys(&c.open_revs_qs("d", &revs, &[], MAX_URL_LEN), &["revs", "open_revs", "latest"]);
+        // As many ancestors as keep the request line short, first first.
+        let pas: Vec<String> = (1..=300).map(|i| format!("{i}-{i:032x}")).collect();
+        let qs = c.open_revs_qs("d", &revs, &pas, MAX_URL_LEN);
+        eq_keys(&qs, &["atts_since", "revs", "open_revs", "latest"]);
+        let since: Vec<String> = serde_json::from_str(&qs[0].1).unwrap();
+        assert!(!since.is_empty() && since.len() < pas.len() && since[..] == pas[..since.len()]);
+        assert!(format!("GET {} HTTP/1.1\r\n", c.url("d", &qs)).len() < MAX_URL_LEN);
+        let more: Vec<String> = serde_json::from_str(&c.open_revs_qs("d", &revs, &pas[..since.len() + 1], MAX_URL_LEN)[0].1).unwrap();
+        assert_eq!(more, since);
+    }
+
+    fn eq_keys(qs: &[(String, String)], keys: &[&str]) {
+        assert_eq!(qs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), keys);
     }
 
     #[test]

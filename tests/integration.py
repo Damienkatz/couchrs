@@ -1962,6 +1962,42 @@ def replication():
 
 
 @test
+def replication_large_attachment():
+    """A large attachment replicates byte for byte (streamed, not inlined),
+    with its digest, revpos, encoding and the doc's history as they are on
+    the source; later, a new attachment travels beside a stub of it."""
+    src, tgt = new_db(), "r" + uuid.uuid4().hex[:12]
+    big = os.urandom(48 * 1024 * 1024 + 7)
+    text = b"0123456789abcdef" * 65536  # compressible: stored gzipped
+    try:
+        rev = req("PUT", f"/{src}/big", {"kind": "large"})[1]["rev"]
+        s, b, _ = req("PUT", f"/{src}/big/big.bin?rev={rev}", big, headers={"Content-Type": "application/octet-stream"})
+        eq(s, 201, b)
+        eq(req("PUT", f"/{src}/big/notes.txt?rev={b['rev']}", text, headers={"Content-Type": "text/plain"})[0], 201)
+        eq(req("PUT", f"/{src}/small", {"n": 1})[0], 201)
+
+        def same():
+            for doc_id in ("big", "small"):
+                doc = req("GET", f"/{src}/{doc_id}?revs=true&att_encoding_info=true")[1]
+                eq(req("GET", f"/{tgt}/{doc_id}?revs=true&att_encoding_info=true")[1], doc)
+            for name in req("GET", f"/{src}/big")[1]["_attachments"]:
+                eq(req("GET", f"/{tgt}/big/{name}", raw=True)[1] == req("GET", f"/{src}/big/{name}", raw=True)[1], True, name)
+
+        s, b, _ = req("POST", "/_replicate", {"source": src, "target": tgt, "create_target": True})
+        eq(s, 200, b)
+        eq((b["history"][0]["docs_written"], b["history"][0]["doc_write_failures"]), (2, 0), b)
+        same()
+        eq(req("GET", f"/{tgt}/big?att_encoding_info=true")[1]["_attachments"]["notes.txt"]["encoding"], "gzip")
+        rev = req("GET", f"/{src}/big")[1]["_rev"]
+        eq(req("PUT", f"/{src}/big/later.bin?rev={rev}", b"\x00later", headers={"Content-Type": "application/octet-stream"})[0], 201)
+        s, b, _ = req("POST", "/_replicate", {"source": src, "target": tgt})
+        eq((s, b["history"][0]["docs_written"], b["history"][0]["doc_write_failures"]), (200, 3, 0), b)
+        same()
+    finally:
+        req("DELETE", f"/{tgt}")
+
+
+@test
 def replicator_database():
     src, tgt, cont = new_db(), "r" + uuid.uuid4().hex[:12], "r" + uuid.uuid4().hex[:12]
     one, run = "one_" + uuid.uuid4().hex[:8], "run_" + uuid.uuid4().hex[:8]

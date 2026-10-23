@@ -2,12 +2,14 @@
 //! _changes_reader). A reader follows the source's _changes into a
 //! bounded queue; workers take batches, ask the target which revisions
 //! it lacks (_revs_diff), fetch them (_bulk_get, else open_revs), and
-//! write them with new_edits=false; the job tracks the sequence below
+//! write them with new_edits=false: docs in _bulk_docs batches, docs with
+//! attachments and design docs one at a time, attachments streamed from
+//! source to target as they're read; the job tracks the sequence below
 //! which everything is done and checkpoints it, every checkpoint_interval,
 //! in _local/<replication id> on both ends.
 
 use super::RepError;
-use super::client::{Change, Client, DocWriteError, feed_stream, seq_encode};
+use super::client::{AttParts, Change, Client, DocHandler, DocWriteError, feed_stream, seq_encode};
 use super::rep::{Filter, REP_ID_VERSION, Rep, filter};
 use crate::server::Server;
 use futures::StreamExt;
@@ -584,6 +586,8 @@ async fn update_checkpoint(db: &Client, log: &Map<String, Value>, body: &Value, 
                 _ => Err(fail("conflict".into())),
             }
         }
+        // A failed request isn't caught: the job crashes with it.
+        Err(DocWriteError::Http(f)) => Err(f.to_string()),
         Err(e) => Err(fail(format!("{e:?}"))),
     }
 }
@@ -819,26 +823,19 @@ impl Worker {
             rest.retain(|(k, _)| !fetched.contains(k));
         }
         fetch.extend(rest);
-        // Each remaining revision on its own, a few at once.
-        let fetched: Vec<Result<Vec<Value>, String>> = futures::stream::iter(fetch)
+        // Each remaining revision on its own, a few at once: docs with
+        // attachments and design docs are written as they're read, the
+        // rest come back to be batched.
+        let fetched: Vec<Result<(Vec<Value>, Stats), String>> = futures::stream::iter(fetch)
             .map(|((id, rev), pas)| async move { self.fetch_doc(&id, &rev, &pas).await })
             .buffer_unordered(self.max_conns)
             .collect()
             .await;
-        for docs in fetched {
-            for doc in docs? {
-                let has_atts = doc.get("_attachments").and_then(Value::as_object).is_some_and(|o| !o.is_empty());
-                let is_ddoc = doc.get("_id").and_then(Value::as_str).is_some_and(|i| i.starts_with("_design/"));
-                if has_atts || is_ddoc {
-                    stats.docs_read += 1;
-                    if self.flush_doc(&doc).await? {
-                        stats.docs_written += 1;
-                    } else {
-                        stats.doc_write_failures += 1;
-                    }
-                } else {
-                    self.batch_doc(&doc, &mut batch, stats).await?;
-                }
+        for r in fetched {
+            let (docs, written) = r?;
+            stats.add(&written);
+            for doc in docs {
+                self.batch_doc(&doc, &mut batch, stats).await?;
             }
         }
         self.flush_docs(std::mem::take(&mut batch.docs), stats).await
@@ -872,17 +869,22 @@ impl Worker {
     }
 
     /// fetch_doc/4: open_revs with attachments since the ancestors; once
-    /// more without them if the source seems to lack the revision.
-    async fn fetch_doc(&self, id: &str, rev: &str, pas: &[String]) -> Result<Vec<Value>, String> {
-        match self.source.open_doc_revs(id, &[rev.to_string()], pas).await {
-            Ok(d) => Ok(d),
-            Err(RepError::MissingDoc) => {
-                tracing::error!("Retrying fetch and update of document `{id}` as it is unexpectedly missing. Missing revisions are: {rev}");
-                tokio::time::sleep(self.missing_retry).await;
-                self.source.open_doc_revs(id, &[rev.to_string()], &[]).await.map_err(|e| e.erl_text())
-            }
-            Err(e) => Err(e.erl_text()),
-        }
+    /// more without them if the source seems to lack the revision or the
+    /// target an attachment it was sent a stub for. The docs to batch, and
+    /// the stats of those written.
+    async fn fetch_doc(&self, id: &str, rev: &str, pas: &[String]) -> Result<(Vec<Value>, Stats), String> {
+        let mut reader = DocReader { worker: self, batch: Vec::new(), stats: Stats::default() };
+        let revs = [rev.to_string()];
+        let why = match self.source.open_doc_revs(id, &revs, pas, &mut reader).await {
+            Ok(()) => return Ok((reader.batch, reader.stats)),
+            Err(RepError::MissingDoc) => "as it is unexpectedly missing",
+            Err(RepError::MissingStub(_)) => "due to out of sync attachment stubs",
+            Err(e) => return Err(e.erl_text()),
+        };
+        tracing::error!("Retrying fetch and update of document `{id}` {why}. Missing revisions are: {rev}");
+        tokio::time::sleep(self.missing_retry).await;
+        self.source.open_doc_revs(id, &revs, &[], &mut reader).await.map_err(|e| e.erl_text())?;
+        Ok((reader.batch, reader.stats))
     }
 
     /// Add a doc to the batch, writing the batch first if it would pass
@@ -938,25 +940,18 @@ impl Worker {
         }
     }
 
-    /// Write one doc (design docs, docs with attachments); false when it
-    /// is skipped.
-    async fn flush_doc(&self, doc: &Value) -> Result<bool, String> {
-        let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default().to_string();
-        let rev = doc.get("_rev").and_then(Value::as_str).unwrap_or_default().to_string();
-        match self.target.update_doc(doc, true).await {
+    /// flush_doc/2: write one doc (design docs, docs with attachments,
+    /// their bodies streamed from `atts`); false when it is skipped.
+    async fn flush_doc(&self, doc: &Value, atts: Option<&mut AttParts<'_>>) -> Result<bool, RepError> {
+        let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default();
+        let rev = doc.get("_rev").and_then(Value::as_str).unwrap_or_default();
+        let r = match atts {
+            Some(atts) => self.target.update_doc_streaming(doc, atts).await,
+            None => self.target.update_doc(doc, true).await,
+        };
+        match r {
             Ok(_) => Ok(true),
-            Err(DocWriteError::MissingStub) => {
-                // Out-of-sync stubs: fetch everything and try once more.
-                tracing::error!("Retrying fetch and update of document `{id}` due to out of sync attachment stubs. Missing revisions are: {rev}");
-                tokio::time::sleep(self.missing_retry).await;
-                let docs = self.source.open_doc_revs(&id, &[rev], &[]).await.map_err(|e| e.erl_text())?;
-                for d in docs {
-                    if self.target.update_doc(&d, true).await.is_err() {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
+            Err(DocWriteError::MissingStub(reason)) => Err(RepError::MissingStub(reason)),
             Err(DocWriteError::Skip(err, reason)) => {
                 tracing::error!(
                     "Replicator: skipping writing document `{id}`, revision `{rev}`, to target database `{}`. Error: `{err}`, reason: `{reason}`.",
@@ -964,12 +959,44 @@ impl Worker {
                 );
                 Ok(false)
             }
-            Err(DocWriteError::Conflict) => Err(format!("{{doc_write_failed,{{conflict,<<\"{id}\">>}}}}")),
+            Err(DocWriteError::Conflict) => Err(RepError::Other(format!("{{doc_write_failed,{{conflict,<<\"{id}\">>}}}}"))),
+            // The request failed: open_doc_revs starts over.
+            Err(DocWriteError::Http(f)) => Err(RepError::Http(f)),
             Err(DocWriteError::Other(e)) => {
                 tracing::error!("Replicator: error writing document `{id}`, revision `{rev}`, to target database `{}`. Error: `{e}`.", self.target.ep.uri());
-                Err(format!("{{doc_write_failed,{e}}}"))
+                Err(RepError::Other(format!("{{doc_write_failed,{e}}}")))
             }
         }
+    }
+}
+
+/// remote_doc_handler/2: what a doc reader does with each revision.
+struct DocReader<'a> {
+    worker: &'a Worker,
+    /// Docs without attachments, for the worker's batch.
+    batch: Vec<Value>,
+    /// Of the docs written here.
+    stats: Stats,
+}
+
+impl DocHandler for DocReader<'_> {
+    async fn doc(&mut self, doc: Value, atts: Option<&mut AttParts<'_>>) -> Result<(), RepError> {
+        let is_ddoc = doc.get("_id").and_then(Value::as_str).is_some_and(|i| i.starts_with("_design/"));
+        let has_atts = doc.get("_attachments").and_then(Value::as_object).is_some_and(|o| !o.is_empty());
+        if !is_ddoc && !has_atts {
+            self.batch.push(doc);
+            return Ok(());
+        }
+        // Design docs alone, for their authorization failures; docs with
+        // attachments at once, their bodies coming in as they're sent.
+        let written = self.worker.flush_doc(&doc, atts).await?;
+        self.stats.docs_read += 1;
+        if written {
+            self.stats.docs_written += 1;
+        } else {
+            self.stats.doc_write_failures += 1;
+        }
+        Ok(())
     }
 }
 

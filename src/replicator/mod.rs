@@ -36,6 +36,9 @@ pub enum RepError {
     FilterFetch(String),
     Http(client::HttpFail),
     MissingDoc,
+    /// {missing_stub, Reason}: the target lacks an attachment it was sent
+    /// a stub for.
+    MissingStub(String),
     NotFound,
     Other(String),
 }
@@ -55,6 +58,7 @@ impl RepError {
             RepError::Forbidden(m) => m.clone(),
             RepError::Http(f) => f.to_string(),
             RepError::MissingDoc => "missing_doc".into(),
+            RepError::MissingStub(r) => format!("{{missing_stub,<<\"{r}\">>}}"),
             RepError::NotFound => "not_found".into(),
             RepError::Other(m) => m.clone(),
         }
@@ -88,6 +92,7 @@ impl RepError {
                 None => e(StatusCode::INTERNAL_SERVER_ERROR, "http_request_failed", &f.to_string()),
             },
             RepError::MissingDoc => e(StatusCode::INTERNAL_SERVER_ERROR, "missing_doc", "missing_doc"),
+            RepError::MissingStub(r) => e(StatusCode::PRECONDITION_FAILED, "missing_stub", r),
             RepError::NotFound => CouchError::not_found("missing"),
             RepError::Other(m) => e(StatusCode::INTERNAL_SERVER_ERROR, "error", m),
         }
