@@ -381,10 +381,14 @@ enum Indexer {
 }
 
 impl Indexer {
-    fn fields(&self, doc: &Value) -> Result<Vec<IndexField>> {
+    /// A doc's fields. JS index functions get its JSON as stored, unparsed.
+    fn fields(&self, snap: &Snapshot, fdi: &FullDocInfo) -> Result<Vec<IndexField>> {
         match self {
-            Indexer::Js(f) => Ok(f.index_doc(doc)?.into_iter().next().unwrap_or_default().iter().filter_map(index_field).collect()),
-            Indexer::Mango(def) => mango::index_doc(def, doc),
+            Indexer::Js(f) => {
+                let doc = snap.winner_json_text(fdi, &DocOpts::default())?;
+                Ok(f.index_doc_text(doc)?.into_iter().next().unwrap_or_default().into_iter().filter_map(index_field).collect())
+            }
+            Indexer::Mango(def) => mango::index_doc(def, &snap.winner_json(fdi, &DocOpts::default())?),
         }
     }
 }
@@ -397,8 +401,7 @@ fn to_updates(snap: &Snapshot, indexer: &Indexer, partitioned: bool, batch: Vec<
         if fdi.deleted {
             return Ok(Some(Update::Delete { id: fdi.id.clone() }));
         }
-        let doc = snap.winner_json(fdi, &DocOpts::default()).map_err(UpdateError::Other)?;
-        let fields = indexer.fields(&doc).map_err(UpdateError::Other)?;
+        let fields = indexer.fields(snap, fdi).map_err(UpdateError::Other)?;
         if fields.is_empty() {
             return Ok(Some(Update::Delete { id: fdi.id.clone() }));
         }
@@ -422,19 +425,21 @@ fn to_updates(snap: &Snapshot, indexer: &Indexer, partitioned: bool, batch: Vec<
     Ok(out)
 }
 
-fn index_field(v: &Value) -> Option<IndexField> {
-    let ty = match v.get("@type")?.as_str()? {
+fn index_field(v: Value) -> Option<IndexField> {
+    let Value::Object(mut o) = v else { return None };
+    let ty = match o.get("@type")?.as_str()? {
         "text" => FType::Text,
         "string" => FType::String,
         "double" => FType::Double,
         "stored" => FType::Stored,
         _ => return None,
     };
+    let Some(Value::String(name)) = o.remove("name") else { return None };
     Some(IndexField {
         ty,
-        name: v.get("name")?.as_str()?.to_string(),
-        value: v.get("value").cloned().unwrap_or(Value::Null),
-        store: v.get("store").and_then(Value::as_bool).unwrap_or(false),
+        name,
+        value: o.remove("value").unwrap_or(Value::Null),
+        store: o.get("store").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 

@@ -573,8 +573,17 @@ impl JsFuns {
     /// A Nouveau index function's fields for a document, per function:
     /// what each index() call recorded ({"@type", name, value, store}).
     pub fn index_doc(&self, doc: &Value) -> Result<Vec<Vec<Value>>> {
-        let out = unwrap_ok(self.call("__nouveau", CallArgs::S(doc.to_string()))?)?;
-        Ok(out.as_array().cloned().unwrap_or_default().into_iter().map(|f| f.as_array().cloned().unwrap_or_default()).collect())
+        self.index_doc_text(doc.to_string())
+    }
+
+    /// index_doc, for a doc already in JSON text.
+    pub fn index_doc_text(&self, doc: String) -> Result<Vec<Vec<Value>>> {
+        let out = unwrap_ok(self.call("__nouveau", CallArgs::S(doc))?)?;
+        let items = |v: Value| match v {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        Ok(items(out).into_iter().map(items).collect())
     }
 
     /// Compile a function's source, as couch_query_servers:try_compile/4
