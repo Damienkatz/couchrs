@@ -312,9 +312,10 @@ fn basic_auth(server: &Server, headers: &HeaderMap) -> Result<Option<Auth>> {
 /// in the short form or as {chttpd_auth, NAME_authentication_handler}.
 pub fn handlers(config: &Config) -> Vec<&'static str> {
     let spec = config.get_or("chttpd", "authentication_handlers", "cookie, default");
-    let re = regex::Regex::new(r"\b(cookie|default|proxy|jwt)(_authentication_handler)?\b").expect("regex");
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\b(cookie|default|proxy|jwt)(_authentication_handler)?\b").expect("regex"));
     let mut out: Vec<&'static str> = Vec::new();
-    for m in re.captures_iter(&spec) {
+    for m in RE.captures_iter(&spec) {
         let h = match &m[1] {
             "cookie" => "cookie",
             "default" => "default",
