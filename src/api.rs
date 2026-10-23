@@ -875,11 +875,6 @@ fn stream_pieces(snap: Snapshot, pieces: Vec<Piece>) -> Body {
 /// body, still to be read through.
 async fn read_multipart_doc(req: &Req, db: &Db) -> Result<(Doc, Multipart)> {
     let config = &req.server.config;
-    // couch_httpd:check_max_request_length/1
-    let max = config.get_int("chttpd", "max_http_request_size", 4294967296u64);
-    if req.header("content-length").and_then(|l| l.parse::<u64>().ok()).is_some_and(|l| l > max) {
-        return Err(crate::http::too_large());
-    }
     let boundary = crate::http::multipart_boundary(req.content_type()).ok_or_else(|| CouchError::bad_request("multipart boundary missing"))?;
     let mut mp = Multipart::new(req.take_body(), &boundary);
     let headers = mp.next_part().await?.ok_or_else(|| CouchError::bad_request("empty multipart body"))?;
@@ -1114,7 +1109,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                 let mut w = AttWriter::new(db, &req.server.config, &att);
                 let mut body = req.take_body();
                 while let Some(b) = body.next().await {
-                    let b = b.map_err(|e| CouchError::bad_request(e.to_string()))?;
+                    let b = b.map_err(crate::http::body_error)?;
                     if max.is_some_and(|m| w.len() + b.len() as u64 > m) {
                         return Err(att_too_large(name));
                     }

@@ -62,7 +62,7 @@ impl Multipart {
                 self.buf.extend_from_slice(&b);
                 Ok(true)
             }
-            Some(Err(e)) => Err(CouchError::bad_request(e.to_string())),
+            Some(Err(e)) => Err(crate::http::body_error(e)),
             None => Ok(false),
         }
     }

@@ -2305,11 +2305,11 @@ def streamed_uploads():
         eq(send_raw("PUT", f"/{db}/l", mp(doc, binary), mp_hdr, midway=compact)[0], 201)
         assert get("k/f") == binary and get("l/f") == binary
 
-        # max_http_request_size bounds a multipart PUT by its Content-Length
-        # alone, and not an attachment PUT; max_attachment_size bounds both,
-        # by the length given up front or the data as it comes.
+        # max_http_request_size bounds a multipart PUT by its Content-Length;
+        # max_attachment_size bounds both kinds, by the length given up
+        # front or the data as it comes.
         c, np = "/_node/_local/_config", {"X-Couch-Persist": "false"}
-        limits = {"chttpd/max_http_request_size": "2000", "couchdb/max_attachment_size": "2500"}
+        limits = {"chttpd/max_http_request_size": "4000", "couchdb/max_attachment_size": "2500"}
         before = {k: req("GET", f"{c}/{k}")[1] for k in limits}
         try:
             for k, v in limits.items():
@@ -2318,13 +2318,20 @@ def streamed_uploads():
             data = b"x" * 2400
             eq(send_raw("PUT", f"/{db}/g/f", data, octet)[0], 201)
             eq(send_raw("PUT", f"/{db}/h/f", data, octet, chunk=1000)[0], 201)
-            eq(send_raw("PUT", f"/{db}/i", mp(follows(f=len(data)), data), mp_hdr),
-               (413, {"error": "too_large", "reason": "the request entity is too large"}))
-            eq(send_raw("PUT", f"/{db}/i", mp(follows(f=len(data)), data), mp_hdr, chunk=1000)[0], 201)
-            too_large = (413, {"error": "attachment_too_large", "reason": "f"})
-            eq(send_raw("PUT", f"/{db}/j/f", data + b"x" * 200, octet), too_large)
-            eq(send_raw("PUT", f"/{db}/j/f", data + b"x" * 200, octet, chunk=1000), too_large)
-            eq(send_raw("PUT", f"/{db}/j", mp(follows(f=2600), b"x" * 5), mp_hdr, chunk=1000), too_large)
+            eq(send_raw("PUT", f"/{db}/i", mp(follows(f=len(data)), data), mp_hdr)[0], 201)
+            too_large = (413, {"error": "too_large", "reason": "the request entity is too large"})
+            eq(send_raw("PUT", f"/{db}/i", mp(follows(f=4100), b"x" * 4100), mp_hdr), too_large)
+            att_too_large = (413, {"error": "attachment_too_large", "reason": "f"})
+            eq(send_raw("PUT", f"/{db}/j/f", data + b"x" * 200, octet), att_too_large)
+            eq(send_raw("PUT", f"/{db}/j/f", data + b"x" * 200, octet, chunk=1000), att_too_large)
+            eq(send_raw("PUT", f"/{db}/j", mp(follows(f=2600), b"x" * 5), mp_hdr, chunk=1000), att_too_large)
+            # CouchDB lets an attachment PUT, and a chunked multipart PUT,
+            # run past max_http_request_size; CouchRS holds them to it.
+            if req("GET", "/")[1].get("vendor", {}).get("name") == "CouchRS":
+                req("PUT", f"{c}/couchdb/max_attachment_size", "infinity", headers=np)
+                eq(send_raw("PUT", f"/{db}/m/f", b"x" * 4100, octet), too_large)
+                eq(send_raw("PUT", f"/{db}/m/f", b"x" * 4100, octet, chunk=1000), too_large)
+                eq(send_raw("PUT", f"/{db}/m", mp(follows(f=4100), b"x" * 4100), mp_hdr, chunk=1000), too_large)
         finally:
             for k, v in before.items():
                 if isinstance(v, str):

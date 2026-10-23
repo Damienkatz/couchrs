@@ -291,18 +291,21 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
         .query()
         .map(parse_qs)
         .unwrap_or_default();
+    // [chttpd] max_http_request_size bounds a body: one left unread up
+    // front by its length, if it gives one, else as it arrives. (CouchDB
+    // lets an attachment PUT, and a chunked multipart PUT, run past it.)
+    let max = server.config.get_int("chttpd", "max_http_request_size", 4294967296usize);
     let ct = parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let (body, unread) = if crate::api::streams_body(&parts.method, &path, ct) {
-        (Bytes::new(), Unread(Arc::new(parking_lot::Mutex::new(Some(body)))))
+        let len = parts.headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|l| l.parse::<usize>().ok());
+        if len.is_some_and(|l| l > max) {
+            return too_large().into_response();
+        }
+        (Bytes::new(), Unread(Arc::new(parking_lot::Mutex::new(Some(Body::new(http_body_util::Limited::new(body, max)))))))
     } else {
-        // [chttpd] max_http_request_size bounds a body.
-        let max = server.config.get_int("chttpd", "max_http_request_size", 4294967296usize);
         match axum::body::to_bytes(body, max).await {
             Ok(b) => (b, Unread::default()),
-            Err(e) if std::error::Error::source(&e).is_some_and(|s| s.is::<http_body_util::LengthLimitError>()) => {
-                return too_large().into_response();
-            }
-            Err(e) => return CouchError::bad_request(e.to_string()).into_response(),
+            Err(e) => return body_error(e).into_response(),
         }
     };
     let method = parts.method.clone();
@@ -365,6 +368,15 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
 /// A body over [chttpd] max_http_request_size.
 pub fn too_large() -> CouchError {
     CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "the request entity is too large")
+}
+
+/// Why reading a request body failed: too large, or the client.
+pub fn body_error(e: axum::Error) -> CouchError {
+    if std::error::Error::source(&e).is_some_and(|s| s.is::<http_body_util::LengthLimitError>()) {
+        too_large()
+    } else {
+        CouchError::bad_request(e.to_string())
+    }
 }
 
 pub fn now_secs() -> u64 {
