@@ -531,17 +531,7 @@ impl Snapshot {
         Ok(n)
     }
 
-    /// Changes before `seq` (what a descending _changes has left).
-    pub fn pending_before(&self, seq: u64) -> u64 {
-        let mut n = 0u64;
-        let _ = self.view.scan(CF_SEQ, None, Some(&be(seq)), false, |_, _| {
-            n += 1;
-            Ok(true)
-        });
-        n
-    }
-
-    /// Changes after `seq` (the `pending` count of _changes), by scanning.
+    /// Changes after `seq` (count_changes_since/2), by scanning.
     pub fn pending_after(&self, seq: u64) -> u64 {
         let mut n = 0u64;
         let _ = self.view.scan(CF_SEQ, Some(&be(seq + 1)), None, false, |_, _| {

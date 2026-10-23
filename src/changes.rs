@@ -12,14 +12,16 @@ use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub enum Filter {
     None,
-    DocIds(HashSet<String>),
+    /// Each id with the times it was given: looked up, a doc comes back
+    /// once for each.
+    DocIds(HashMap<String, usize>),
     Design,
     Selector(crate::mango::Selector),
     Js(crate::js::ChangesFilter),
@@ -43,6 +45,11 @@ pub struct ChangesArgs {
     pub transform: Option<fn(&Value) -> Option<Value>>,
     /// _db_updates: no pending counts.
     pub db_updates: bool,
+    /// The feed looks the filter's docs up instead of passing over every
+    /// change (a _doc_ids list within changes_doc_ids_optimization_threshold,
+    /// or _design: fabric_rpc:do_changes/5), so only they count toward
+    /// `pending`.
+    pub lookup: bool,
 }
 
 fn parse_args(req: &Req, db: &Db) -> Result<ChangesArgs> {
@@ -75,6 +82,7 @@ fn parse_args(req: &Req, db: &Db) -> Result<ChangesArgs> {
         None => None,
     };
     let filter_name = req.q("filter").map(String::from);
+    let mut lookup = false;
     let filter = match filter_name.as_deref() {
         None => Filter::None,
         Some("_doc_ids") => {
@@ -85,13 +93,18 @@ fn parse_args(req: &Req, db: &Db) -> Result<ChangesArgs> {
             };
             let ids = ids
                 .as_array()
-                .ok_or_else(|| CouchError::bad_request("`doc_ids` filter parameter is not a list of doc ids."))?
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            Filter::DocIds(ids)
+                .ok_or_else(|| CouchError::bad_request("`doc_ids` filter parameter is not a list of doc ids."))?;
+            lookup = ids.len() as u64 <= req.server.config.get_int("couchdb", "changes_doc_ids_optimization_threshold", 1000u64);
+            let mut counts = HashMap::new();
+            for id in ids.iter().filter_map(Value::as_str) {
+                *counts.entry(id.to_string()).or_insert(0) += 1;
+            }
+            Filter::DocIds(counts)
         }
-        Some("_design") => Filter::Design,
+        Some("_design") => {
+            lookup = true;
+            Filter::Design
+        }
         Some("_selector") => {
             let sel = body
                 .as_ref()
@@ -148,6 +161,7 @@ fn parse_args(req: &Req, db: &Db) -> Result<ChangesArgs> {
         seq_interval: req.q_u64("seq_interval")?,
         transform: None,
         db_updates: false,
+        lookup,
     })
 }
 
@@ -164,7 +178,7 @@ impl Filter {
     fn matches(&mut self, snap: &Snapshot, fdi: &FullDocInfo, req: &Value) -> Result<bool> {
         Ok(match self {
             Filter::None => true,
-            Filter::DocIds(ids) => ids.contains(&fdi.id),
+            Filter::DocIds(ids) => ids.contains_key(&fdi.id),
             Filter::Design => fdi.id.starts_with("_design/"),
             Filter::Selector(sel) => {
                 let doc = snap.winner_json(fdi, &DocOpts::default())?;
@@ -200,31 +214,55 @@ fn change_row(snap: &Snapshot, fdi: &FullDocInfo, args: &ChangesArgs) -> Result<
     Ok(row)
 }
 
-/// Collect up to `limit` matching rows after `since`. Returns rows and the
-/// last seq examined.
-fn collect(snap: &Snapshot, args: &mut ChangesArgs, since: u64, limit: usize) -> Result<(Vec<Value>, u64)> {
+/// Collect up to `limit` matching rows after `since`. Returns rows, the
+/// last seq examined, and `pending`.
+///
+/// `pending` is counted as CouchDB does: the changes after `since` (all of
+/// them, descending), less each doc the feed visits, filtered out or not
+/// (fabric_rpc:changes_enumerator/2). On the lookup path only the filter's
+/// docs are visited.
+fn collect(snap: &Snapshot, args: &mut ChangesArgs, since: u64, limit: usize) -> Result<(Vec<Value>, u64, u64)> {
     let mut rows = Vec::new();
     let dir = if args.descending { Dir::Rev } else { Dir::Fwd };
-    let mut last = since;
-    let req = args.req_json.clone();
     // Descending starts at the newest change, whatever `since` says.
-    let start = if args.descending { 0 } else { since };
+    let (start, mut last) = if args.descending { (0, snap.update_seq()) } else { (since, since) };
+    let req = args.req_json.clone();
+    let total = snap.pending_after(start);
+    let mut visited = 0u64;
     snap.fold_changes(start, dir, |fdi| {
-        // Check the limit before advancing `last`: a change we stop in
-        // front of must not be covered by last_seq, or a client that
-        // checkpoints last_seq would skip it.
-        if rows.len() >= limit {
+        if rows.len() >= limit && args.lookup {
             return Ok(false);
         }
-        last = fdi.update_seq;
-        if args.filter.matches(snap, fdi, &req)? {
-            let row = change_row(snap, fdi, args)?;
-            match args.transform {
-                Some(t) => rows.extend(t(&row)),
-                None => rows.push(row),
-            }
+        let pass = args.filter.matches(snap, fdi, &req)?;
+        let visits = match &args.filter {
+            _ if !args.lookup => 1,
+            _ if !pass => 0,
+            Filter::DocIds(ids) => ids.get(&fdi.id).copied().unwrap_or(1),
+            _ => 1,
+        };
+        for _ in 0..visits {
+            // Check the limit before advancing `last`: a change we stop in
+            // front of must not be covered by last_seq, or a client that
+            // checkpoints last_seq would skip it. One that doesn't pass is
+            // (fabric_view_changes takes the seq of the doc after the last
+            // row), and with no rows yet (limit=0) it counts as visited.
             if rows.len() >= limit {
+                if !pass {
+                    last = fdi.update_seq;
+                    if rows.is_empty() {
+                        visited += 1;
+                    }
+                }
                 return Ok(false);
+            }
+            last = fdi.update_seq;
+            visited += 1;
+            if pass {
+                let row = change_row(snap, fdi, args)?;
+                match args.transform {
+                    Some(t) => rows.extend(t(&row)),
+                    None => rows.push(row),
+                }
             }
         }
         Ok(true)
@@ -232,11 +270,7 @@ fn collect(snap: &Snapshot, args: &mut ChangesArgs, since: u64, limit: usize) ->
     if rows.len() < limit && !args.descending {
         last = last.max(snap.update_seq());
     }
-    Ok((rows, last))
-}
-
-fn pending(snap: &Snapshot, last: u64) -> u64 {
-    snap.pending_after(last)
+    Ok((rows, last, total.saturating_sub(visited)))
 }
 
 /// A client waiting on a longpoll, continuous or eventsource feed, counted
@@ -271,20 +305,8 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
             let snap = db.snapshot();
             let since = args.since;
             let limit = args.limit;
-            let (rows, last) = blocking(|| collect(&snap, &mut args, since, limit))?;
-            let last_seq = if args.descending {
-                rows.last().map(|r| r["seq"].clone()).unwrap_or(json!(snap.seq_str(0)))
-            } else {
-                json!(snap.seq_str(last))
-            };
-            // Descending, what's left are the changes before the last row.
-            let pend = if args.descending {
-                let lowest = rows.last().and_then(|r| parse_seq(&r["seq"])).unwrap_or(u64::MAX);
-                snap.pending_before(lowest)
-            } else {
-                pending(&snap, last)
-            };
-            let mut out = json!({"results": rows, "last_seq": last_seq, "pending": pend});
+            let (rows, last, pend) = blocking(|| collect(&snap, &mut args, since, limit))?;
+            let mut out = json!({"results": rows, "last_seq": snap.seq_str(last), "pending": pend});
             if args.db_updates {
                 out.as_object_mut().map(|o| o.shift_remove("pending"));
                 return Ok(json_response(StatusCode::OK, &out));
@@ -299,9 +321,8 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
                 let snap = db.snapshot();
                 let since = args.since;
                 let limit = args.limit;
-                let (rows, last) = blocking(|| collect(&snap, &mut args, since, limit))?;
+                let (rows, last, pend) = blocking(|| collect(&snap, &mut args, since, limit))?;
                 if !rows.is_empty() || tokio::time::Instant::now() >= deadline {
-                    let pend = pending(&snap, last);
                     let mut out = json!({"results": rows, "last_seq": snap.seq_str(last), "pending": pend});
                     if args.db_updates {
                         out.as_object_mut().map(|o| o.shift_remove("pending"));
@@ -313,7 +334,7 @@ async fn run_feed(db: Arc<Db>, mut args: ChangesArgs) -> Result<Response> {
                 let wait = tokio::time::timeout_at(deadline, rx.changed()).await;
                 if wait.is_err() {
                     let snap = db.snapshot();
-                    let mut out = json!({"results": [], "last_seq": snap.seq_str(args.since), "pending": 0});
+                    let mut out = json!({"results": [], "last_seq": snap.seq_str(args.since), "pending": pend});
                     if args.db_updates {
                         out.as_object_mut().map(|o| o.shift_remove("pending"));
                         return Ok(json_response(StatusCode::OK, &out));
@@ -354,7 +375,7 @@ fn continuous_stream(
             rx.borrow_and_update();
             let snap = db.snapshot();
             let res = tokio::task::block_in_place(|| collect(&snap, &mut args, since, remaining));
-            let (rows, last) = match res {
+            let (rows, last, pend) = match res {
                 Ok(r) => r,
                 Err(e) => {
                     yield Ok(Bytes::from(format!("{}\n", crate::json::to_string(&e.json()))));
@@ -376,7 +397,7 @@ fn continuous_stream(
             since = last;
             if remaining == 0 {
                 if !eventsource {
-                    let end = if args.db_updates { json!({"last_seq": snap.seq_str(since)}) } else { json!({"last_seq": snap.seq_str(since), "pending": pending(&snap, since)}) };
+                    let end = if args.db_updates { json!({"last_seq": snap.seq_str(since)}) } else { json!({"last_seq": snap.seq_str(since), "pending": pend}) };
                     yield Ok(Bytes::from(format!("{end}\n")));
                 }
                 break;
@@ -409,7 +430,7 @@ fn continuous_stream(
             if done {
                 if !eventsource {
                     let snap = db.snapshot();
-                    let end = if args.db_updates { json!({"last_seq": snap.seq_str(since)}) } else { json!({"last_seq": snap.seq_str(since), "pending": 0}) };
+                    let end = if args.db_updates { json!({"last_seq": snap.seq_str(since)}) } else { json!({"last_seq": snap.seq_str(since), "pending": pend}) };
                     yield Ok(Bytes::from(format!("{end}\n")));
                 }
                 break;
@@ -481,6 +502,7 @@ pub async fn db_updates(req: Req) -> Result<Response> {
         seq_interval: None,
         transform: Some(db_update_row),
         db_updates: true,
+        lookup: false,
     };
     run_feed(db, args).await
 }

@@ -403,6 +403,38 @@ def changes_feed():
 
 
 @test
+def changes_pending_counts():
+    # pending is the changes since `since` less the docs the feed visits:
+    # every one it passes over, but on the _doc_ids and _design lookup
+    # paths only the docs asked for.
+    db = new_db()
+    eq(req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": f"d{i}", "n": i} for i in range(10)]})[0], 201)
+    eq(req("PUT", f"/{db}/_design/f", {"filters": {"even": "function(d){ return d.n % 2 == 0; }"}})[0], 201)
+    seq = lambda v: int(v.split("-")[0])
+    def changes(q):
+        b = req("GET", f"/{db}/_changes?{q}")[1]
+        return [r["id"] for r in b["results"]], seq(b["last_seq"]), b["pending"]
+    ids = urllib.parse.quote('["d1","d3","nope"]')
+    eq(changes(f"filter=_doc_ids&doc_ids={ids}"), (["d1", "d3"], 11, 9))
+    eq(changes(f"filter=_doc_ids&doc_ids={ids}&limit=1"), (["d1"], 2, 10))
+    eq(changes(f"filter=_doc_ids&doc_ids={ids}&descending=true"), (["d3", "d1"], 2, 9))
+    # An id given twice is looked up, and comes back, twice.
+    eq(changes("filter=_doc_ids&doc_ids=" + urllib.parse.quote('["d1","d1"]')), (["d1", "d1"], 11, 9))
+    eq(changes("filter=_design"), (["_design/f"], 11, 10))
+    # Passing over everything, nothing is left; stopped by the limit,
+    # last_seq moves past a next doc that doesn't pass.
+    eq(changes("filter=f/even"), (["d0", "d2", "d4", "d6", "d8"], 11, 0))
+    eq(changes("filter=f/even&limit=1"), (["d0"], 2, 10))
+    eq(changes("filter=f/even&limit=2"), (["d0", "d2"], 4, 8))
+    eq(changes("filter=f/even&descending=true&limit=1"), (["d8"], 8, 8))
+    eq(changes("limit=0"), ([], 0, 11))
+    # A continuous feed's timeout reports its last round's count.
+    s, b, _ = req("GET", f"/{db}/_changes?feed=continuous&timeout=100&filter=_doc_ids&doc_ids={ids}", raw=True)
+    end = json.loads(b.decode().strip().splitlines()[-1])
+    eq((seq(end["last_seq"]), end["pending"]), (11, 9))
+
+
+@test
 def views():
     db = new_db()
     docs = [{"_id": f"p{i}", "type": "post", "author": a, "words": w, "tags": t}
