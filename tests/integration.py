@@ -693,6 +693,28 @@ def exact_numbers():
 
 
 @test
+def view_reads_while_rebuilding():
+    """A purge makes the next update rebuild the index; queries that don't
+    wait for it (update=false, update=lazy) keep reading the old one."""
+    db = new_db()
+    try:
+        _, res, _ = req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": f"d{i:04}", "n": i, "pad": "x" * 40} for i in range(3000)]})
+        revs = {r["id"]: r["rev"] for r in res}
+        req("PUT", f"/{db}/_design/v", {"views": {"by_n": {"map": "function(d) { emit(d.n, d.pad); }"}}})
+        eq(req("GET", f"/{db}/_design/v/_view/by_n?limit=1")[1]["total_rows"], 3000)
+        for i in range(8):
+            eq(req("POST", f"/{db}/_purge", {f"d{i:04}": [revs[f"d{i:04}"]]})[0], 201)
+            for q in ("stable=true&update=lazy&limit=1", "update=false&skip=2000&limit=2"):
+                s, b, _ = req("GET", f"/{db}/_design/v/_view/by_n?{q}")
+                eq(s, 200, f"{q}: {b}")
+                assert b["rows"], b
+        b = req("GET", f"/{db}/_design/v/_view/by_n?limit=1")[1]
+        eq((b["total_rows"], b["rows"][0]["key"]), (2992, 8))
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
 def compaction_preserves_data():
     db = new_db()
     for i in range(20):

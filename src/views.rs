@@ -1140,6 +1140,18 @@ impl Index {
         self.state.read().clone()
     }
 
+    /// Put a new, empty file in place of the index's, for a rebuild. The
+    /// old one, unlinked, stays open for queries still reading the state
+    /// it holds (update=false or lazy), which truncating it would break.
+    fn replace_file(&self) -> Result<Arc<CouchFile>> {
+        let tmp = self.path.with_extension("new.view");
+        let _ = std::fs::remove_file(&tmp);
+        let file = Arc::new(CouchFile::open(&tmp, true)?);
+        std::fs::rename(&tmp, &self.path)?;
+        *self.file.write() = file.clone();
+        Ok(file)
+    }
+
     fn commit(&self, st: &IndexState) -> Result<()> {
         let file = self.file.read().clone();
         let h = IndexHeader {
@@ -1229,8 +1241,7 @@ impl Index {
         let mut st = self.state();
         if snap.header.purge_seq != st.purge_seq || st.seq > snap.update_seq() {
             // Purges (and db recreation) invalidate the index: rebuild.
-            let file = self.file.read().clone();
-            file.truncate(0)?;
+            let file = self.replace_file()?;
             st = fresh_state(&file, &self.def);
             st.purge_seq = snap.header.purge_seq;
         }
@@ -2091,7 +2102,9 @@ pub fn cleanup_index_files(server: &Server, db: &Arc<Db>) -> Result<()> {
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if let Some(sig) = name.strip_suffix(".view")
+            // SIG.view, and SIG.compact.view or SIG.new.view while a live
+            // index is compacting or rebuilding.
+            if let Some(sig) = name.strip_suffix(".view").and_then(|n| n.split('.').next())
                 && !live.contains(sig) {
                     let _ = std::fs::remove_file(e.path());
                     db.ext.lock().remove(&format!("mrview:{sig}"));
