@@ -25,7 +25,7 @@ use parking_lot::{Mutex, RwLock};
 use rocksdb::{WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
@@ -650,6 +650,9 @@ pub struct Db {
     compacting: AtomicBool,
     /// Next id for a body or attachment chunk.
     next_ptr: AtomicU64,
+    /// Floors of ids being written ahead of the commit that will refer to
+    /// them, each with its holders (see `staging`).
+    staging: Mutex<BTreeMap<u64, usize>>,
     /// Per-database extension state (view indexes), keyed by signature.
     pub ext: Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
     /// Messages waiting for the writer.
@@ -827,6 +830,7 @@ impl Db {
             seq_tx,
             compacting: AtomicBool::new(false),
             next_ptr: AtomicU64::new(next_ptr),
+            staging: Mutex::new(BTreeMap::new()),
             ext: Mutex::new(HashMap::new()),
             queued: queued.clone(),
             compacted_seq: AtomicU64::new(u64::MAX),
@@ -926,6 +930,26 @@ impl Db {
         self.next_ptr.fetch_add(n, AtomicOrdering::Relaxed)
     }
 
+    /// Keep compaction off the ids allocated from now until the guard
+    /// drops. Hold it from before writing data ahead of the commit that
+    /// refers to it (attachments stored as they arrive) until that commit
+    /// is published or abandoned: compaction's snapshot may not show the
+    /// doc yet, and would sweep the data as unreferenced.
+    pub fn staging(&self) -> Staging<'_> {
+        let mut s = self.staging.lock();
+        let floor = self.next_ptr.load(AtomicOrdering::SeqCst);
+        *s.entry(floor).or_default() += 1;
+        Staging { db: self, floor }
+    }
+
+    /// The id compaction sweeps below: none allocated since it started,
+    /// nor any staged since the lowest floor still held.
+    fn sweep_limit(&self) -> u64 {
+        let s = self.staging.lock();
+        let next = self.next_ptr.load(AtomicOrdering::SeqCst);
+        s.keys().next().map_or(next, |&f| f.min(next))
+    }
+
     /// Write a doc's new attachment bytes before it reaches the writer
     /// thread, so large uploads don't stall every other write. They become
     /// durable with the doc's own synced commit, which follows them in the
@@ -1005,8 +1029,11 @@ impl Db {
                 tracing::warn!("purge checkpoints of {}: {}", self.name, e.reason);
             }
         }
+        // The limit before the snapshot: an id under it was allocated by
+        // a write already published, so the snapshot shows what refers to
+        // it, or by one abandoned.
+        let limit = self.sweep_limit();
         let snap = self.snapshot();
-        let limit = self.next_ptr.load(AtomicOrdering::SeqCst);
         let mut live_bodies: Vec<u64> = Vec::new();
         let mut live_chunks: Vec<u64> = Vec::new();
         let mut with_old: Vec<String> = Vec::new();
@@ -1270,6 +1297,9 @@ fn flush_updates(db: &Db, batch: UpdateBatch) {
             crate::stat!("couchdb.coalesced_updates.replicated").inc();
         }
     }
+    // Bodies and chunks this batch writes are unreferenced until commit
+    // publishes it.
+    let _staging = db.staging();
     let snap = db.snapshot();
     match apply_updates(db, &snap, &batch) {
         Ok((wb, header, results, counts)) => {
@@ -1531,6 +1561,163 @@ fn write_att_chunks(db: &Db, bytes: &[u8]) -> Result<(Vec<Pos>, u64)> {
         db.store.db.write(batch).map_err(rerr)?;
     }
     Ok((chunks, stored))
+}
+
+/// A staging floor held (`Db::staging`).
+pub struct Staging<'a> {
+    db: &'a Db,
+    floor: u64,
+}
+
+impl Drop for Staging<'_> {
+    fn drop(&mut self) {
+        let mut s = self.db.staging.lock();
+        if let Some(n) = s.get_mut(&self.floor) {
+            *n -= 1;
+            if *n == 0 {
+                s.remove(&self.floor);
+            }
+        }
+    }
+}
+
+/// How much attachment data an AttWriter gathers before storing it.
+const ATT_FLUSH: usize = 16 * ATT_CHUNK;
+
+/// An attachment's data stored as it arrives, ahead of its doc's update
+/// (under a `Db::staging` guard taken before the writer): gzipped first
+/// if its type is compressible, as couch_db:with_stream/3 does, and cut
+/// into chunks as write_att_chunks cuts them. It holds no more than a
+/// flush's worth at a time.
+pub struct AttWriter<'a> {
+    db: &'a Db,
+    gzip: Option<flate2::Compress>,
+    /// Data taken and not yet stored.
+    input: Vec<u8>,
+    /// Encoded bytes short of a whole chunk.
+    tail: Vec<u8>,
+    len: u64,
+    md5: Md5,
+    /// Of the gzipped bytes, when gzipping.
+    encoded_len: u64,
+    encoded_md5: Md5,
+    chunks: Vec<Pos>,
+    stored: u64,
+}
+
+impl<'a> AttWriter<'a> {
+    pub fn new(db: &'a Db, config: &crate::config::Config, a: &Att) -> AttWriter<'a> {
+        AttWriter {
+            db,
+            gzip: gzip_level(config, a).map(|l| flate2::Compress::new_gzip(flate2::Compression::new(l.min(9)), 15)),
+            input: Vec::new(),
+            tail: Vec::new(),
+            len: 0,
+            md5: Md5::new(),
+            encoded_len: 0,
+            encoded_md5: Md5::new(),
+            chunks: Vec::new(),
+            stored: 0,
+        }
+    }
+
+    /// Bytes taken so far.
+    pub fn len(&self) -> u64 {
+        self.len + self.input.len() as u64
+    }
+
+    /// Take more of the data; true once enough has gathered to `flush`.
+    pub fn push(&mut self, data: &[u8]) -> bool {
+        self.input.extend_from_slice(data);
+        self.input.len() >= ATT_FLUSH
+    }
+
+    /// Store what has gathered, in whole chunks. Blocks.
+    pub fn flush(&mut self) -> Result<()> {
+        self.store(false)
+    }
+
+    /// Store the rest and make `a` the attachment stored: its data, the
+    /// lengths and digest CouchDB keeps for it, and gzip if this gzipped.
+    /// Sent encoded, `a` keeps the identity length it came with, if any.
+    /// A digest `a` came with must be the data's (couch_util:check_md5/2).
+    /// Blocks.
+    pub fn finish(mut self, a: &mut Att) -> Result<()> {
+        self.store(true)?;
+        let md5 = self.md5.finalize().to_vec();
+        if !a.md5.is_empty() && a.md5 != md5 {
+            return Err(CouchError::new(axum::http::StatusCode::BAD_REQUEST, "content_md5_mismatch", "Possible message corruption."));
+        }
+        if self.gzip.is_some() {
+            a.length = self.len;
+            a.md5 = self.encoded_md5.finalize().to_vec();
+            a.encoding = Some("gzip".into());
+            a.encoded_length = self.encoded_len;
+        } else {
+            if a.encoding.is_none() {
+                a.length = self.len;
+            }
+            a.md5 = md5;
+            a.encoded_length = self.len;
+        }
+        a.stored_length = self.stored;
+        a.data = AttData::Staged(self.chunks);
+        Ok(())
+    }
+
+    fn store(&mut self, last: bool) -> Result<()> {
+        self.md5.update(&self.input);
+        self.len += self.input.len() as u64;
+        let from = self.tail.len();
+        match &mut self.gzip {
+            Some(c) => deflate(c, &self.input, &mut self.tail, last),
+            None => self.tail.extend_from_slice(&self.input),
+        }
+        self.input.clear();
+        if self.gzip.is_some() {
+            self.encoded_md5.update(&self.tail[from..]);
+            self.encoded_len += (self.tail.len() - from) as u64;
+        }
+        let cf = self.db.store.cf(CF_ATT);
+        let mut batch = WriteBatch::default();
+        let mut at = 0;
+        while self.tail.len() - at >= ATT_CHUNK || (last && at < self.tail.len()) {
+            let end = (at + ATT_CHUNK).min(self.tail.len());
+            let id = self.db.alloc_ptrs(1);
+            let e = crate::file::encode_chunk(&self.tail[at..end]);
+            self.stored += e.len() as u64;
+            batch.put_cf(&cf, be(id), e);
+            self.chunks.push(id);
+            at = end;
+        }
+        self.tail.drain(..at);
+        if !batch.is_empty() {
+            self.db.store.db.write(batch).map_err(rerr)?;
+        }
+        Ok(())
+    }
+}
+
+/// Deflate `input` onto `out`, finishing the stream if `last`. Fed in
+/// pieces this way, zlib writes the bytes it would for the whole data at
+/// once, as couch_stream feeds it.
+fn deflate(c: &mut flate2::Compress, input: &[u8], out: &mut Vec<u8>, last: bool) {
+    let flush = if last { flate2::FlushCompress::Finish } else { flate2::FlushCompress::None };
+    let start = c.total_in();
+    loop {
+        out.reserve(ATT_CHUNK);
+        let done = (c.total_in() - start) as usize;
+        match c.compress_vec(&input[done..], out, flush) {
+            Ok(flate2::Status::StreamEnd) | Err(_) => return,
+            Ok(_) => {
+                // Not finishing, it's done when it took all the input
+                // without filling the space it had.
+                if !last && (c.total_in() - start) as usize == input.len() && out.len() < out.capacity() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// The members of a JSON object's text, between its braces.

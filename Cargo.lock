@@ -429,6 +429,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "md-5",
+ "memchr",
  "mime",
  "multer",
  "p521",

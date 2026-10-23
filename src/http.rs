@@ -22,6 +22,9 @@ pub struct Req {
     pub query: Vec<(String, String)>,
     pub headers: HeaderMap,
     pub body: Bytes,
+    /// The body, when the front end left it for the handler to read as it
+    /// arrives (`body` is then empty): see `take_body`.
+    pub unread: Unread,
     pub server: Arc<Server>,
     /// Whether the raw path ended in '/' (lost when splitting `path`).
     pub trailing_slash: bool,
@@ -36,6 +39,10 @@ pub struct Req {
 /// Marks the requests of the HTTPS listener.
 #[derive(Clone, Copy)]
 pub struct Tls;
+
+/// A request body not yet read (crate::api::streams_body), taken once.
+#[derive(Clone, Default)]
+pub struct Unread(Arc<parking_lot::Mutex<Option<Body>>>);
 
 /// couch_util:url_encode/1: all but letters, digits and _ . - : as %XX.
 pub fn url_encode(s: &str) -> String {
@@ -136,6 +143,12 @@ impl Req {
                 format!("{other} is not a supported content encoding."),
             )),
         }
+    }
+
+    /// The body as it arrives, if the front end left it unread, else the
+    /// bytes it read.
+    pub fn take_body(&self) -> axum::body::BodyDataStream {
+        self.unread.0.lock().take().unwrap_or_else(|| Body::from(self.body.clone())).into_data_stream()
     }
 
     pub fn json_obj_body(&self) -> Result<serde_json::Map<String, Value>> {
@@ -278,14 +291,19 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
         .query()
         .map(parse_qs)
         .unwrap_or_default();
-    // [chttpd] max_http_request_size bounds a body.
-    let max = server.config.get_int("chttpd", "max_http_request_size", 4294967296usize);
-    let body = match axum::body::to_bytes(body, max).await {
-        Ok(b) => b,
-        Err(e) if std::error::Error::source(&e).is_some_and(|s| s.is::<http_body_util::LengthLimitError>()) => {
-            return CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "the request entity is too large").into_response();
+    let ct = parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let (body, unread) = if crate::api::streams_body(&parts.method, &path, ct) {
+        (Bytes::new(), Unread(Arc::new(parking_lot::Mutex::new(Some(body)))))
+    } else {
+        // [chttpd] max_http_request_size bounds a body.
+        let max = server.config.get_int("chttpd", "max_http_request_size", 4294967296usize);
+        match axum::body::to_bytes(body, max).await {
+            Ok(b) => (b, Unread::default()),
+            Err(e) if std::error::Error::source(&e).is_some_and(|s| s.is::<http_body_util::LengthLimitError>()) => {
+                return too_large().into_response();
+            }
+            Err(e) => return CouchError::bad_request(e.to_string()).into_response(),
         }
-        Err(e) => return CouchError::bad_request(e.to_string()).into_response(),
     };
     let method = parts.method.clone();
     let req = Req {
@@ -294,6 +312,7 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
         query,
         headers: parts.headers,
         body,
+        unread,
         server,
         trailing_slash: raw_path.ends_with('/'),
         auth: crate::auth::Auth::default(),
@@ -341,6 +360,11 @@ async fn handle_req(server: Arc<Server>, req: Request) -> Response {
         return Response::from_parts(parts, Body::empty());
     }
     resp
+}
+
+/// A body over [chttpd] max_http_request_size.
+pub fn too_large() -> CouchError {
+    CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "the request entity is too large")
 }
 
 pub fn now_secs() -> u64 {

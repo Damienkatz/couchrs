@@ -1,16 +1,17 @@
 //! Database and document endpoints (chttpd_db).
 
 use crate::btree::{Dir, Range};
-use crate::db::{Db, Snapshot};
+use crate::db::{AttWriter, Db, Snapshot};
 use crate::doc::*;
 use crate::error::{CouchError, Result};
 use crate::http::{Req, empty, json_response, new_uuid, not_allowed, ok_json, with_header};
+use crate::multipart::Multipart;
 use axum::body::Body;
 use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
 use base64::Engine;
 use bytes::Bytes;
-use md5::{Digest, Md5};
+use futures::StreamExt;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
@@ -24,6 +25,31 @@ use std::sync::Arc;
 /// serialize, and the server stalls with its CPUs idle.
 pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
     tokio::task::block_in_place(f)
+}
+
+/// Whether a request's body is left for its handler to read as it
+/// arrives rather than read first: the PUTs db_request gives att_request
+/// and, multipart, put_doc, which store attachments as they come in.
+pub fn streams_body(method: &Method, path: &[String], content_type: &str) -> bool {
+    let [db, rest @ ..] = path else { return false };
+    if *method != Method::PUT || (db.starts_with('_') && !matches!(db.as_str(), "_users" | "_replicator" | "_global_changes")) {
+        return false;
+    }
+    let att = match rest {
+        [d, _, att @ ..] if d == "_design" => att,
+        [d, att @ ..] if !d.starts_with('_') => att,
+        _ => return false,
+    };
+    match att.first() {
+        None => is_multipart_doc(content_type),
+        Some(a) => !a.starts_with('_'),
+    }
+}
+
+/// chttpd_db's test for a document PUT with attachments in parts: this
+/// type, as written, and parameters.
+fn is_multipart_doc(content_type: &str) -> bool {
+    content_type.starts_with("multipart/related;")
 }
 
 pub async fn db_request(req: Req) -> Result<Response> {
@@ -215,6 +241,10 @@ pub fn max_attachment_size(config: &crate::config::Config) -> Option<u64> {
     }
 }
 
+fn att_too_large(name: &str) -> CouchError {
+    CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "attachment_too_large", name.to_string())
+}
+
 /// What couch_doc:from_json_obj_validate/2 and validate_docid/1 limit:
 /// id length, body size (its JSON), attachment sizes. Any too big fails
 /// the whole request.
@@ -238,10 +268,14 @@ fn check_doc_limits(config: &crate::config::Config, docs: &[Doc]) -> Result<()> 
             return Err(CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "document_too_large", d.id.clone()));
         }
         for a in &d.atts {
-            if let (AttData::Bytes(b), Some(m)) = (&a.data, max_att)
-                && b.len() as u64 > m
-            {
-                return Err(CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "attachment_too_large", a.name.clone()));
+            let len = match &a.data {
+                AttData::Bytes(b) => b.len() as u64,
+                // As the JSON says, before any of it arrives.
+                AttData::Follows => a.encoded_length,
+                _ => continue,
+            };
+            if max_att.is_some_and(|m| len > m) {
+                return Err(att_too_large(&a.name));
             }
         }
     }
@@ -310,8 +344,10 @@ pub async fn save_docs(req: &Req, db: &Arc<Db>, mut docs: Vec<Doc>, new_edits: b
             None => Ok(String::new()),
         })
         .collect();
-    // Stage attachment bytes outside the writer; retry docs whose staged
-    // chunks were orphaned by a concurrent compaction swap.
+    // Stage attachment bytes outside the writer, clear of compaction
+    // until they commit; retry docs whose staged chunks were orphaned by
+    // a concurrent compaction swap.
+    let _staging = db.staging();
     let mut pending: Vec<(usize, Doc)> = idx.into_iter().zip(to_save).collect();
     for attempt in 0..3 {
         if pending.is_empty() {
@@ -830,52 +866,80 @@ fn stream_pieces(snap: Snapshot, pieces: Vec<Piece>) -> Body {
     Body::from_stream(stream)
 }
 
-/// Parse a multipart/related document upload: JSON first, then the
-/// bodies of its attachments marked `"follows": true`, one part each in
-/// their order, each as long as the JSON says (part headers are ignored,
-/// as couch_httpd_multipart does).
-async fn parse_multipart_doc(req: &Req) -> Result<Doc> {
-    // multer's parse_boundary only accepts multipart/form-data.
-    let boundary = crate::http::multipart_boundary(req.content_type()).ok_or_else(|| CouchError::bad_request("multipart boundary missing"))?;
-    let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(req.body.clone())));
-    let mut mp = multer::Multipart::new(stream, boundary);
-    let first = mp
-        .next_field()
-        .await
-        .map_err(|e| CouchError::bad_request(e.to_string()))?
-        .ok_or_else(|| CouchError::bad_request("empty multipart body"))?;
-    let json_bytes = first.bytes().await.map_err(|e| CouchError::bad_request(e.to_string()))?;
-    let mut doc = from_json(crate::json::parse(&json_bytes).ok_or_else(|| CouchError::bad_request("invalid UTF-8 JSON"))?)?;
-    for a in doc.atts.iter_mut().filter(|a| matches!(a.data, AttData::Follows)) {
-        let bytes = match mp.next_field().await.map_err(|e| CouchError::bad_request(e.to_string()))? {
-            Some(f) => f.bytes().await.map_err(|e| CouchError::bad_request(e.to_string()))?,
-            None => bytes::Bytes::new(),
-        };
-        // write_streamed_attachment/3's checks.
-        match (bytes.len() as u64).cmp(&a.encoded_length) {
-            std::cmp::Ordering::Greater => return Err(CouchError::bad_request("attachment longer than expected")),
-            std::cmp::Ordering::Less => return Err(CouchError::bad_request("attachment shorter than expected")),
-            std::cmp::Ordering::Equal => {}
-        }
-        if a.encoding.is_none() {
-            a.length = bytes.len() as u64;
-            a.md5 = Md5::digest(&bytes).to_vec();
-        }
-        a.data = AttData::Bytes(bytes);
+/// Read a multipart/related document upload as
+/// couch_doc:doc_from_multi_part_stream/2 does, storing the attachments
+/// marked "follows" as their bytes arrive: the JSON is the first part
+/// (application/json), and the attachments' bytes run through the parts
+/// after it in their order, each attachment exactly as long as the JSON
+/// says (part headers are ignored). Returns the doc and the rest of the
+/// body, still to be read through.
+async fn read_multipart_doc(req: &Req, db: &Db) -> Result<(Doc, Multipart)> {
+    let config = &req.server.config;
+    // couch_httpd:check_max_request_length/1
+    let max = config.get_int("chttpd", "max_http_request_size", 4294967296u64);
+    if req.header("content-length").and_then(|l| l.parse::<u64>().ok()).is_some_and(|l| l > max) {
+        return Err(crate::http::too_large());
     }
-    Ok(doc)
+    let boundary = crate::http::multipart_boundary(req.content_type()).ok_or_else(|| CouchError::bad_request("multipart boundary missing"))?;
+    let mut mp = Multipart::new(req.take_body(), &boundary);
+    let headers = mp.next_part().await?.ok_or_else(|| CouchError::bad_request("empty multipart body"))?;
+    // mp_parse_doc/2
+    let ct = headers.iter().rev().find(|(k, _)| k == "content-type").map(|(_, v)| v.as_str()).unwrap_or("");
+    if !ct.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json") {
+        return Err(CouchError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "bad_content_type", "Content-Type must be application/json"));
+    }
+    let json_bytes = mp.body().await?;
+    let mut doc = from_json(crate::json::parse(&json_bytes).ok_or_else(|| CouchError::bad_request("invalid UTF-8 JSON"))?)?;
+    // Sizes are checked of the doc as sent (its id, if any, its own),
+    // before any attachment is read.
+    check_doc_limits(config, std::slice::from_ref(&doc))?;
+    for a in doc.atts.iter_mut().filter(|a| matches!(a.data, AttData::Follows)) {
+        let mut w = AttWriter::new(db, config, a);
+        // write_streamed_attachment/3
+        while w.len() < a.encoded_length {
+            match mp.body_chunk().await? {
+                Some(b) if w.len() + b.len() as u64 > a.encoded_length => {
+                    return Err(CouchError::bad_request("attachment longer than expected"));
+                }
+                Some(b) => {
+                    if w.push(&b) {
+                        blocking(|| w.flush())?;
+                    }
+                }
+                None => {
+                    if mp.next_part().await?.is_none() {
+                        return Err(CouchError::bad_request("attachment shorter than expected"));
+                    }
+                }
+            }
+        }
+        // More in the part it ended in is too long. (Failing to read on is
+        // left to whatever reads on.)
+        if a.encoded_length > 0 && mp.body_chunk().await.is_ok_and(|b| b.is_some()) {
+            return Err(CouchError::bad_request("attachment longer than expected"));
+        }
+        blocking(|| w.finish(a))?;
+    }
+    Ok((doc, mp))
 }
 
 async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     crate::doc::validate_path_docid(id)?;
     check_docid_length(&req.server.config, id)?;
-    let mut doc = if req.content_type().starts_with("multipart/related") {
-        parse_multipart_doc(req).await?
+    let new_edits = req.q_bool("new_edits")?.unwrap_or(true);
+    let multipart = is_multipart_doc(req.content_type());
+    // Attachments stored as they arrive are kept from compaction until
+    // the doc commits.
+    let _staging = multipart.then(|| db.staging());
+    let (mut doc, rest) = if multipart {
+        let (doc, rest) = read_multipart_doc(req, db).await?;
+        (doc, Some(rest))
     } else {
-        from_json(req.json_body()?)?
+        let doc = from_json(req.json_body()?)?;
+        // Sizes are checked of the doc as sent (its id, if any, its own).
+        check_doc_limits(&req.server.config, std::slice::from_ref(&doc))?;
+        (doc, None)
     };
-    // Sizes are checked of the doc as sent (its id, if any, its own).
-    check_doc_limits(&req.server.config, std::slice::from_ref(&doc))?;
     doc.id = id.to_string();
     if doc.revs.1.is_empty()
         && let Some(r) = rev_from_req(req)
@@ -883,9 +947,11 @@ async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         let (p, rid) = parse_rev(&r)?;
         doc.revs = (p, vec![rid]);
     }
-    let new_edits = req.q_bool("new_edits")?.unwrap_or(true);
     let deleted = doc.deleted;
     let rev = save_docs(req, db, vec![doc], new_edits).await?.pop().unwrap()?;
+    if let Some(mut rest) = rest {
+        rest.drain().await;
+    }
     // A deletion is "ok", not "created" (chttpd_db:update_doc/4).
     let status = if req.q("batch") == Some("ok") {
         StatusCode::ACCEPTED
@@ -1006,14 +1072,19 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                 a.data = AttData::Stub;
             }
             doc.att_gen = 0;
+            // The attachment is stored as it arrives, kept from compaction
+            // until the doc commits.
+            let _staging = (req.method == Method::PUT).then(|| db.staging());
             if req.method == Method::PUT {
                 let ct = req
                     .header("content-type")
                     .unwrap_or("application/octet-stream")
                     .to_string();
-                let data = req.body.clone();
-                if max_attachment_size(&req.server.config).is_some_and(|m| data.len() as u64 > m) {
-                    return Err(CouchError::new(StatusCode::PAYLOAD_TOO_LARGE, "attachment_too_large", name.to_string()));
+                // couch_att:flush_data/3 checks a length given up front, or
+                // as the data comes.
+                let max = max_attachment_size(&req.server.config);
+                if req.header("content-length").and_then(|l| l.parse::<u64>().ok()).zip(max).is_some_and(|(l, m)| l > m) {
+                    return Err(att_too_large(name));
                 }
                 // Uploaded gzipped, it is kept gzipped (its identity length
                 // unknown).
@@ -1028,18 +1099,35 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                         ));
                     }
                 };
-                doc.atts.retain(|a| a.name != name);
-                doc.atts.insert(0, Att {
+                let sent_gzip = encoding.is_some();
+                let mut att = Att {
                     name: name.to_string(),
                     content_type: ct,
                     revpos: None,
-                    length: data.len() as u64,
-                    md5: Md5::digest(&data).to_vec(),
+                    length: 0,
+                    md5: Vec::new(),
                     encoding,
-                    encoded_length: data.len() as u64,
+                    encoded_length: 0,
                     stored_length: 0,
-                    data: AttData::Bytes(data),
-                });
+                    data: AttData::Stub,
+                };
+                let mut w = AttWriter::new(db, &req.server.config, &att);
+                let mut body = req.take_body();
+                while let Some(b) = body.next().await {
+                    let b = b.map_err(|e| CouchError::bad_request(e.to_string()))?;
+                    if max.is_some_and(|m| w.len() + b.len() as u64 > m) {
+                        return Err(att_too_large(name));
+                    }
+                    if w.push(&b) {
+                        blocking(|| w.flush())?;
+                    }
+                }
+                blocking(|| w.finish(&mut att))?;
+                if sent_gzip {
+                    att.length = att.encoded_length;
+                }
+                doc.atts.retain(|a| a.name != name);
+                doc.atts.insert(0, att);
             } else {
                 let before = doc.atts.len();
                 doc.atts.retain(|a| a.name != name);
