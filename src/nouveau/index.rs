@@ -33,6 +33,130 @@ pub const LUCENE_SCORE: f32 = 1.0 / 2.2;
 pub const INITIAL_SLOTS: usize = 8;
 const DEFINITION_FILE: &str = "index_definition.json";
 
+/// An index's files, kept as MmapDirectory keeps them but synced, on
+/// Apple platforms, without flushing the drive's cache (F_FULLFSYNC, what
+/// std's sync_data does there, several milliseconds each and a dozen per
+/// commit). There a plain fsync hands a file's data to the drive, and the
+/// commit point, meta.json, is written behind a write barrier
+/// (F_BARRIERFSYNC): no commit reaches the disk before the files it
+/// names, so after a power loss an index is at an earlier commit and
+/// catches up from its update seq, as it's only derived data (and the
+/// database's own files aren't synced harder). Elsewhere files are synced
+/// as MmapDirectory syncs them.
+#[derive(Clone, Debug)]
+struct IndexDirectory {
+    inner: tantivy::directory::MmapDirectory,
+    root: PathBuf,
+}
+
+/// Sync a file's data, behind a barrier when later writes depend on it.
+fn sync_file(f: &std::fs::File, barrier: bool) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fcntl and fsync on a file descriptor the File owns.
+        let r = unsafe { if barrier { libc::fcntl(f.as_raw_fd(), libc::F_BARRIERFSYNC) } else { libc::fsync(f.as_raw_fd()) } };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = barrier;
+        f.sync_data()
+    }
+}
+
+impl IndexDirectory {
+    fn open(root: &Path) -> Result<IndexDirectory> {
+        let inner = tantivy::directory::MmapDirectory::open(root).map_err(|e| CouchError::internal(e.to_string()))?;
+        Ok(IndexDirectory { inner, root: root.to_path_buf() })
+    }
+}
+
+/// A file being written, synced when tantivy is done with it.
+struct SyncedFile(std::io::BufWriter<std::fs::File>);
+
+impl std::io::Write for SyncedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    // As MmapDirectory's writer: only terminating flushes (and syncs).
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tantivy::directory::TerminatingWrite for SyncedFile {
+    fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
+        use std::io::Write;
+        self.0.flush()?;
+        sync_file(self.0.get_ref(), false)
+    }
+}
+
+impl tantivy::Directory for IndexDirectory {
+    fn get_file_handle(&self, path: &Path) -> std::result::Result<std::sync::Arc<dyn tantivy::directory::FileHandle>, tantivy::directory::error::OpenReadError> {
+        self.inner.get_file_handle(path)
+    }
+
+    fn delete(&self, path: &Path) -> std::result::Result<(), tantivy::directory::error::DeleteError> {
+        self.inner.delete(path)
+    }
+
+    fn exists(&self, path: &Path) -> std::result::Result<bool, tantivy::directory::error::OpenReadError> {
+        self.inner.exists(path)
+    }
+
+    fn open_write(&self, path: &Path) -> std::result::Result<tantivy::directory::WritePtr, tantivy::directory::error::OpenWriteError> {
+        use tantivy::directory::error::OpenWriteError;
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(self.root.join(path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                OpenWriteError::FileAlreadyExists(path.to_path_buf())
+            } else {
+                OpenWriteError::wrap_io_error(e, path.to_path_buf())
+            }
+        })?;
+        Ok(std::io::BufWriter::new(Box::new(SyncedFile(std::io::BufWriter::new(file)))))
+    }
+
+    fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, tantivy::directory::error::OpenReadError> {
+        self.inner.atomic_read(path)
+    }
+
+    /// As MmapDirectory writes atomically: a synced temporary file in the
+    /// same directory, renamed over the file; meta.json, the commit point,
+    /// behind a barrier.
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp = self.root.join(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+        let res = (|| {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(data)?;
+            sync_file(&f, path == Path::new("meta.json"))?;
+            std::fs::rename(&tmp, self.root.join(path))
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
+    }
+
+    fn sync_directory(&self) -> std::io::Result<()> {
+        sync_file(&std::fs::File::open(&self.root)?, true)
+    }
+
+    fn acquire_lock(&self, lock: &tantivy::directory::Lock) -> std::result::Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
+        self.inner.acquire_lock(lock)
+    }
+
+    fn watch(&self, callback: tantivy::directory::WatchCallback) -> tantivy::Result<tantivy::directory::WatchHandle> {
+        self.inner.watch(callback)
+    }
+}
+
 /// The index definition (Nouveau's IndexDefinition), with our slot count.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Definition {
@@ -182,7 +306,7 @@ impl SearchIndex {
         }
         std::fs::create_dir_all(dir)?;
         let schema = schema_for(&def)?;
-        let index = Index::create_in_dir(dir, schema).map_err(tantivy_err)?;
+        let index = Index::create(IndexDirectory::open(dir)?, schema, tantivy::IndexSettings::default()).map_err(tantivy_err)?;
         register_tokenizers(&index, &def)?;
         let tmp = dir.join(format!("{DEFINITION_FILE}.tmp"));
         std::fs::write(&tmp, serde_json::to_vec(&def)?)?;
@@ -194,10 +318,10 @@ impl SearchIndex {
 
     pub fn open(dir: &Path) -> Result<Option<SearchIndex>> {
         let Some(def) = Self::load_definition(dir) else { return Ok(None) };
-        let index = match Index::open_in_dir(dir) {
+        let index = match IndexDirectory::open(dir).and_then(|d| Index::open(d).map_err(tantivy_err)) {
             Ok(i) => i,
             Err(e) => {
-                tracing::warn!("search index {} unreadable, rebuilding: {e}", dir.display());
+                tracing::warn!("search index {} unreadable, rebuilding: {}", dir.display(), e.reason);
                 return Ok(None);
             }
         };
