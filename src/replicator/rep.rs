@@ -271,7 +271,10 @@ fn decode_basic(header: &str) -> Option<(String, String)> {
 }
 
 /// parse_rep_db/3 for an http(s) endpoint, string or object.
-fn parse_endpoint(v: &Value, proxy: &str, opts: &Options, server: &Server) -> Result<Endpoint, RepError> {
+fn parse_endpoint(v: Option<&Value>, proxy: &str, opts: &Options, server: &Server) -> Result<Endpoint, RepError> {
+    let Some(v) = v else {
+        return Err(RepError::Error("Missing replicator database".into()));
+    };
     let (url0, auth, hdrs) = match v {
         Value::String(s) if !s.starts_with("http://") && !s.starts_with("https://") => {
             return Err(RepError::Error("local_endpoints_not_supported".into()));
@@ -282,8 +285,7 @@ fn parse_endpoint(v: &Value, proxy: &str, opts: &Options, server: &Server) -> Re
             o.get("auth").and_then(Value::as_object).cloned().unwrap_or_default(),
             o.get("headers").and_then(Value::as_object).cloned().unwrap_or_default(),
         ),
-        Value::Null => return Err(RepError::Error("Missing replicator database".into())),
-        _ => return Err(RepError::Error("endpoint has an invalid url".into())),
+        _ => return Err(RepError::Crash("function_clause")),
     };
     check_url(&url0, "endpoint", server)?;
     let url = if url0.contains('?') || url0.ends_with('/') { url0 } else { format!("{url0}/") };
@@ -345,19 +347,34 @@ fn parse_endpoint(v: &Value, proxy: &str, opts: &Options, server: &Server) -> Re
 
 /// chttpd's "hack": a local database name becomes a URL to this server,
 /// with the request's credentials.
-pub fn localize(body: &mut Map<String, Value>, server: &Server, authorization: &str, cookie: &str) {
+pub fn localize(body: &mut Map<String, Value>, server: &Server, authorization: &str, cookie: &str) -> Result<(), RepError> {
+    // What mochiweb_util:quote_plus/1 takes: strings (lists of character
+    // codes too), and atoms and numbers as they're written.
+    let text = |v: &Value| match v {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) if n.to_string().contains(['.', 'e', 'E']) => Ok(n.as_f64().map(crate::json::short_float).unwrap_or_default()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Null => Ok("null".into()),
+        Value::Array(a) => {
+            let bytes: Option<Vec<u8>> = a.iter().map(|c| c.as_i64().map(|c| c as u8)).collect();
+            bytes.map(|b| String::from_utf8_lossy(&b).into_owned()).ok_or(RepError::Crash("badarg"))
+        }
+        Value::Object(_) => Err(RepError::Crash("function_clause")),
+    };
     for key in ["source", "target"] {
-        let name = match body.get(key) {
-            Some(Value::String(s)) => s.clone(),
+        let uri = match body.get(key) {
             Some(Value::Object(o)) => match o.get("url") {
-                Some(Value::String(s)) => s.clone(),
-                _ => continue,
+                Some(u) => u,
+                None => continue,
             },
-            _ => continue,
+            Some(v) => v,
+            None => continue,
         };
-        if name.starts_with("http://") || name.starts_with("https://") {
+        if uri.as_str().is_some_and(|s| s.starts_with("http://") || s.starts_with("https://")) {
             continue;
         }
+        let name = text(uri)?;
         let addr = server.config.get_or("chttpd", "bind_address", "127.0.0.1");
         let port = server.config.get_or("chttpd", "port", "5984");
         let host = if addr.contains(':') { format!("[{addr}]") } else { addr };
@@ -369,6 +386,7 @@ pub fn localize(body: &mut Map<String, Value>, server: &Server, authorization: &
             }),
         );
     }
+    Ok(())
 }
 
 // --------------------------------------------------------------- options
@@ -377,11 +395,29 @@ fn cfg_int(server: &Server, key: &str, default: u64) -> u64 {
     server.config.get_int("replicator", key, default)
 }
 
-fn to_integer(v: &Value, name: &str) -> Result<u64, RepError> {
+/// couch_util:to_integer/1: an integer, or the digits of one in a string
+/// (or a list of their character codes). A negative one counts as 0.
+fn to_integer(v: &Value) -> Result<u64, RepError> {
+    let digits = |s: &str| -> Result<u64, RepError> {
+        let (neg, d) = match s.as_bytes().first() {
+            Some(b'-') => (true, &s[1..]),
+            Some(b'+') => (false, &s[1..]),
+            _ => (false, s),
+        };
+        if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(RepError::Crash("badarg"));
+        }
+        Ok(if neg { 0 } else { d.parse().unwrap_or(u64::MAX) })
+    };
     match v {
-        Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f as u64)).ok_or_else(|| bad_request(format!("parameter `{name}` must be an integer"))),
-        Value::String(s) => s.trim().parse().map_err(|_| bad_request(format!("parameter `{name}` must be an integer"))),
-        _ => Err(bad_request(format!("parameter `{name}` must be an integer"))),
+        Value::Number(n) if n.is_i64() => Ok(n.as_u64().unwrap_or(0)),
+        Value::Number(n) if !n.is_f64() && !n.to_string().contains(['.', 'e', 'E']) => digits(&n.to_string()),
+        Value::String(s) => digits(s),
+        Value::Array(a) => {
+            let chars: Option<String> = a.iter().map(|c| c.as_u64().filter(|&c| c < 256).map(|c| c as u8 as char)).collect();
+            digits(&chars.ok_or(RepError::Crash("badarg"))?)
+        }
+        _ => Err(RepError::Crash("function_clause")),
     }
 }
 
@@ -444,21 +480,21 @@ fn make_options(props: &Map<String, Value>, server: &Server) -> Result<Options, 
                 }
                 o.selector = Some(v.clone());
             }
-            "worker_processes" => o.worker_processes = to_integer(v, k)?,
-            "worker_batch_size" => o.worker_batch_size = to_integer(v, k)?,
-            "http_connections" => o.http_connections = to_integer(v, k)?,
-            "connection_timeout" => o.connection_timeout = to_integer(v, k)?,
-            "retries_per_request" => o.retries = to_integer(v, k)?,
+            "worker_processes" => o.worker_processes = to_integer(v)?,
+            "worker_batch_size" => o.worker_batch_size = to_integer(v)?,
+            "http_connections" => o.http_connections = to_integer(v)?,
+            "connection_timeout" => o.connection_timeout = to_integer(v)?,
+            "retries_per_request" => o.retries = to_integer(v)?,
             "since_seq" => o.since_seq = Some(v.clone()),
             "use_checkpoints" => o.use_checkpoints = v.as_bool().unwrap_or(true),
             "use_bulk_get" => o.use_bulk_get = boolean(k, v)?,
-            "checkpoint_interval" => o.checkpoint_interval = to_integer(v, k)?,
+            "checkpoint_interval" => o.checkpoint_interval = to_integer(v)?,
             _ => {}
         }
     }
     let set = [o.doc_ids.is_some(), o.filter.is_some(), o.selector.is_some()].iter().filter(|b| **b).count();
     if set > 1 {
-        return Err(bad_request("`doc_ids`,`filter`,`selector` are mutually exclusive"));
+        return Err(RepError::BadRequestList("`doc_ids`,`filter`,`selector` are mutually exclusive".into()));
     }
     Ok(o)
 }
@@ -509,10 +545,10 @@ pub fn parse_without_id(doc: &Map<String, Value>, user_ctx: UserCtx, server: &Se
     let (proxy, src_proxy, tgt_proxy) = (get_str("proxy"), get_str("source_proxy"), get_str("target_proxy"));
     let (sp, tp) = if !proxy.is_empty() {
         if !src_proxy.is_empty() {
-            return Err(bad_request("`proxy` is mutually exclusive with `source_proxy`"));
+            return Err(RepError::BadRequestList("`proxy` is mutually exclusive with `source_proxy`".into()));
         }
         if !tgt_proxy.is_empty() {
-            return Err(bad_request("`proxy` is mutually exclusive with `target_proxy`"));
+            return Err(RepError::BadRequestList("`proxy` is mutually exclusive with `target_proxy`".into()));
         }
         (proxy.clone(), proxy)
     } else {
@@ -546,8 +582,8 @@ pub fn parse_without_id(doc: &Map<String, Value>, user_ctx: UserCtx, server: &Se
     if rep.options.cancel && rep.options.id.is_some() {
         return Ok(rep);
     }
-    rep.source = parse_endpoint(doc.get("source").unwrap_or(&Value::Null), &sp, &rep.options, server)?;
-    rep.target = parse_endpoint(doc.get("target").unwrap_or(&Value::Null), &tp, &rep.options, server)?;
+    rep.source = parse_endpoint(doc.get("source"), &sp, &rep.options, server)?;
+    rep.target = parse_endpoint(doc.get("target"), &tp, &rep.options, server)?;
     if doc.get("filter").and_then(Value::as_str) == Some("_view") {
         let view = rep.options.query_params.as_ref().and_then(|q| q.get("view")).and_then(Value::as_str).unwrap_or("");
         match view.split('/').collect::<Vec<_>>().as_slice() {

@@ -1388,6 +1388,9 @@ fn apply_updates(db: &Db, snap: &Snapshot, batch: &UpdateBatch) -> Result<Applie
     let mut header = snap.header.clone();
     let mut seq = header.update_seq;
     let mut counts = WriteCounts { local_writes: local_changed.len() as u64, ..Default::default() };
+    // Seqs go to a batch's docs in id order, as couch_db_updater sorts
+    // them (group_alike_docs), whatever order they came in.
+    changed.sort_unstable();
     for id in changed {
         counts.writes += 1;
         if id.starts_with("_design/") {

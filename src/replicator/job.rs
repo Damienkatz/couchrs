@@ -88,7 +88,14 @@ pub enum JobError {
 
 impl JobError {
     pub fn reason(&self) -> String {
+        crate::erlpp::pretty(&self.flat_reason())
+    }
+
+    fn flat_reason(&self) -> String {
         match self {
+            // replication_start_error/1's {Error, Reason}, as error_reason/1 writes it.
+            JobError::Start(e @ RepError::DbNotFound(_)) => format!("db_not_found: {}", e.erl_text()),
+            JobError::Start(e @ RepError::Unauthorized(_)) => format!("unauthorized: {}", e.erl_text()),
             JobError::Start(e) => e.erl_text(),
             JobError::Crash(s) => s.clone(),
         }
@@ -235,6 +242,15 @@ pub async fn run(
     }
 }
 
+/// A database's one shard, as CouchDB names it
+/// (`shards/00000000-ffffffff/<db>.<created>`).
+fn shard_name(server: &Server, db: &str) -> String {
+    match server.open_db(db) {
+        Ok(d) => format!("shards/00000000-ffffffff/{db}.{}", d.snapshot().created),
+        Err(_) => db.to_string(),
+    }
+}
+
 async fn init_state(rep: &Rep, server: &Server, live: Arc<Mutex<Live>>, initial_stats: Stats, pid: String) -> Result<State, RepError> {
     let mut src = rep.source.clone();
     if src.http_connections == 1 {
@@ -264,7 +280,8 @@ async fn init_state(rep: &Rep, server: &Server, live: Arc<Mutex<Live>>, initial_
         "type": "replication",
         "user": rep.user_ctx.name,
         "replication_id": rep.id_str(),
-        "database": rep.db_name,
+        // The shard it was read from, as a one-shard database's is named.
+        "database": rep.db_name.as_ref().map(|d| shard_name(server, d)),
         "doc_id": rep.doc_id,
         "source": source.ep.uri(),
         "target": target.ep.uri(),
@@ -297,7 +314,9 @@ async fn init_state(rep: &Rep, server: &Server, live: Arc<Mutex<Live>>, initial_
     };
     // As CouchDB: worked out once at the start, then cached.
     st.refresh_pending().await;
-    st.update_task();
+    // The task starts with the stats; the scheduler hears of them at the
+    // first update.
+    st.task.update(Value::Object(st.rep_stats()));
     Ok(st)
 }
 
@@ -444,6 +463,8 @@ impl State {
 
     async fn last_checkpoint(&mut self) -> Result<JobEnd, JobError> {
         if self.in_progress.is_empty() && self.highest_seq_done.1 == json!(0) {
+            // Nothing done; terminate_cleanup/1 still reports the stats.
+            self.update_task();
             return Ok(JobEnd::Finished(self.checkpoint_history.clone()));
         }
         self.current_through_seq = self.highest_seq_done.clone();

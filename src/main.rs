@@ -7,6 +7,7 @@ pub mod config;
 pub mod cors;
 pub mod db;
 pub mod doc;
+pub mod erlpp;
 pub mod error;
 pub mod extsort;
 pub mod fauxton;

@@ -23,6 +23,10 @@ use std::sync::Arc;
 pub enum RepError {
     /// {bad_request, Reason}
     BadRequest(String),
+    /// {bad_request, Reason} with the reason an Erlang string, not a binary.
+    BadRequestList(String),
+    /// An error exception the parser runs into (badarg, function_clause).
+    Crash(&'static str),
     /// {error, Reason}
     Error(String),
     DbNotFound(String),
@@ -41,7 +45,13 @@ impl RepError {
     /// (rep_error_to_binary/1).
     pub fn erl_text(&self) -> String {
         match self {
-            RepError::BadRequest(m) | RepError::Error(m) | RepError::DbNotFound(m) | RepError::Unauthorized(m) | RepError::FilterFetch(m) => m.clone(),
+            RepError::BadRequest(m)
+            | RepError::BadRequestList(m)
+            | RepError::Error(m)
+            | RepError::DbNotFound(m)
+            | RepError::Unauthorized(m)
+            | RepError::FilterFetch(m) => m.clone(),
+            RepError::Crash(a) => a.to_string(),
             RepError::Forbidden(m) => m.clone(),
             RepError::Http(f) => f.to_string(),
             RepError::MissingDoc => "missing_doc".into(),
@@ -50,10 +60,21 @@ impl RepError {
         }
     }
 
+    /// How POST /_replicate reports a replication that failed to start: a
+    /// request that failed is an {error, Reason} with the reason as `~p`
+    /// writes it.
+    pub fn start_failure(&self) -> CouchError {
+        match self {
+            RepError::Http(f) => CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, "error", crate::erlpp::pretty(&f.to_string())),
+            e => e.to_couch(),
+        }
+    }
+
     pub fn to_couch(&self) -> CouchError {
         let e = |code: StatusCode, err: &str, reason: &str| CouchError::new(code, err, reason.to_string());
         match self {
-            RepError::BadRequest(m) => e(StatusCode::BAD_REQUEST, "bad_request", m),
+            RepError::BadRequest(m) | RepError::BadRequestList(m) => e(StatusCode::BAD_REQUEST, "bad_request", m),
+            RepError::Crash(a) => e(StatusCode::INTERNAL_SERVER_ERROR, "unknown_error", a).with_ref(),
             RepError::Error(m) if m == "endpoint has an invalid url" || m == "proxy has an invalid url" => {
                 e(StatusCode::BAD_REQUEST, "invalid_replication", m)
             }
@@ -100,7 +121,7 @@ pub async fn http_replicate(req: &Req) -> Result<Response> {
         .and_then(|c| c.split(';').map(str::trim).find_map(|p| p.strip_prefix("AuthSession=")))
         .map(|s| format!("AuthSession={s}"))
         .unwrap_or_default();
-    rep::localize(&mut body, &req.server, req.header("authorization").unwrap_or(""), &cookie);
+    rep::localize(&mut body, &req.server, req.header("authorization").unwrap_or(""), &cookie).map_err(|e| e.to_couch())?;
     let sched = scheduler::get().ok_or_else(|| CouchError::internal("replicator not started"))?;
     let rep = rep::parse_rep_doc(&body, user_ctx(req), &req.server).await.map_err(|e| e.to_couch())?;
     let id = rep.id_str();
@@ -133,8 +154,8 @@ pub async fn http_replicate(req: &Req) -> Result<Response> {
             }
             ok_json(Value::Object(out))
         }
-        Ok(scheduler::Outcome::Error(job::JobError::Start(e))) => Err(e.to_couch()),
-        Ok(scheduler::Outcome::Error(job::JobError::Crash(r))) => Err(CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, "error", r)),
+        Ok(scheduler::Outcome::Error(job::JobError::Start(e))) => Err(e.start_failure()),
+        Ok(scheduler::Outcome::Error(e @ job::JobError::Crash(_))) => Err(CouchError::new(StatusCode::INTERNAL_SERVER_ERROR, "error", e.reason())),
         Ok(scheduler::Outcome::Stopped) | Err(_) => ok_json(json!({"ok": "stopped"})),
     }
 }

@@ -46,6 +46,8 @@ fn iso(t: SystemTime) -> String {
 fn bad_doc_reason(e: &RepError) -> String {
     match e {
         RepError::BadRequest(m) => format!("{{throw,{{bad_request,<<\"{m}\">>}}}}"),
+        RepError::BadRequestList(m) => format!("{{throw,{{bad_request,\"{m}\"}}}}"),
+        RepError::Crash(a) => format!("{{error,{a}}}"),
         other => other.erl_text(),
     }
 }
@@ -711,10 +713,13 @@ pub fn http_docs(req: &Req, db_name: &str) -> Result<Response> {
             return Ok(true);
         }
         seen += 1;
+        if rows.len() >= limit {
+            return Ok(false);
+        }
         if seen > skip {
             rows.push(Value::Object(info));
         }
-        Ok(rows.len() < limit)
+        Ok(true)
     })?;
     ok_json(json!({"total_rows": snap.doc_count(), "offset": skip.min(snap.doc_count() as usize), "docs": rows}))
 }

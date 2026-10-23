@@ -35,6 +35,35 @@ impl std::fmt::Display for HttpFail {
     }
 }
 
+/// The inet error a connection failed with, as ibrowse reports it
+/// (econnrefused, nxdomain, ...).
+fn conn_error(e: &reqwest::Error) -> String {
+    use std::io::ErrorKind;
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            let posix = match io.kind() {
+                ErrorKind::ConnectionRefused => "econnrefused",
+                ErrorKind::ConnectionReset => "econnreset",
+                ErrorKind::ConnectionAborted => "econnaborted",
+                ErrorKind::TimedOut => "etimedout",
+                ErrorKind::HostUnreachable => "ehostunreach",
+                ErrorKind::NetworkUnreachable => "enetunreach",
+                ErrorKind::AddrNotAvailable => "eaddrnotavail",
+                _ => "",
+            };
+            if !posix.is_empty() {
+                return posix.into();
+            }
+        }
+        if s.to_string().starts_with("dns error") {
+            return "nxdomain".into();
+        }
+        src = s.source();
+    }
+    e.to_string()
+}
+
 pub struct Resp {
     pub status: u16,
     pub body: Bytes,
@@ -347,8 +376,8 @@ impl Client {
                     *d = if *d <= Duration::from_millis(25) { Duration::ZERO } else { *d / 2 };
                     return Ok(r);
                 }
-                Err(e) if e.is_timeout() => fail("timeout".into(), None),
-                Err(e) if e.is_connect() => fail(format!("{{conn_failed,{e}}}"), None),
+                Err(e) if e.is_timeout() => fail("{error,req_timedout}".into(), None),
+                Err(e) if e.is_connect() => fail(format!("{{error,{{conn_failed,{{error,{}}}}}}}", conn_error(&e)), None),
                 Err(e) => fail(e.to_string(), None),
             };
             let started = *first_error.get_or_insert_with(Instant::now);

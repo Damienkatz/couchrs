@@ -8,6 +8,7 @@ sends those credentials with every request (for a server with admins).
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -223,6 +224,17 @@ def bulk_docs_and_all_docs():
     eq(b["offset"], 1500)
     s, info, _ = req("GET", f"/{db}")
     eq(info["doc_count"], 3101)
+
+
+@test
+def bulk_docs_seqs_in_id_order():
+    # A batch's docs get their seqs in id order, whatever order they came in.
+    db = new_db()
+    ids = ["m", "_design/z", "b", "zz", "a"]
+    eq(req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": i} for i in ids]})[0], 201)
+    rows = req("GET", f"/{db}/_changes")[1]["results"]
+    eq([r["id"] for r in rows], sorted(ids))
+    eq([int(r["seq"].split("-")[0]) for r in rows], [1, 2, 3, 4, 5])
 
 
 @test
@@ -1949,6 +1961,11 @@ def replicator_database():
         assert any(d["doc_id"] == run for d in docs) and not any(d["doc_id"] == one for d in docs), docs
         jobs = [j for j in req("GET", "/_scheduler/jobs")[1]["jobs"] if j["doc_id"] == run]
         eq((len(jobs), jobs[0]["database"]), (1, "_replicator"))
+        # Its task names the shard the doc is in.
+        task = _wait(lambda: [t for t in req("GET", "/_active_tasks")[1] if t.get("doc_id") == run])
+        assert task and re.fullmatch(r"shards/00000000-ffffffff/_replicator\.\d+", task[0]["database"]), task
+        s, b, _ = req("GET", "/_scheduler/docs?limit=0")
+        eq((s, b["docs"], b["offset"]), (200, [], 0))
         rev = req("GET", f"/_replicator/{run}")[1]["_rev"]
         eq(req("DELETE", f"/_replicator/{run}?rev={rev}")[0], 200)
         assert _wait(lambda: not [j for j in req("GET", "/_scheduler/jobs")[1]["jobs"] if j["doc_id"] == run]), "job outlived its doc"
@@ -1959,6 +1976,53 @@ def replicator_database():
             if s == 200:
                 req("DELETE", f"/_replicator/{d}?rev={b['_rev']}")
         for d in (src, tgt, cont):
+            req("DELETE", f"/{d}")
+
+
+@test
+def replication_error_reasons():
+    src, tgt = new_db(), "r" + uuid.uuid4().hex[:12]
+    doc = "err_" + uuid.uuid4().hex[:8]
+    refused = '{http_request_failed,"GET","http://127.0.0.1:1/x/",\n                     {error,{error,{conn_failed,{error,econnrefused}}}}}'
+    try:
+        # Options the parser crashes on, as CouchDB's does.
+        def replicate(**extra):
+            return req("POST", "/_replicate", dict({"source": src, "target": tgt}, **extra))[:2]
+        for extra, reason in (({"worker_processes": "x"}, "badarg"), ({"worker_batch_size": 2.5}, "function_clause"),
+                              ({"http_connections": True}, "function_clause"), ({"source": ["x"]}, "badarg")):
+            s, b = replicate(**extra)
+            eq((s, b["error"], b["reason"], "ref" in b), (500, "unknown_error", reason, True), extra)
+        # Anything but a URL names a local database, numbers and null too.
+        for v, name in ((5, "5"), (None, "null"), ({"url": True}, "true")):
+            s, b = replicate(source=v)
+            assert s == 500 and b["error"] == "db_not_found" and b["reason"].endswith(f"/{name}/"), (v, s, b)
+        # A source refusing connections: the reason as ~p lays out the term.
+        eq(req("POST", "/_replicate", {"source": "http://127.0.0.1:1/x", "target": db_url(tgt), "retries_per_request": 0})[:2],
+           (500, {"error": "error", "reason": refused}))
+
+        # The same checks on replicator docs, as forbidden writes.
+        def put(**body):
+            return req("PUT", f"/_replicator/{doc}", dict({"source": db_url(src), "target": db_url(tgt)}, **body))[:2]
+        eq(put(doc_ids=["a"], filter="f/x"),
+           (403, {"error": "forbidden", "reason": '{throw,{bad_request,"`doc_ids`,`filter`,`selector` are mutually exclusive"}}'}))
+        eq(put(proxy="http://p:1", source_proxy="http://q:1"),
+           (403, {"error": "forbidden", "reason": '{throw,{bad_request,"`proxy` is mutually exclusive with `source_proxy`"}}'}))
+        eq(put(source=None), (403, {"error": "forbidden", "reason": "{error,function_clause}"}))
+        eq(put(worker_processes="x"), (403, {"error": "forbidden", "reason": "{error,badarg}"}))
+        eq(put(worker_batch_size=1.5), (403, {"error": "forbidden", "reason": "{error,function_clause}"}))
+
+        # A doc whose source refuses connections crashes with that reason.
+        eq(put(source="http://127.0.0.1:1/x", retries_per_request=0)[0], 201)
+        info = _wait(lambda: (lambda i: i if i.get("state") == "crashing" else None)(req("GET", f"/_scheduler/docs/_replicator/{doc}")[1]), 60)
+        assert info, req("GET", f"/_scheduler/docs/_replicator/{doc}")[1]
+        eq((info["info"], info["error_count"]), ({"error": refused}, 1))
+        job = [j for j in req("GET", "/_scheduler/jobs")[1]["jobs"] if j["doc_id"] == doc]
+        eq([(h["type"], h.get("reason")) for h in job[0]["history"]], [("crashed", refused), ("started", None), ("added", None)])
+    finally:
+        s, b, _ = req("GET", f"/_replicator/{doc}")
+        if s == 200:
+            req("DELETE", f"/_replicator/{doc}?rev={b['_rev']}")
+        for d in (src, tgt):
             req("DELETE", f"/{d}")
 
 
