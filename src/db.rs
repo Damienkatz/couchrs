@@ -274,16 +274,45 @@ impl Snapshot {
 
     /// Render a revision to JSON with the given options.
     pub fn doc_json(&self, fdi: &FullDocInfo, rev: &RevInfo, opts: &DocOpts) -> Result<Value> {
-        let leaf = rev.val.leaf().ok_or_else(CouchError::missing)?;
-        let body = self.read_body(leaf.ptr)?;
-        let mut m = Map::new();
-        m.insert("_id".into(), json!(fdi.id));
-        m.insert("_rev".into(), json!(rev.rev()));
-        if leaf.deleted {
-            m.insert("_deleted".into(), json!(true));
-        }
+        let (mut m, body, tail) = self.doc_parts(fdi, rev, opts)?;
         let fields: Map<String, Value> = serde_json::from_slice(&body.json).unwrap_or_default();
         m.extend(fields);
+        m.extend(tail);
+        Ok(Value::Object(m))
+    }
+
+    /// A revision's JSON as doc_json renders it, as text, with the stored
+    /// body spliced in unparsed (bodies hold none of the members added).
+    pub fn doc_json_text(&self, fdi: &FullDocInfo, rev: &RevInfo, opts: &DocOpts) -> Result<String> {
+        let (head, body, tail) = self.doc_parts(fdi, rev, opts)?;
+        let Some(fields) = std::str::from_utf8(&body.json).ok().and_then(json_members) else {
+            return Ok(self.doc_json(fdi, rev, opts)?.to_string());
+        };
+        let tail = Value::Object(tail).to_string();
+        let mut out = Value::Object(head).to_string();
+        out.pop();
+        for part in [fields, json_members(&tail).unwrap_or("")] {
+            if !part.is_empty() {
+                out.push(',');
+                out.push_str(part);
+            }
+        }
+        out.push('}');
+        Ok(out)
+    }
+
+    /// A revision's stored body and the members rendered before it (_id,
+    /// _rev, _deleted) and after it.
+    fn doc_parts(&self, fdi: &FullDocInfo, rev: &RevInfo, opts: &DocOpts) -> Result<(Map<String, Value>, DiskBody, Map<String, Value>)> {
+        let leaf = rev.val.leaf().ok_or_else(CouchError::missing)?;
+        let body = self.read_body(leaf.ptr)?;
+        let mut head = Map::new();
+        head.insert("_id".into(), json!(fdi.id));
+        head.insert("_rev".into(), json!(rev.rev()));
+        if leaf.deleted {
+            head.insert("_deleted".into(), json!(true));
+        }
+        let mut m = Map::new();
         if !body.atts.is_empty() {
             let since_pos = opts.atts_since.as_ref().map(|revs| {
                 revs.iter()
@@ -343,12 +372,17 @@ impl Snapshot {
         if opts.local_seq {
             m.insert("_local_seq".into(), json!(leaf.seq));
         }
-        Ok(Value::Object(m))
+        Ok((head, body, m))
     }
 
     /// Render the winning revision.
     pub fn winner_json(&self, fdi: &FullDocInfo, opts: &DocOpts) -> Result<Value> {
         self.doc_json(fdi, &fdi.winner(), opts)
+    }
+
+    /// The winning revision as doc_json_text renders it.
+    pub fn winner_json_text(&self, fdi: &FullDocInfo, opts: &DocOpts) -> Result<String> {
+        self.doc_json_text(fdi, &fdi.winner(), opts)
     }
 
     /// RocksDB [lower, upper) bounds for a string-keyed range. Btree ranges
@@ -1351,6 +1385,11 @@ fn write_att_chunks(db: &Db, bytes: &[u8]) -> Result<(Vec<Pos>, u64)> {
         db.store.db.write(batch).map_err(rerr)?;
     }
     Ok((chunks, stored))
+}
+
+/// The members of a JSON object's text, between its braces.
+fn json_members(json: &str) -> Option<&str> {
+    json.trim().strip_prefix('{')?.strip_suffix('}').map(str::trim)
 }
 
 fn write_rev(w: &mut Writes, doc: &Doc, atts: Vec<AttInfo>, body_json: Vec<u8>) -> Result<LeafVal> {

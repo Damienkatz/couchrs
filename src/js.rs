@@ -545,7 +545,12 @@ impl JsFuns {
     }
 
     pub fn map(&self, doc: &Value) -> Result<Vec<Vec<(Value, Value)>>> {
-        let out = self.call("__map", CallArgs::S(doc.to_string()))?;
+        self.map_text(doc.to_string())
+    }
+
+    /// map, for a doc already in JSON text.
+    pub fn map_text(&self, doc: String) -> Result<Vec<Vec<(Value, Value)>>> {
+        let out = self.call("__map", CallArgs::S(doc))?;
         let items = |v: Value| match v {
             Value::Array(a) => a,
             _ => Vec::new(),

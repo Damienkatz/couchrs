@@ -1168,10 +1168,17 @@ impl Index {
             local_seq: self.def.local_seq,
             ..Default::default()
         };
-        let doc = snap.winner_json(fdi, &opts)?;
+        // Only Mango views need the doc parsed; JS gets its JSON as text.
+        let doc = match self.def.views.iter().any(|v| matches!(v.map, MapKind::Mango { .. })) {
+            true => Some(snap.winner_json(fdi, &opts)?),
+            false => None,
+        };
         crate::stat!("couchdb.mrview.map_doc").inc();
         let js_rows = match &self.def.js {
-            Some(f) if self.def.views.iter().any(|v| matches!(v.map, MapKind::Js(_))) => Some(f.map(&doc)?),
+            Some(f) if self.def.views.iter().any(|v| matches!(v.map, MapKind::Js(_))) => Some(match &doc {
+                Some(d) => f.map(d)?,
+                None => f.map_text(snap.winner_json_text(fdi, &opts)?)?,
+            }),
             _ => None,
         };
         let mut out = Vec::with_capacity(n);
@@ -1190,14 +1197,15 @@ impl Index {
             match &v.map {
                 MapKind::Js(i) => out.push(wrap(js_rows.as_ref().and_then(|r| r.get(*i).cloned()).unwrap_or_default())),
                 MapKind::Mango { fields, partial } => {
+                    let doc = doc.as_ref().expect("parsed for Mango views");
                     if let Some(p) = partial
-                        && !p.matches(&doc) {
+                        && !p.matches(doc) {
                             out.push(Vec::new());
                             continue;
                         }
                     let mut key = Vec::with_capacity(fields.len());
                     for f in fields {
-                        match crate::mango::get_field(&doc, f) {
+                        match crate::mango::get_field(doc, f) {
                             Some(val) => key.push(val.clone()),
                             None => break,
                         }

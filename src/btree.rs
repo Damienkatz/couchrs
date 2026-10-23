@@ -40,11 +40,54 @@ enum Node<K, V, R> {
     Kv(Vec<(K, V)>),
 }
 
-/// A node to write, borrowing its entries; encodes exactly as `Node`.
-#[derive(Serialize)]
-enum NodeRef<'a, K, V, R> {
-    Kp(&'a [(K, NodePtr<R>)]),
-    Kv(&'a [(K, V)]),
+/// Node's variant indexes, as bincode writes them.
+const KP: u32 = 0;
+const KV: u32 = 1;
+
+/// Entries bincode-serialized once, back to back: their sizes chunk them
+/// into nodes, and their bytes are the nodes' bytes.
+#[derive(Default)]
+struct Encoded {
+    buf: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl Encoded {
+    fn of<T: Serialize>(items: &[T]) -> Encoded {
+        let mut e = Encoded::default();
+        for it in items {
+            e.push(it);
+        }
+        e
+    }
+
+    fn push<T: Serialize>(&mut self, item: &T) {
+        bincode::serialize_into(&mut self.buf, item).expect("serialize");
+        self.ends.push(self.buf.len());
+    }
+
+    fn bytes(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn start(&self, i: usize) -> usize {
+        if i == 0 { 0 } else { self.ends[i - 1] }
+    }
+
+    fn size(&self, i: usize) -> usize {
+        self.ends[i] - self.start(i)
+    }
+
+    /// The node of entries `r`, as bincode lays out a Node: variant index,
+    /// entry count, entries.
+    fn node(&self, variant: u32, r: std::ops::Range<usize>) -> Vec<u8> {
+        let entries = &self.buf[self.start(r.start)..self.start(r.end)];
+        let mut out = Vec::with_capacity(12 + entries.len());
+        out.extend_from_slice(&variant.to_le_bytes());
+        out.extend_from_slice(&(r.len() as u64).to_le_bytes());
+        out.extend_from_slice(entries);
+        out
+    }
 }
 
 type NodeOf<S> = Node<<S as Spec>::K, <S as Spec>::V, <S as Spec>::R>;
@@ -252,7 +295,7 @@ impl<S: Spec> Btree<S> {
             match level.len() {
                 0 => break None,
                 1 => break Some(level.pop().unwrap().1),
-                _ => level = self.write_kp(level)?,
+                _ => level = self.write_kp(&level)?,
             }
         };
         Ok(self.with_root(root))
@@ -297,7 +340,7 @@ impl<S: Spec> Btree<S> {
                 if out.is_empty() {
                     Ok(out)
                 } else {
-                    self.write_kp(out)
+                    self.write_kp(&out)
                 }
             }
         }
@@ -323,15 +366,15 @@ impl<S: Spec> Btree<S> {
             }
         }
         out.extend(ei);
-        self.write_kv(out)
+        self.write_kv(&out)
     }
 
-    fn chunkify<T: Serialize>(items: &[T]) -> Vec<std::ops::Range<usize>> {
+    fn chunkify(enc: &Encoded) -> Vec<std::ops::Range<usize>> {
         let mut ranges = Vec::new();
         let mut start = 0;
         let mut size = 0usize;
-        for (i, it) in items.iter().enumerate() {
-            let sz = bincode::serialized_size(it).unwrap_or(64) as usize;
+        for i in 0..enc.ends.len() {
+            let sz = enc.size(i);
             // At least two entries per node, so kp levels always shrink.
             if i - start >= 2 && size + sz > CHUNK_THRESHOLD {
                 ranges.push(start..i);
@@ -340,8 +383,8 @@ impl<S: Spec> Btree<S> {
             }
             size += sz;
         }
-        if start < items.len() {
-            ranges.push(start..items.len());
+        if start < enc.ends.len() {
+            ranges.push(start..enc.ends.len());
         }
         // Avoid a tiny trailing node by merging it into its neighbour.
         if ranges.len() >= 2 {
@@ -354,14 +397,18 @@ impl<S: Spec> Btree<S> {
         ranges
     }
 
-    fn write_kv(&self, kvs: Vec<(S::K, S::V)>) -> io::Result<Vec<(S::K, NodePtr<S::R>)>> {
-        let ranges = Self::chunkify(&kvs);
+    fn write_kv(&self, kvs: &[(S::K, S::V)]) -> io::Result<Vec<(S::K, NodePtr<S::R>)>> {
+        self.write_kv_encoded(kvs, &Encoded::of(kvs))
+    }
+
+    fn write_kv_encoded(&self, kvs: &[(S::K, S::V)], enc: &Encoded) -> io::Result<Vec<(S::K, NodePtr<S::R>)>> {
+        let ranges = Self::chunkify(enc);
         let mut payloads = Vec::with_capacity(ranges.len());
         let mut meta = Vec::with_capacity(ranges.len());
         for r in ranges {
-            let chunk = &kvs[r];
+            let chunk = &kvs[r.clone()];
             let red = self.spec.reduce(chunk);
-            payloads.push(crate::file::encode_term(&NodeRef::<S::K, S::V, S::R>::Kv(chunk)));
+            payloads.push(crate::file::encode_term_bytes(enc.node(KV, r)));
             meta.push((chunk.last().unwrap().0.clone(), red));
         }
         let ptrs = self.file.append_raw_many(&payloads)?;
@@ -372,19 +419,20 @@ impl<S: Spec> Btree<S> {
             .collect())
     }
 
-    fn write_kp(
-        &self,
-        kps: Vec<(S::K, NodePtr<S::R>)>,
-    ) -> io::Result<Vec<(S::K, NodePtr<S::R>)>> {
-        let ranges = Self::chunkify(&kps);
+    fn write_kp(&self, kps: &[(S::K, NodePtr<S::R>)]) -> io::Result<Vec<(S::K, NodePtr<S::R>)>> {
+        self.write_kp_encoded(kps, &Encoded::of(kps))
+    }
+
+    fn write_kp_encoded(&self, kps: &[(S::K, NodePtr<S::R>)], enc: &Encoded) -> io::Result<Vec<(S::K, NodePtr<S::R>)>> {
+        let ranges = Self::chunkify(enc);
         let mut payloads = Vec::with_capacity(ranges.len());
         let mut meta = Vec::with_capacity(ranges.len());
         for r in ranges {
-            let chunk = &kps[r];
+            let chunk = &kps[r.clone()];
             let reds: Vec<S::R> = chunk.iter().map(|(_, p)| p.red.clone()).collect();
             let red = self.spec.rereduce(&reds);
             let child_size: u64 = chunk.iter().map(|(_, p)| p.size).sum();
-            payloads.push(crate::file::encode_term(&NodeRef::<S::K, S::V, S::R>::Kp(chunk)));
+            payloads.push(crate::file::encode_term_bytes(enc.node(KP, r)));
             meta.push((chunk.last().unwrap().0.clone(), red, child_size));
         }
         let ptrs = self.file.append_raw_many(&payloads)?;
@@ -775,8 +823,8 @@ const BULK_FLUSH: usize = 4 << 20;
 pub struct BulkBuilder<S: Spec> {
     tree: Btree<S>,
     leaf: Vec<(S::K, S::V)>,
-    leaf_bytes: usize,
-    levels: Vec<(Vec<(S::K, NodePtr<S::R>)>, usize)>,
+    leaf_enc: Encoded,
+    levels: Vec<(Vec<(S::K, NodePtr<S::R>)>, Encoded)>,
     last: Option<S::K>,
 }
 
@@ -787,7 +835,7 @@ impl<S: Spec> Btree<S> {
         BulkBuilder {
             tree: self.clone(),
             leaf: Vec::new(),
-            leaf_bytes: 0,
+            leaf_enc: Encoded::default(),
             levels: Vec::new(),
             last: None,
         }
@@ -801,9 +849,9 @@ impl<S: Spec> BulkBuilder<S> {
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "bulk build keys out of order"));
         }
-        self.leaf_bytes += bincode::serialized_size(&(&k, &v)).unwrap_or(64) as usize;
+        self.leaf_enc.push(&(&k, &v));
         self.leaf.push((k, v));
-        if self.leaf_bytes >= BULK_FLUSH {
+        if self.leaf_enc.bytes() >= BULK_FLUSH {
             self.flush_leaf()?;
         }
         Ok(())
@@ -812,27 +860,33 @@ impl<S: Spec> BulkBuilder<S> {
     fn flush_leaf(&mut self) -> io::Result<()> {
         self.last = self.leaf.last().map(|(k, _)| k.clone());
         let kvs = std::mem::take(&mut self.leaf);
-        self.leaf_bytes = 0;
-        for e in self.tree.write_kv(kvs)? {
+        let enc = std::mem::take(&mut self.leaf_enc);
+        for e in self.tree.write_kv_encoded(&kvs, &enc)? {
             self.push_level(0, e)?;
         }
         Ok(())
     }
 
+    /// Add a pointer to level l (created if new), writing the level's
+    /// nodes once it fills.
     fn push_level(&mut self, l: usize, e: (S::K, NodePtr<S::R>)) -> io::Result<()> {
-        if self.levels.len() <= l {
-            self.levels.push((Vec::new(), 0));
-        }
-        self.levels[l].1 += bincode::serialized_size(&e).unwrap_or(64) as usize;
-        self.levels[l].0.push(e);
-        if self.levels[l].1 >= BULK_FLUSH {
-            let ents = std::mem::take(&mut self.levels[l].0);
-            self.levels[l].1 = 0;
-            for p in self.tree.write_kp(ents)? {
+        self.add(l, e);
+        if self.levels[l].1.bytes() >= BULK_FLUSH {
+            let (ents, enc) = std::mem::take(&mut self.levels[l]);
+            for p in self.tree.write_kp_encoded(&ents, &enc)? {
                 self.push_level(l + 1, p)?;
             }
         }
         Ok(())
+    }
+
+    fn add(&mut self, l: usize, e: (S::K, NodePtr<S::R>)) {
+        if self.levels.len() <= l {
+            self.levels.push(Default::default());
+        }
+        let (ents, enc) = &mut self.levels[l];
+        enc.push(&e);
+        ents.push(e);
     }
 
     /// Write the remaining partial nodes and return the finished tree.
@@ -846,20 +900,17 @@ impl<S: Spec> BulkBuilder<S> {
                 break None;
             }
             let top = l == self.levels.len() - 1;
-            let ents = std::mem::take(&mut self.levels[l].0);
+            let (ents, enc) = std::mem::take(&mut self.levels[l]);
             if top && ents.len() == 1 {
                 break ents.into_iter().next().map(|(_, p)| p);
             }
             if ents.len() == 1 {
                 // A lone pointer moves up as is; depth needn't be uniform.
                 let e = ents.into_iter().next().unwrap();
-                self.levels[l + 1].0.push(e);
+                self.add(l + 1, e);
             } else if !ents.is_empty() {
-                for p in self.tree.write_kp(ents)? {
-                    if self.levels.len() <= l + 1 {
-                        self.levels.push((Vec::new(), 0));
-                    }
-                    self.levels[l + 1].0.push(p);
+                for p in self.tree.write_kp_encoded(&ents, &enc)? {
+                    self.add(l + 1, p);
                 }
             }
             l += 1;
@@ -902,13 +953,16 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_nodes_encode_as_nodes() {
+    fn encoded_entries_make_nodes_as_bincode_does() {
         let kvs: Vec<(u64, u64)> = (0..300).map(|i| (i, i * 7)).collect();
-        let kps: Vec<(u64, NodePtr<u64>)> = (0..3).map(|i| (i, NodePtr { pos: i * 100, red: i, size: 9 })).collect();
-        let owned: Node<u64, u64, u64> = Node::Kv(kvs.clone());
-        assert_eq!(crate::file::encode_term(&owned), crate::file::encode_term(&NodeRef::<u64, u64, u64>::Kv(&kvs)));
-        let owned: Node<u64, u64, u64> = Node::Kp(kps.clone());
-        assert_eq!(crate::file::encode_term(&owned), crate::file::encode_term(&NodeRef::<u64, u64, u64>::Kp(&kps)));
+        let kps: Vec<(u64, NodePtr<u64>)> = (0..5).map(|i| (i, NodePtr { pos: i * 100, red: i, size: 9 })).collect();
+        let enc = Encoded::of(&kvs);
+        let node: Node<u64, u64, u64> = Node::Kv(kvs[10..250].to_vec());
+        assert_eq!(bincode::serialize(&node).unwrap(), enc.node(KV, 10..250));
+        let enc = Encoded::of(&kps);
+        let node: Node<u64, u64, u64> = Node::Kp(kps[..3].to_vec());
+        assert_eq!(bincode::serialize(&node).unwrap(), enc.node(KP, 0..3));
+        assert_eq!(enc.size(4), bincode::serialized_size(&kps[4]).unwrap() as usize);
     }
 
     #[test]

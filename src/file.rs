@@ -275,7 +275,11 @@ const ENC_RAW2: u8 = 3;
 
 /// Serialize with bincode, snappy-compressing larger payloads.
 pub fn encode_term<T: Serialize>(term: &T) -> Vec<u8> {
-    let raw = bincode::serialize(term).expect("serialize");
+    encode_term_bytes(bincode::serialize(term).expect("serialize"))
+}
+
+/// encode_term of a term already bincode-serialized.
+pub fn encode_term_bytes(raw: Vec<u8>) -> Vec<u8> {
     if raw.len() > 128 {
         let mut enc = snap::raw::Encoder::new();
         if let Ok(c) = enc.compress_vec(&raw)
