@@ -346,31 +346,119 @@ fn run_updates(db: &Db, snap: &Snapshot, idx: &SearchIndex, spec: &IndexSpec) ->
         Indexer::Js(crate::js::JsFuns::new(&Value::Null, &[spec.def.as_str().unwrap_or_default().to_string()], &[]))
     };
     let partitioned = snap.partitioned();
-    let mut batch: Vec<FullDocInfo> = Vec::new();
-    let mut err = None;
-    let flush = |batch: Vec<FullDocInfo>| -> std::result::Result<(), UpdateError> {
-        let n = batch.len() as u64;
-        let updates = to_updates(snap, &indexer, partitioned, batch)?;
-        idx.apply(&updates)?;
-        task.add_changes(n);
-        Ok(())
-    };
-    snap.fold_changes(since, crate::btree::Dir::Fwd, |fdi| {
-        batch.push(fdi.clone());
-        if batch.len() >= BATCH_DOCS
-            && let Err(e) = flush(std::mem::take(&mut batch)) {
-                err = Some(e);
-                return Ok(false);
+    // Index functions run on worker threads that last the whole update, so
+    // each starts its JavaScript engine once. An update of a batch or less
+    // runs here, where the engine stays cached from one update to the next.
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(total.div_ceil(BATCH_DOCS as u64) as usize);
+    if workers <= 1 {
+        let mut batch: Vec<FullDocInfo> = Vec::new();
+        let mut err = None;
+        let flush = |batch: &[FullDocInfo]| -> std::result::Result<(), UpdateError> {
+            idx.apply(&batch_updates(snap, &indexer, partitioned, batch)?)?;
+            task.add_changes(batch.len() as u64);
+            Ok(())
+        };
+        snap.fold_changes(since, crate::btree::Dir::Fwd, |fdi| {
+            batch.push(fdi.clone());
+            if batch.len() >= BATCH_DOCS {
+                if let Err(e) = flush(&batch) {
+                    err = Some(e);
+                    return Ok(false);
+                }
+                batch.clear();
             }
-        Ok(true)
-    })
-    .map_err(UpdateError::Other)?;
-    if let Some(e) = err {
-        return Err(e);
+            Ok(true)
+        })
+        .map_err(UpdateError::Other)?;
+        if let Some(e) = err {
+            return Err(e);
+        }
+        flush(&batch)?;
+    } else {
+        run_pool(snap, since, &indexer, partitioned, idx, &task, workers)?;
     }
-    flush(batch)?;
     idx.set_seqs(snap.update_seq(), snap.header.purge_seq);
     idx.commit().map_err(UpdateError::Other)
+}
+
+/// A walk of the changes feeds batches to `workers` threads, and their
+/// updates are applied here in the changes' order (stopping at the first
+/// batch that fails).
+fn run_pool(
+    snap: &Snapshot,
+    since: u64,
+    indexer: &Indexer,
+    partitioned: bool,
+    idx: &SearchIndex,
+    task: &crate::tasks::TaskHandle,
+    workers: usize,
+) -> std::result::Result<(), UpdateError> {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    type Done = (usize, std::result::Result<Vec<Update>, UpdateError>, u64);
+    let stop = AtomicBool::new(false);
+    let walk_err: Mutex<Option<CouchError>> = Mutex::new(None);
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<FullDocInfo>)>(workers * 2);
+    let work_rx = Mutex::new(work_rx);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
+    std::thread::scope(|sc| {
+        let (stop, walk_err, work_rx) = (&stop, &walk_err, &work_rx);
+        sc.spawn(move || {
+            let mut batch = Vec::with_capacity(BATCH_DOCS);
+            let mut n = 0;
+            let r = snap.fold_changes(since, crate::btree::Dir::Fwd, |fdi| {
+                if stop.load(Relaxed) {
+                    return Ok(false);
+                }
+                batch.push(fdi.clone());
+                if batch.len() >= BATCH_DOCS {
+                    if work_tx.send((n, std::mem::take(&mut batch))).is_err() {
+                        return Ok(false);
+                    }
+                    n += 1;
+                }
+                Ok(true)
+            });
+            if !batch.is_empty() {
+                let _ = work_tx.send((n, batch));
+            }
+            if let Err(e) = r {
+                *walk_err.lock() = Some(e);
+            }
+        });
+        for _ in 0..workers {
+            let done_tx = done_tx.clone();
+            sc.spawn(move || {
+                // Until the walk ends; once stopped, batches are drained unread.
+                loop {
+                    // (Its own statement, so the lock is let go before the work.)
+                    let job = work_rx.lock().recv();
+                    let Ok((n, batch)) = job else { break };
+                    if !stop.load(Relaxed) && done_tx.send((n, batch_updates(snap, indexer, partitioned, &batch), batch.len() as u64)).is_err() {
+                        stop.store(true, Relaxed);
+                    }
+                }
+            });
+        }
+        drop(done_tx);
+        let mut ready = std::collections::BTreeMap::new();
+        let mut next = 0;
+        for (n, updates, len) in done_rx.iter() {
+            ready.insert(n, (updates, len));
+            while let Some((updates, len)) = ready.remove(&next) {
+                next += 1;
+                if let Err(e) = updates.and_then(|u| idx.apply(&u)) {
+                    stop.store(true, Relaxed);
+                    return Err(e);
+                }
+                task.add_changes(len);
+            }
+        }
+        Ok(())
+    })?;
+    match walk_err.into_inner() {
+        Some(e) => Err(UpdateError::Other(e)),
+        None => Ok(()),
+    }
 }
 
 /// What each changed document becomes in the index: its index
@@ -393,34 +481,24 @@ impl Indexer {
     }
 }
 
-fn to_updates(snap: &Snapshot, indexer: &Indexer, partitioned: bool, batch: Vec<FullDocInfo>) -> std::result::Result<Vec<Update>, UpdateError> {
-    let one = |fdi: &FullDocInfo| -> std::result::Result<Option<Update>, UpdateError> {
+/// A batch of changed docs as index updates.
+fn batch_updates(snap: &Snapshot, indexer: &Indexer, partitioned: bool, batch: &[FullDocInfo]) -> std::result::Result<Vec<Update>, UpdateError> {
+    let mut out = Vec::with_capacity(batch.len());
+    for fdi in batch {
         if fdi.id.starts_with("_design/") {
-            return Ok(None);
+            continue;
         }
         if fdi.deleted {
-            return Ok(Some(Update::Delete { id: fdi.id.clone() }));
+            out.push(Update::Delete { id: fdi.id.clone() });
+            continue;
         }
         let fields = indexer.fields(snap, fdi).map_err(UpdateError::Other)?;
         if fields.is_empty() {
-            return Ok(Some(Update::Delete { id: fdi.id.clone() }));
+            out.push(Update::Delete { id: fdi.id.clone() });
+            continue;
         }
         let partition = if partitioned { crate::doc::partition_of(&fdi.id).map(String::from) } else { None };
-        Ok(Some(Update::Upsert { id: fdi.id.clone(), partition, fields }))
-    };
-    // Index functions run in parallel over large batches.
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(batch.len() / 64).max(1);
-    if threads == 1 {
-        return Ok(batch.iter().map(one).collect::<std::result::Result<Vec<_>, _>>()?.into_iter().flatten().collect());
-    }
-    let chunk = batch.len().div_ceil(threads);
-    let parts: Vec<std::result::Result<Vec<Option<Update>>, UpdateError>> = std::thread::scope(|s| {
-        let hs: Vec<_> = batch.chunks(chunk).map(|c| s.spawn(move || c.iter().map(one).collect())).collect();
-        hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(UpdateError::Other(CouchError::internal("index worker panicked"))))).collect()
-    });
-    let mut out = Vec::with_capacity(batch.len());
-    for p in parts {
-        out.extend(p?.into_iter().flatten());
+        out.push(Update::Upsert { id: fdi.id.clone(), partition, fields });
     }
     Ok(out)
 }
