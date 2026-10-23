@@ -33,6 +33,16 @@ pub enum MergeResult {
     InternalNode,
 }
 
+/// Rev ids in CouchDB's order: 32 hex digits compare as the 16 bytes they
+/// spell (parse_revid/2 keeps them so), any other id as its own bytes.
+pub fn cmp_rev_ids(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut ba, mut bb) = ([0u8; 16], [0u8; 16]);
+    let key = |id: &'_ str, buf: &mut [u8; 16]| -> bool { id.len() == 32 && hex::decode_to_slice(id, buf).is_ok() };
+    let ka: &[u8] = if key(a, &mut ba) { &ba } else { a.as_bytes() };
+    let kb: &[u8] = if key(b, &mut bb) { &bb } else { b.as_bytes() };
+    ka.cmp(kb)
+}
+
 pub trait RevValue: Clone {
     /// True if this value has no data (stemmed / compacted away).
     fn is_missing(&self) -> bool;
@@ -68,7 +78,7 @@ fn merge_into<V: RevValue>(node: &mut RevNode<V>, revs: &[(String, V)]) -> Merge
     let was_leaf = node.kids.is_empty();
     node.kids.push(path_to_node(next));
     // Keep siblings in a deterministic order.
-    node.kids.sort_by(|a, b| a.id.cmp(&b.id));
+    node.kids.sort_by(|a, b| cmp_rev_ids(&a.id, &b.id));
     if was_leaf {
         MergeResult::NewLeaf
     } else {
@@ -133,7 +143,7 @@ pub fn merge_path<V: RevValue>(tree: &mut RevTree<V>, path: Path<V>) -> MergeRes
         }
     }
     tree.push((path.start, path_to_node(&path.revs)));
-    tree.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    tree.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| cmp_rev_ids(&a.1.id, &b.1.id)));
     MergeResult::NewBranch
 }
 
@@ -404,5 +414,16 @@ mod tests {
         let r = remove_leafs(&mut t, &[(2, "c".into())]);
         assert_eq!(r.len(), 1);
         assert_eq!(leafs(&t).len(), 1);
+    }
+
+    #[test]
+    fn rev_id_order() {
+        use std::cmp::Ordering::*;
+        // 32 hex digits compare as bytes: 0xc7 sorts after "z" (0x7a).
+        assert_eq!(cmp_rev_ids("c7babbc20892ba5e4ba940b588585336", "zzz"), Greater);
+        assert_eq!(cmp_rev_ids("0785e9eb543380151003dc452c3a001a", "zzz"), Less);
+        assert_eq!(cmp_rev_ids("C7BABBC20892BA5E4BA940B588585336", "c7babbc20892ba5e4ba940b588585336"), Equal);
+        assert_eq!(cmp_rev_ids("aaa", "bbb"), Less);
+        assert_eq!(cmp_rev_ids("ab", "abc"), Less);
     }
 }

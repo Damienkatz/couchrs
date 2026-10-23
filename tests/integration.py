@@ -238,6 +238,48 @@ def bulk_docs_seqs_in_id_order():
 
 
 @test
+def doc_members_revpos_and_winners():
+    db = new_db()
+    att = lambda s: {"content_type": "text/plain", "data": base64.b64encode(s).decode()}
+    # Members after the body: _deleted, _revisions, the meta ones, then _attachments.
+    rev = req("PUT", f"/{db}/a", {"v": 1, "_attachments": {"x.txt": att(b"one")}})[1]["rev"]
+    eq(req("POST", f"/{db}/_bulk_docs", {"new_edits": False, "docs": [{"_id": "a", "_rev": "1-000", "w": 1}]})[0], 201)
+    s, b, _ = req("GET", f"/{db}/a?revs=true&conflicts=true&local_seq=true")
+    eq(list(b), ["_id", "_rev", "v", "_revisions", "_conflicts", "_local_seq", "_attachments"])
+    # _local_seq is the doc's latest update seq, not its revision's.
+    eq(b["_local_seq"], 2)
+    # A revision asked for by rev gets revs, but none of the meta members.
+    s, b, _ = req("GET", f"/{db}/a?rev={rev}&revs=true&conflicts=true&revs_info=true&local_seq=true")
+    eq(list(b), ["_id", "_rev", "v", "_revisions", "_attachments"])
+    s, b, _ = req("GET", f"/{db}/a?open_revs=all&conflicts=true&local_seq=true", headers={"Accept": "application/json"})
+    eq([sorted(r["ok"]) for r in b], [["_id", "_rev", "w"], ["_attachments", "_id", "_rev", "v"]])
+    # A deletion with a body: 200, and _deleted follows the body.
+    rev = req("PUT", f"/{db}/d", {"v": 1})[1]["rev"]
+    s, b, _ = req("PUT", f"/{db}/d", {"_rev": rev, "_deleted": True, "why": "gone", "_attachments": {"x.txt": att(b"two")}})
+    eq(s, 200, b)
+    s, b, _ = req("GET", f"/{db}/d?rev={b['rev']}&revs=true")
+    eq(list(b), ["_id", "_rev", "why", "_deleted", "_revisions", "_attachments"])
+
+    # revpos: new data in an edit takes the new revision's; a replicated
+    # write keeps the one it came with, or 0.
+    eq(req("PUT", f"/{db}/b", {"_attachments": {"x.txt": dict(att(b"hi"), revpos=7)}})[0], 201)
+    eq(req("GET", f"/{db}/b")[1]["_attachments"]["x.txt"]["revpos"], 1)
+    eq(req("POST", f"/{db}/_bulk_docs", {"new_edits": False, "docs": [{"_id": "c", "_rev": "3-abc", "_revisions": {"start": 3, "ids": ["abc", "b", "a"]},
+       "_attachments": {"t": att(b"hi"), "u": dict(att(b"hi"), revpos=2)}}]})[0], 201)
+    atts = req("GET", f"/{db}/c")[1]["_attachments"]
+    eq((atts["t"]["revpos"], atts["u"]["revpos"]), (0, 2))
+
+    # Winners: 32 hex digits compare as the bytes they spell.
+    h1, h2 = "c7babbc20892ba5e4ba940b588585336", "0785e9eb543380151003dc452c3a001a"
+    eq(req("POST", f"/{db}/_bulk_docs", {"new_edits": False, "docs": [
+        {"_id": "w", "_rev": f"1-{h1}", "n": 1}, {"_id": "w", "_rev": "1-zzz", "n": 2}, {"_id": "w", "_rev": f"1-{h2}", "n": 3}]})[0], 201)
+    s, b, _ = req("GET", f"/{db}/w?conflicts=true")
+    eq((b["_rev"], b["_conflicts"]), (f"1-{h1}", ["1-zzz", f"1-{h2}"]))
+    s, b, _ = req("GET", f"/{db}/w?open_revs=all", headers={"Accept": "application/json"})
+    eq([r["ok"]["_rev"] for r in b], [f"1-{h2}", "1-zzz", f"1-{h1}"])
+
+
+@test
 def local_docs():
     db = new_db()
     s, b, _ = req("PUT", f"/{db}/_local/cp", {"seq": 1})

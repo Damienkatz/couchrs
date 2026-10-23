@@ -385,42 +385,17 @@ impl Snapshot {
     }
 
     /// A revision's stored body and the members rendered before it (_id,
-    /// _rev, _deleted) and after it.
+    /// _rev) and after it: _deleted, _revisions, the meta members, then the
+    /// attachments, as couch_doc:to_json_obj/2 orders them.
     fn doc_parts(&self, fdi: &FullDocInfo, rev: &RevInfo, opts: &DocOpts) -> Result<(Map<String, Value>, DiskBody, Map<String, Value>)> {
         let leaf = rev.val.leaf().ok_or_else(CouchError::missing)?;
         let body = self.read_body(leaf.ptr)?;
         let mut head = Map::new();
         head.insert("_id".into(), json!(fdi.id));
         head.insert("_rev".into(), json!(rev.rev()));
-        if leaf.deleted {
-            head.insert("_deleted".into(), json!(true));
-        }
         let mut m = Map::new();
-        if !body.atts.is_empty() {
-            let since_pos = opts.atts_since.as_ref().map(|revs| {
-                revs.iter()
-                    .filter(|(p, id)| {
-                        let idx = rev.pos.checked_sub(*p).map(|d| d as usize);
-                        idx.and_then(|i| rev.path.get(i)).map(|x| x == id).unwrap_or(false)
-                    })
-                    .map(|(p, _)| *p)
-                    .max()
-                    .unwrap_or(0)
-            });
-            let mut atts = Map::new();
-            for a in &body.atts {
-                let want = match since_pos {
-                    Some(sp) => a.revpos > sp,
-                    None => opts.attachments,
-                };
-                let stub = match (want, opts.follows) {
-                    (true, true) => att_json(a, opts, AttBody::Follows),
-                    (true, false) => att_json(a, opts, AttBody::Data(self.read_att_decoded(a)?)),
-                    (false, _) => att_json(a, opts, AttBody::Stub),
-                };
-                atts.insert(a.name.clone(), stub);
-            }
-            m.insert("_attachments".into(), Value::Object(atts));
+        if leaf.deleted {
+            m.insert("_deleted".into(), json!(true));
         }
         if opts.revs {
             m.insert("_revisions".into(), json!({"start": rev.pos, "ids": rev.path}));
@@ -452,8 +427,35 @@ impl Snapshot {
                 m.insert("_deleted_conflicts".into(), json!(c));
             }
         }
+        // The doc's latest update seq, whichever revision this is.
         if opts.local_seq {
-            m.insert("_local_seq".into(), json!(leaf.seq));
+            m.insert("_local_seq".into(), json!(fdi.update_seq));
+        }
+        if !body.atts.is_empty() {
+            let since_pos = opts.atts_since.as_ref().map(|revs| {
+                revs.iter()
+                    .filter(|(p, id)| {
+                        let idx = rev.pos.checked_sub(*p).map(|d| d as usize);
+                        idx.and_then(|i| rev.path.get(i)).map(|x| x == id).unwrap_or(false)
+                    })
+                    .map(|(p, _)| *p)
+                    .max()
+                    .unwrap_or(0)
+            });
+            let mut atts = Map::new();
+            for a in &body.atts {
+                let want = match since_pos {
+                    Some(sp) => a.revpos > sp,
+                    None => opts.attachments,
+                };
+                let stub = match (want, opts.follows) {
+                    (true, true) => att_json(a, opts, AttBody::Follows),
+                    (true, false) => att_json(a, opts, AttBody::Data(self.read_att_decoded(a)?)),
+                    (false, _) => att_json(a, opts, AttBody::Stub),
+                };
+                atts.insert(a.name.clone(), stub);
+            }
+            m.insert("_attachments".into(), Value::Object(atts));
         }
         Ok((head, body, m))
     }
@@ -940,7 +942,7 @@ impl Db {
                     a.length = bytes.len() as u64;
                 }
                 a.encoded_length = bytes.len() as u64;
-                a.data = AttData::Stored(chunks);
+                a.data = AttData::Staged(chunks);
             }
         }
         Ok(())
@@ -1454,7 +1456,11 @@ fn missing_stub(doc: &Doc, name: &str) -> CouchError {
 }
 
 /// Resolve stubs and write new attachment data, returning stored infos.
-fn prepare_atts(w: &Writes, doc: &Doc, prev: Option<&DiskBody>, new_pos: u64) -> Result<Vec<AttInfo>> {
+/// New data takes the new revision's position in an interactive edit
+/// (set_new_att_revpos/1); a replicated one keeps the revpos it came with,
+/// or 0.
+fn prepare_atts(w: &Writes, doc: &Doc, prev: Option<&DiskBody>, new_pos: u64, replicated: bool) -> Result<Vec<AttInfo>> {
+    let new_revpos = |a: &Att| if replicated { a.revpos.unwrap_or(0) } else { new_pos };
     let mut out = Vec::with_capacity(doc.atts.len());
     for a in &doc.atts {
         let info = match &a.data {
@@ -1467,10 +1473,13 @@ fn prepare_atts(w: &Writes, doc: &Doc, prev: Option<&DiskBody>, new_pos: u64) ->
                 }
                 p.clone()
             }
-            AttData::Stored(chunks) => AttInfo {
+            AttData::Stored(chunks) | AttData::Staged(chunks) => AttInfo {
                 name: a.name.clone(),
                 content_type: a.content_type.clone(),
-                revpos: a.revpos.unwrap_or(new_pos),
+                revpos: match a.data {
+                    AttData::Staged(_) => new_revpos(a),
+                    _ => a.revpos.unwrap_or(new_pos),
+                },
                 length: a.length,
                 md5: a.md5.clone(),
                 encoding: a.encoding.clone(),
@@ -1484,7 +1493,7 @@ fn prepare_atts(w: &Writes, doc: &Doc, prev: Option<&DiskBody>, new_pos: u64) ->
                 AttInfo {
                     name: a.name.clone(),
                     content_type: a.content_type.clone(),
-                    revpos: a.revpos.unwrap_or(new_pos),
+                    revpos: new_revpos(a),
                     length: if a.encoding.is_some() { a.length } else { bytes.len() as u64 },
                     md5,
                     encoding: a.encoding.clone(),
@@ -1573,7 +1582,7 @@ fn update_interactive(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDoc
         None => None,
     };
     let new_pos = parent.as_ref().map(|p| p.pos + 1).unwrap_or(1);
-    let atts = prepare_atts(w, doc, prev_body.as_ref(), new_pos)?;
+    let atts = prepare_atts(w, doc, prev_body.as_ref(), new_pos, false)?;
     let body_json = serde_json::to_vec(&doc.body)?;
     let mut hash_doc = doc.clone();
     hash_doc.atts = atts.iter().map(Att::from_info).collect();
@@ -1620,7 +1629,7 @@ fn update_replicated(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDocI
             }
         }
     }
-    let atts = prepare_atts(w, doc, prev_body.as_ref(), *pos)?;
+    let atts = prepare_atts(w, doc, prev_body.as_ref(), *pos, true)?;
     let body_json = serde_json::to_vec(&doc.body)?;
     let leaf = write_rev(w, doc, atts, body_json)?;
     let n = ids.len();

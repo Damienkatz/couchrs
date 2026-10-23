@@ -110,7 +110,8 @@ impl RevInfo {
 }
 
 impl FullDocInfo {
-    /// Leaves sorted winner-first: non-deleted, then highest pos, then id.
+    /// Leaves sorted winner-first: non-deleted, then highest pos, then id
+    /// (as CouchDB compares them).
     pub fn sorted_leafs(&self) -> Vec<RevInfo> {
         let mut ls: Vec<RevInfo> = keytree::leafs(&self.tree)
             .into_iter()
@@ -122,9 +123,7 @@ impl FullDocInfo {
                 path: l.path,
             })
             .collect();
-        ls.sort_by(|a, b| {
-            (!b.deleted, b.pos, &b.id).cmp(&(!a.deleted, a.pos, &a.id))
-        });
+        ls.sort_by(|a, b| (!b.deleted, b.pos).cmp(&(!a.deleted, a.pos)).then_with(|| keytree::cmp_rev_ids(&b.id, &a.id)));
         ls
     }
 
@@ -245,6 +244,8 @@ pub enum AttData {
     Bytes(bytes::Bytes),
     /// Already written to the file.
     Stored(Vec<Pos>),
+    /// Bytes from the request, written ahead of the update (stage_atts).
+    Staged(Vec<Pos>),
     /// Will arrive in a later multipart part.
     Follows,
 }
@@ -559,6 +560,15 @@ pub struct DocOpts {
     /// Mark included attachments `"follows": true` instead of inlining
     /// base64 data; the bytes are sent as multipart parts.
     pub follows: bool,
+}
+
+impl DocOpts {
+    /// For a revision asked for by rev (`rev=`, `open_revs`, _bulk_get):
+    /// CouchDB opens those with open_revs, whose docs carry no meta, so
+    /// revs_info, conflicts and local_seq don't apply.
+    pub fn without_meta(&self) -> DocOpts {
+        DocOpts { revs_info: false, conflicts: false, deleted_conflicts: false, local_seq: false, ..self.clone() }
+    }
 }
 
 pub const DEFAULT_COMPRESSIBLE_TYPES: &str = "text/*, application/javascript, application/json, application/xml";

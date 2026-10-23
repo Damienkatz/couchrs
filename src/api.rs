@@ -434,17 +434,17 @@ fn get_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         return open_revs_response(req, &snap, id, open_revs, &opts);
     }
     let fdi = snap.get_fdi(id)?.ok_or_else(CouchError::missing)?;
-    let rev = match req.q("rev") {
+    let (rev, opts) = match req.q("rev") {
         Some(r) => {
             let (p, rid) = parse_rev(r)?;
-            Snapshot::find_rev(&fdi, p, &rid).ok_or_else(CouchError::missing)?
+            (Snapshot::find_rev(&fdi, p, &rid).ok_or_else(CouchError::missing)?, opts.without_meta())
         }
         None => {
             let w = fdi.winner();
             if w.deleted {
                 return Err(CouchError::deleted());
             }
-            w
+            (w, opts)
         }
     };
     let etag = format!("\"{}\"", rev.rev());
@@ -482,6 +482,7 @@ pub fn open_revs(
     latest: bool,
     opts: &DocOpts,
 ) -> Result<Vec<Value>> {
+    let opts = &opts.without_meta();
     let mut out = Vec::new();
     for r in resolve_open_revs(snap, id, spec, latest)? {
         match r {
@@ -570,7 +571,10 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
                 let (p, r) = rev.split_once('-').unwrap_or(("0", ""));
                 (p.parse::<u64>().unwrap_or(0), r.to_string())
             };
-            results.sort_by_key(pos_id);
+            results.sort_by(|a, b| {
+                let ((pa, ra), (pb, rb)) = (pos_id(a), pos_id(b));
+                pa.cmp(&pb).then_with(|| crate::keytree::cmp_rev_ids(&ra, &rb))
+            });
         }
         return ok_json(Value::Array(results));
     }
@@ -580,7 +584,7 @@ fn open_revs_response(req: &Req, snap: &Snapshot, id: &str, spec: &str, opts: &D
     // CouchDB always sends attachment bodies in multipart open_revs
     // responses (`[attachments, follows, att_encoding_info | Options]`);
     // the replicator relies on it and never asks for attachments=true.
-    let mut opts = opts.clone();
+    let mut opts = opts.without_meta();
     opts.follows = true;
     opts.attachments = true;
     opts.att_encoding_info = true;
@@ -897,9 +901,13 @@ async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         doc.revs = (p, vec![rid]);
     }
     let new_edits = req.q_bool("new_edits")?.unwrap_or(true);
+    let deleted = doc.deleted;
     let rev = save_docs(req, db, vec![doc], new_edits).await?.pop().unwrap()?;
+    // A deletion is "ok", not "created" (chttpd_db:update_doc/4).
     let status = if req.q("batch") == Some("ok") {
         StatusCode::ACCEPTED
+    } else if deleted {
+        StatusCode::OK
     } else {
         StatusCode::CREATED
     };
