@@ -489,6 +489,11 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
         } else if a.get("follows").and_then(|s| s.as_bool()) == Some(true) {
             let declared_length = a.get("length").and_then(|l| l.as_u64());
             let length = declared_length.unwrap_or(0);
+            // encoded_lengths_from_json/1: only an encoded one has its own.
+            let encoded_length = match encoding {
+                Some(_) => a.get("encoded_length").and_then(|l| l.as_u64()).unwrap_or(length),
+                None => length,
+            };
             atts.push(Att {
                 name: name.clone(),
                 content_type,
@@ -496,7 +501,7 @@ fn parse_atts(v: &Value) -> Result<Vec<Att>> {
                 length,
                 declared: Declared { md5: (!md5.is_empty()).then(|| md5.clone()), length: declared_length },
                 md5,
-                encoded_length: a.get("encoded_length").and_then(|l| l.as_u64()).unwrap_or(length),
+                encoded_length,
                 encoding,
                 stored_length: 0,
                 data: AttData::Follows,
@@ -624,14 +629,18 @@ pub fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The compression level a new attachment is stored gzipped at, if it
+/// is: sent unencoded, of a compressible type, with compression on.
+pub fn gzip_level(config: &crate::config::Config, a: &Att) -> Option<u32> {
+    let level = config.get_int("attachments", "compression_level", 8u32);
+    (level != 0 && a.encoding.is_none() && compressible_type(config, &a.content_type)).then_some(level)
+}
+
 /// Store a new attachment gzipped if its type is compressible, as
 /// couch_db:with_stream/3 does: length stays the data's, the digest is
 /// of the gzipped bytes (zlib's, so it matches CouchDB's).
 pub fn maybe_compress_att(config: &crate::config::Config, a: &mut Att) {
-    let level = config.get_int("attachments", "compression_level", 8u32);
-    if level == 0 || a.encoding.is_some() || !compressible_type(config, &a.content_type) {
-        return;
-    }
+    let Some(level) = gzip_level(config, a) else { return };
     if let AttData::Bytes(bytes) = &a.data {
         a.length = bytes.len() as u64;
         let gz = gzip(bytes, level);

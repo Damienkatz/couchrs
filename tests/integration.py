@@ -6,6 +6,7 @@ Stdlib only. Each test uses a fresh database. COUCHDB_CREDS=user:pass
 sends those credentials with every request (for a server with admins).
 """
 import base64
+import http.client
 import json
 import os
 import re
@@ -59,6 +60,37 @@ def _json(b):
         return json.loads(b) if b else None
     except ValueError:
         return b
+
+
+def send_raw(method, path, body, headers=None, chunk=None, midway=None):
+    """A request with its body sent as given: chunked, `chunk` bytes at a
+    time, if `chunk` is set, else with a Content-Length. `midway` is called
+    with half the body sent."""
+    u = urllib.parse.urlsplit(BASE)
+    conn = (http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection)(u.hostname, u.port, timeout=60)
+    hdrs = {"Accept": "application/json"}
+    if CREDS:
+        hdrs["Authorization"] = "Basic " + base64.b64encode(CREDS.encode()).decode()
+    hdrs.update(headers or {})
+    hdrs["Transfer-Encoding" if chunk else "Content-Length"] = "chunked" if chunk else str(len(body))
+    conn.putrequest(method, urllib.parse.quote(path, safe="/?&=%:@$+,-_.~"), skip_accept_encoding=True)
+    for k, v in hdrs.items():
+        conn.putheader(k, v)
+    conn.endheaders()
+    for i, half in enumerate((body[:len(body) // 2], body[len(body) // 2:])):
+        if chunk:
+            for j in range(0, len(half), chunk):
+                conn.send(b"%x\r\n%s\r\n" % (len(half[j:j + chunk]), half[j:j + chunk]))
+        else:
+            conn.send(half)
+        if i == 0 and midway:
+            midway()
+    if chunk:
+        conn.send(b"0\r\n\r\n")
+    resp = conn.getresponse()
+    content = resp.read()
+    conn.close()
+    return resp.status, _json(content)
 
 
 # Databases the tests made, deleted at the end (whether or not a test
@@ -2030,6 +2062,42 @@ def replication():
 
 
 @test
+def replication_large_attachment():
+    """A large attachment replicates byte for byte (streamed, not inlined),
+    with its digest, revpos, encoding and the doc's history as they are on
+    the source; later, a new attachment travels beside a stub of it."""
+    src, tgt = new_db(), "r" + uuid.uuid4().hex[:12]
+    big = os.urandom(48 * 1024 * 1024 + 7)
+    text = b"0123456789abcdef" * 65536  # compressible: stored gzipped
+    try:
+        rev = req("PUT", f"/{src}/big", {"kind": "large"})[1]["rev"]
+        s, b, _ = req("PUT", f"/{src}/big/big.bin?rev={rev}", big, headers={"Content-Type": "application/octet-stream"})
+        eq(s, 201, b)
+        eq(req("PUT", f"/{src}/big/notes.txt?rev={b['rev']}", text, headers={"Content-Type": "text/plain"})[0], 201)
+        eq(req("PUT", f"/{src}/small", {"n": 1})[0], 201)
+
+        def same():
+            for doc_id in ("big", "small"):
+                doc = req("GET", f"/{src}/{doc_id}?revs=true&att_encoding_info=true")[1]
+                eq(req("GET", f"/{tgt}/{doc_id}?revs=true&att_encoding_info=true")[1], doc)
+            for name in req("GET", f"/{src}/big")[1]["_attachments"]:
+                eq(req("GET", f"/{tgt}/big/{name}", raw=True)[1] == req("GET", f"/{src}/big/{name}", raw=True)[1], True, name)
+
+        s, b, _ = req("POST", "/_replicate", {"source": src, "target": tgt, "create_target": True})
+        eq(s, 200, b)
+        eq((b["history"][0]["docs_written"], b["history"][0]["doc_write_failures"]), (2, 0), b)
+        same()
+        eq(req("GET", f"/{tgt}/big?att_encoding_info=true")[1]["_attachments"]["notes.txt"]["encoding"], "gzip")
+        rev = req("GET", f"/{src}/big")[1]["_rev"]
+        eq(req("PUT", f"/{src}/big/later.bin?rev={rev}", b"\x00later", headers={"Content-Type": "application/octet-stream"})[0], 201)
+        s, b, _ = req("POST", "/_replicate", {"source": src, "target": tgt})
+        eq((s, b["history"][0]["docs_written"], b["history"][0]["doc_write_failures"]), (200, 3, 0), b)
+        same()
+    finally:
+        req("DELETE", f"/{tgt}")
+
+
+@test
 def replicator_database():
     src, tgt, cont = new_db(), "r" + uuid.uuid4().hex[:12], "r" + uuid.uuid4().hex[:12]
     one, run = "one_" + uuid.uuid4().hex[:8], "run_" + uuid.uuid4().hex[:8]
@@ -2212,6 +2280,125 @@ def gzip_and_attachment_encoding():
         eq(req("GET", f"/{db}/d/up.txt", raw=True)[1], text)
         eq(req("PUT", f"/{db}/d/br.txt?rev={rev}", b"x", headers={"Content-Type": "text/plain", "Content-Encoding": "br"})[:2],
            (415, {"error": "bad_content_type", "reason": "Only gzip and identity content-encodings are supported"}))
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
+def streamed_uploads():
+    """Attachments of a multipart/related doc PUT or an attachment PUT are
+    stored as they arrive, the parts read as couch_httpd_multipart does."""
+    import hashlib
+    import random
+    import zlib
+    db = new_db()
+    B = "bnd"
+    mp_hdr = {"Content-Type": f'multipart/related; boundary="{B}"'}
+
+    def mp(doc, *parts, json_ct="Content-Type: application/json\r\n", end=True):
+        """The doc's JSON, then parts with no headers, as given."""
+        out = f"--{B}\r\n{json_ct}\r\n{json.dumps(doc)}".encode()
+        for p in parts:
+            out += f"\r\n--{B}\r\n\r\n".encode() + p
+        return out + (f"\r\n--{B}--".encode() if end else b"")
+
+    def follows(**lengths):
+        return {"_attachments": {n: {"follows": True, "length": length} for n, length in lengths.items()}}
+
+    def md5(b):
+        return "md5-" + base64.b64encode(hashlib.md5(b).digest()).decode()
+
+    get = lambda path: req("GET", f"/{db}/{path}", raw=True)[1]
+    bad = lambda reason: (400, {"error": "bad_request", "reason": reason})
+    try:
+        # Each attachment takes its length from the parts after the JSON,
+        # in order, running on into the next part if need be. What precedes
+        # the first boundary, parts past the last attachment and a missing
+        # final boundary are let be.
+        eq(send_raw("PUT", f"/{db}/a", mp(follows(x=2, y=3), b"ab", b"c", b"de"), mp_hdr)[0], 201)
+        eq((get("a/x"), get("a/y")), (b"ab", b"cde"))
+        eq(send_raw("PUT", f"/{db}/b", b"preamble\r\n" + mp(follows(x=3), b"abc", b"extra", end=False), mp_hdr)[0], 201)
+        eq(get("b/x"), b"abc")
+        eq(send_raw("PUT", f"/{db}/c", mp(follows(z=0, x=1), b"q"), mp_hdr)[0], 201)
+        eq((get("c/z"), get("c/x")), (b"", b"q"))
+        # An identity attachment's length is its encoded length.
+        doc = {"_attachments": {"x": {"follows": True, "length": 3, "encoded_length": 5}}}
+        eq(send_raw("PUT", f"/{db}/e", mp(doc, b"abc"), mp_hdr)[0], 201)
+        eq(send_raw("PUT", f"/{db}/d", mp(follows(x=2, y=3), b"a", b"bcde"), mp_hdr), bad("attachment longer than expected"))
+        eq(send_raw("PUT", f"/{db}/d", mp(follows(x=2, y=3), b"ab"), mp_hdr), bad("attachment shorter than expected"))
+        # The first part must be JSON; a type other than
+        # "multipart/related;" as written isn't taken for multipart.
+        eq(send_raw("PUT", f"/{db}/d", mp(follows(x=1), b"a", json_ct=""), mp_hdr),
+           (415, {"error": "bad_content_type", "reason": "Content-Type must be application/json"}))
+        json_ct = "Content-Type: Application/JSON; charset=utf-8\r\n"
+        eq(send_raw("PUT", f"/{db}/f", mp(follows(x=1), b"a", json_ct=json_ct), mp_hdr)[0], 201)
+        eq(send_raw("PUT", f"/{db}/d", mp(follows(x=1), b"a"), {"Content-Type": f"Multipart/Related; boundary={B}"}),
+           bad("invalid UTF-8 JSON"))
+        # A digest given must be the data's.
+        doc = {"_attachments": {"x": {"follows": True, "length": 3, "digest": md5(b"nope")}}}
+        assert send_raw("PUT", f"/{db}/d", mp(doc, b"abc"), mp_hdr)[0] >= 400
+        eq(req("GET", f"/{db}/d")[0], 404)
+
+        # Large ones, every way they come, are stored the same: compressible
+        # ones gzipped as zlib does it whole.
+        rng = random.Random(7)
+        binary = rng.randbytes(3 * 1024 * 1024 + 12345)
+        words = [b"w%d " % i for i in range(1000)]
+        text = b"".join(rng.choice(words) for _ in range(600000))
+        z = zlib.compressobj(8, zlib.DEFLATED, 16 + 15, 8)
+        gz_text = z.compress(text) + z.flush()
+        for name, data, ct, stored in [("bin", binary, "application/octet-stream", binary), ("txt", text, "text/plain", gz_text)]:
+            expect = {"content_type": ct, "revpos": 1, "digest": md5(stored), "length": len(data), "stub": True}
+            if stored is not data:
+                expect.update(encoding="gzip", encoded_length=len(stored))
+            eq(send_raw("PUT", f"/{db}/put_{name}/f", data, {"Content-Type": ct})[0], 201)
+            eq(send_raw("PUT", f"/{db}/chunked_{name}/f", data, {"Content-Type": ct}, chunk=100000)[0], 201)
+            doc = {"_attachments": {"f": {"follows": True, "length": len(data), "content_type": ct}}}
+            eq(send_raw("PUT", f"/{db}/mp_{name}", mp(doc, data), mp_hdr, chunk=100000)[0], 201)
+            for d in (f"put_{name}", f"chunked_{name}", f"mp_{name}"):
+                eq(req("GET", f"/{db}/{d}?att_encoding_info=true")[1]["_attachments"]["f"], expect, d)
+                assert get(f"{d}/f") == data, d
+        s, body, _ = req("GET", f"/{db}/mp_bin/f", headers={"Range": "bytes=65530-65545"}, raw=True)
+        eq((s, body), (206, binary[65530:65546]))
+
+        # Compacting while an upload is half sent leaves alone what has
+        # arrived.
+        def compact():
+            time.sleep(1)
+            eq(req("POST", f"/{db}/_compact", {})[0], 202)
+            while req("GET", f"/{db}")[1]["compact_running"]:
+                time.sleep(0.1)
+        eq(send_raw("PUT", f"/{db}/k/f", binary, {"Content-Type": "application/octet-stream"}, midway=compact)[0], 201)
+        doc = {"_attachments": {"f": {"follows": True, "length": len(binary)}}}
+        eq(send_raw("PUT", f"/{db}/l", mp(doc, binary), mp_hdr, midway=compact)[0], 201)
+        assert get("k/f") == binary and get("l/f") == binary
+
+        # max_http_request_size bounds a multipart PUT by its Content-Length
+        # alone, and not an attachment PUT; max_attachment_size bounds both,
+        # by the length given up front or the data as it comes.
+        c, np = "/_node/_local/_config", {"X-Couch-Persist": "false"}
+        limits = {"chttpd/max_http_request_size": "2000", "couchdb/max_attachment_size": "2500"}
+        before = {k: req("GET", f"{c}/{k}")[1] for k in limits}
+        try:
+            for k, v in limits.items():
+                req("PUT", f"{c}/{k}", v, headers=np)
+            octet = {"Content-Type": "application/octet-stream"}
+            data = b"x" * 2400
+            eq(send_raw("PUT", f"/{db}/g/f", data, octet)[0], 201)
+            eq(send_raw("PUT", f"/{db}/h/f", data, octet, chunk=1000)[0], 201)
+            eq(send_raw("PUT", f"/{db}/i", mp(follows(f=len(data)), data), mp_hdr),
+               (413, {"error": "too_large", "reason": "the request entity is too large"}))
+            eq(send_raw("PUT", f"/{db}/i", mp(follows(f=len(data)), data), mp_hdr, chunk=1000)[0], 201)
+            too_large = (413, {"error": "attachment_too_large", "reason": "f"})
+            eq(send_raw("PUT", f"/{db}/j/f", data + b"x" * 200, octet), too_large)
+            eq(send_raw("PUT", f"/{db}/j/f", data + b"x" * 200, octet, chunk=1000), too_large)
+            eq(send_raw("PUT", f"/{db}/j", mp(follows(f=2600), b"x" * 5), mp_hdr, chunk=1000), too_large)
+        finally:
+            for k, v in before.items():
+                if isinstance(v, str):
+                    req("PUT", f"{c}/{k}", v, headers=np)
+                else:
+                    req("DELETE", f"{c}/{k}", headers=np)
     finally:
         req("DELETE", f"/{db}")
 
