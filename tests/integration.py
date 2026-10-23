@@ -693,9 +693,66 @@ def exact_numbers():
 
 
 @test
+def purges_update_views_incrementally():
+    """Purged docs leave view indexes without a rebuild: rows of docs gone
+    are dropped, a doc that keeps revisions is mapped again, and each
+    index keeps a purge checkpoint that compaction respects."""
+    # One shard, so CouchDB's seqs are the database's.
+    db = "t" + uuid.uuid4().hex[:12]
+    eq(req("PUT", f"/{db}?q=1")[0], 201)
+    CREATED.append(db)
+    try:
+        _, res, _ = req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": f"d{i:04}", "n": i} for i in range(1000)] + [{"_id": "c", "n": -1}]})
+        revs = {r["id"]: r["rev"] for r in res}
+        req("POST", f"/{db}/_bulk_docs", {"new_edits": False, "docs": [{"_id": "c", "_rev": "1-zzzz", "n": -2}]})
+        req("PUT", f"/{db}/_design/v", {"views": {"n": {"map": "function(d) { emit(d.n, d._rev); }", "reduce": "_count"}}})
+        sig = req("GET", f"/{db}/_design/v/_info")[1]["view_index"]["signature"]
+        cp = f"/{db}/_local/purge-mrview-{sig}"
+        s, b, _ = req("GET", cp)
+        eq((s, b["_rev"], b["type"], b["purge_seq"], b["ddoc_id"], b["signature"]), (200, "0-1", "mrview", 0, "_design/v", sig))
+        eq(req("GET", f"/{db}/_design/v/_view/n?reduce=false&limit=1")[1]["total_rows"], 1001)
+        stat = lambda: req("GET", "/_node/_local/_stats/couchdb/mrview/map_doc")[1]["value"]
+        mapped = stat()
+        _, b, _ = req("POST", f"/{db}/_purge", {"d0005": [revs["d0005"]], "c": ["1-zzzz"], "nope": ["1-x"]})
+        eq(b["purged"], {"d0005": [revs["d0005"]], "c": ["1-zzzz"], "nope": []})
+        info = req("GET", f"/{db}")[1]
+        eq((info["purge_seq"].split("-")[0], info["update_seq"].split("-")[0]), ("3", "1004"))
+        eq(req("GET", f"/{db}/c?local_seq=true")[1]["_local_seq"], 1004)
+        b = req("GET", f"/{db}/_design/v/_view/n?reduce=false&limit=2")[1]
+        eq((b["total_rows"], [(r["id"], r["key"]) for r in b["rows"]]), (1000, [("c", -1), ("d0000", 0)]))
+        assert stat() - mapped < 10, "purge rebuilt the index"
+        s, b, _ = req("GET", cp)
+        eq((b["_rev"], b["purge_seq"]), ("0-2", 3))
+        eq(req("GET", f"/{db}/_purged_infos")[1], {"purged_infos": [{"id": "c", "revs": ["1-zzzz"]}, {"id": "d0005", "revs": [revs["d0005"]]}, {"id": "nope", "revs": ["1-x"]}]})
+        eq(req("GET", f"/{db}/_local_docs")[1]["rows"], [])
+        eq([r["id"] for r in req("GET", f"/{db}/_local_docs?include_system=true")[1]["rows"]], [cp.split("/", 2)[2]])
+        # Compaction keeps the infos past the limit an index still needs.
+        eq(req("PUT", f"/{db}/_purged_infos_limit", "0")[:2], (400, {"error": "bad_request", "reason": "`purged_infos_limit` must be positive integer"}))
+        eq(req("PUT", f"/{db}/_purged_infos_limit", 2)[0], 200)
+        eq(req("GET", f"/{db}/_purged_infos_limit")[1], 2)
+        req("POST", f"/{db}/_purge", {"x1": ["1-a"], "x2": ["1-b"], "x3": ["1-c"]})
+        eq(req("GET", f"/{db}/_design/v/_view/n")[1]["rows"], [{"key": None, "value": 1000}])
+        req("POST", f"/{db}/_compact", {})
+        for _ in range(100):
+            if not req("GET", f"/{db}")[1]["compact_running"]:
+                break
+            time.sleep(0.1)
+        time.sleep(0.5)
+        eq([i["id"] for i in req("GET", f"/{db}/_purged_infos")[1]["purged_infos"]], ["x1", "x2"])
+        # A deleted design doc's checkpoint goes with its index.
+        req("DELETE", f"/{db}/_design/v?rev={req('GET', f'/{db}/_design/v')[1]['_rev']}")
+        req("POST", f"/{db}/_view_cleanup", {})
+        time.sleep(0.5)
+        eq(req("GET", cp)[0], 404)
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
 def view_reads_while_rebuilding():
-    """A purge makes the next update rebuild the index; queries that don't
-    wait for it (update=false, update=lazy) keep reading the old one."""
+    """Queries that don't wait for an index update (update=false, and
+    update=lazy, which starts one) keep reading the index as it was while
+    purges are applied."""
     db = new_db()
     try:
         _, res, _ = req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": f"d{i:04}", "n": i, "pad": "x" * 40} for i in range(3000)]})

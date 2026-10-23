@@ -65,9 +65,22 @@ pub async fn db_request(req: Req) -> Result<Response> {
         ["_security"] => security(&req, &db).await,
         ["_purge"] => purge(&req, &db).await,
         ["_purged_infos_limit"] => match req.method {
-            Method::GET => ok_json(json!(1000)),
-            Method::PUT => ok_json(json!({"ok": true})),
+            Method::GET => ok_json(json!(db.snapshot().purge_infos_limit()?)),
+            Method::PUT => {
+                let limit = req.json_body()?.as_number().filter(|n| crate::json::is_integer(n)).and_then(|n| n.as_str().parse::<u64>().ok());
+                match limit.filter(|n| *n > 0) {
+                    Some(n) => {
+                        db.set_purge_infos_limit(n).await?;
+                        ok_json(json!({"ok": true}))
+                    }
+                    None => Err(CouchError::bad_request("`purged_infos_limit` must be positive integer")),
+                }
+            }
             _ => not_allowed("GET,PUT"),
+        },
+        ["_purged_infos"] => match req.method {
+            Method::GET => purged_infos(&db),
+            _ => not_allowed("GET"),
         },
         ["_find" | "_explain" | "_index", ..] => crate::mango::handle(&req, &db, &r, None).await,
         ["_partition", p, rest @ ..] => {
@@ -348,6 +361,16 @@ pub fn doc_opts(req: &Req) -> Result<DocOpts> {
         meta,
         follows: false,
     })
+}
+
+/// couch_mrview:should_skip_local_document/2: checkpoints _local_docs
+/// leaves out unless asked for system docs.
+fn is_system_local(id: &str, l: &crate::db::LocalDoc) -> bool {
+    let has = |fields: &[&str]| {
+        let body: Map<String, Value> = serde_json::from_slice(&l.body).unwrap_or_default();
+        fields.iter().all(|f| body.contains_key(*f))
+    };
+    (id.starts_with("_local/purge-") && has(&["purge_seq"])) || (id.starts_with("_local/shard-sync") && has(&["target_uuid", "seq"]))
 }
 
 fn local_json(id: &str, l: &crate::db::LocalDoc) -> Value {
@@ -1081,6 +1104,8 @@ pub struct QueryArgs {
     pub sorted: bool,
     /// Set for queries within a partition (/db/_partition/P/...).
     pub partition: Option<String>,
+    /// _local_docs lists purge and shard-sync checkpoints too.
+    pub include_system: bool,
 }
 
 impl Default for QueryArgs {
@@ -1106,6 +1131,7 @@ impl Default for QueryArgs {
             att_encoding_info: false,
             sorted: true,
             partition: None,
+            include_system: false,
         }
     }
 }
@@ -1177,6 +1203,7 @@ impl QueryArgs {
             "attachments" => self.attachments = as_bool(&v)?,
             "att_encoding_info" => self.att_encoding_info = as_bool(&v)?,
             "sorted" => self.sorted = as_bool(&v)?,
+            "include_system" => self.include_system = v.as_str() == Some("true"),
             "queries" => {}
             _ => {}
         }
@@ -1387,6 +1414,9 @@ pub fn run_all_docs(snap: &Snapshot, args: &QueryArgs, kind: AllDocsKind) -> Res
         snap.fold_locals(&range, dir, |id, l| {
             if skip > 0 {
                 skip -= 1;
+                return true;
+            }
+            if !args.include_system && is_system_local(id, l) {
                 return true;
             }
             let mut row = json!({"id": id, "key": id, "value": {"rev": format!("0-{}", l.rev)}});
@@ -1709,6 +1739,17 @@ async fn security(req: &Req, db: &Arc<Db>) -> Result<Response> {
         }
         _ => not_allowed("GET,PUT"),
     }
+}
+
+/// The purge infos kept, as fabric_db_purged_infos merges a set of them:
+/// distinct, in (id, revs) order.
+fn purged_infos(db: &Db) -> Result<Response> {
+    let mut infos: Vec<(String, Vec<(u64, String)>)> = db.snapshot().purge_infos_after(0)?.into_iter().map(|i| (i.id, i.revs)).collect();
+    infos.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then_with(|| a.1.cmp(&b.1)));
+    infos.dedup();
+    let infos: Vec<Value> =
+        infos.into_iter().map(|(id, revs)| json!({"id": id, "revs": revs.iter().map(|(p, r)| format!("{p}-{r}")).collect::<Vec<_>>()})).collect();
+    ok_json(json!({"purged_infos": infos}))
 }
 
 async fn purge(req: &Req, db: &Arc<Db>) -> Result<Response> {

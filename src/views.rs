@@ -8,7 +8,7 @@
 use crate::api::{QueryArgs, blocking};
 use crate::btree::{Action, Btree, Dir, NodePtr, Range, Spec};
 use crate::collate::{Json, cmp_json, cmp_json_raw};
-use crate::db::{Db, Snapshot};
+use crate::db::{Db, PurgeInfo, Snapshot};
 use crate::doc::{DocOpts, FullDocInfo};
 use crate::error::{CouchError, Result};
 use crate::file::CouchFile;
@@ -1107,9 +1107,12 @@ impl Index {
     fn open(db: &Db, def: IndexDef, dir: PathBuf) -> Result<Index> {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.view", def.sig));
-        let db_uuid = db.snapshot().header.uuid.clone();
+        let snap = db.snapshot();
+        let db_uuid = snap.header.uuid.clone();
         let file = Arc::new(CouchFile::open(&path, true)?);
         let mut state = fresh_state(&file, &def);
+        // A new index has seen every purge so far.
+        state.purge_seq = snap.header.purge_seq;
         if let Some(h) = file.read_header::<IndexHeader>()? {
             if h.sig == def.sig && h.db_uuid == db_uuid && h.view_roots.len() == def.views.len() {
                 state.seq = h.seq;
@@ -1150,6 +1153,71 @@ impl Index {
         std::fs::rename(&tmp, &self.path)?;
         *self.file.write() = file.clone();
         Ok(file)
+    }
+
+    /// A new, empty index that has seen purges up to `purge_seq`.
+    fn reset(&self, purge_seq: u64) -> Result<IndexState> {
+        let file = self.replace_file()?;
+        let mut st = fresh_state(&file, &self.def);
+        st.purge_seq = purge_seq;
+        Ok(st)
+    }
+
+    /// couch_mrview_updater:purge/4: drop the rows of purged docs that are
+    /// gone, or have changed since the index saw them (a purge gives a
+    /// doc's remaining revisions new seqs), which the update then maps
+    /// again. Docs that didn't change keep theirs.
+    fn apply_purges(&self, snap: &Snapshot, st: &mut IndexState, infos: &[PurgeInfo]) -> Result<()> {
+        let mut ids: Vec<&str> = infos.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut view_acts: Vec<Vec<Action<VKey, VVal>>> = (0..self.def.views.len()).map(|_| Vec::new()).collect();
+        let mut id_acts = Vec::new();
+        for id in ids {
+            if snap.get_fdi(id)?.is_some_and(|f| f.update_seq <= st.seq) {
+                continue;
+            }
+            let id = id.to_string();
+            let Some(old) = st.ids.lookup(&id)? else { continue };
+            for (vi, keys) in &old.keys {
+                for k in keys {
+                    view_acts[*vi as usize].push(Action::Remove((k.clone(), IdBound::Id(id.clone()))));
+                }
+            }
+            id_acts.push(Action::Remove(id));
+        }
+        st.ids = st.ids.modify(id_acts)?;
+        for (vi, acts) in view_acts.into_iter().enumerate() {
+            st.views[vi] = st.views[vi].modify(acts)?;
+        }
+        st.purge_seq = infos.last().map_or(st.purge_seq, |i| i.seq);
+        Ok(())
+    }
+
+    /// couch_mrview_index:ensure_local_purge_doc/2: an index with views
+    /// has a purge checkpoint, starting at the database's purge seq.
+    fn ensure_purge_checkpoint(&self, db: &Db) -> Result<()> {
+        let snap = db.snapshot();
+        let id = purge_checkpoint_id(&self.def.sig);
+        match (!self.def.views.is_empty(), snap.get_local(&id)?.is_some()) {
+            (true, false) => self.save_purge_checkpoint(db, snap.header.purge_seq),
+            (false, true) => db.put_local_blocking(&id, None),
+            _ => Ok(()),
+        }
+    }
+
+    /// couch_mrview_index:update_local_purge_doc/3: the purge seq this
+    /// index has seen, which compaction keeps purge infos after.
+    fn save_purge_checkpoint(&self, db: &Db, purge_seq: u64) -> Result<()> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let body = json!({
+            "type": "mrview",
+            "purge_seq": purge_seq,
+            "updated_on": now,
+            "ddoc_id": self.def.ddoc_id,
+            "signature": self.def.sig,
+        });
+        db.put_local_blocking(&purge_checkpoint_id(&self.def.sig), body.as_object().cloned())
     }
 
     fn commit(&self, st: &IndexState) -> Result<()> {
@@ -1239,18 +1307,27 @@ impl Index {
         let _g = self.update_lock.lock();
         let snap = db.snapshot();
         let mut st = self.state();
-        if snap.header.purge_seq != st.purge_seq || st.seq > snap.update_seq() {
-            // Purges (and db recreation) invalidate the index: rebuild.
-            let file = self.replace_file()?;
-            st = fresh_state(&file, &self.def);
-            st.purge_seq = snap.header.purge_seq;
+        let db_purge = snap.header.purge_seq;
+        let pending_purges = db_purge.saturating_sub(st.purge_seq);
+        let purged = st.purge_seq != db_purge;
+        if st.seq > snap.update_seq() || st.purge_seq > db_purge {
+            // The database was recreated: rebuild.
+            st = self.reset(db_purge)?;
+        } else if purged {
+            match snap.purges_since(st.purge_seq)? {
+                Some(infos) => self.apply_purges(&snap, &mut st, &infos)?,
+                // Purges it hasn't seen are gone: rebuild.
+                None => st = self.reset(db_purge)?,
+            }
         }
-        if st.seq >= snap.update_seq() {
+        if st.seq >= snap.update_seq() && !purged {
             return Ok(st);
         }
         self.updater_running.store(true, std::sync::atomic::Ordering::Relaxed);
-        // Docs changed since the index's seq: all of them, for a new index.
-        let total = if st.seq == 0 { snap.header.doc_count + snap.header.del_count } else { snap.pending_after(st.seq) };
+        // Docs changed since the index's seq (all of them, for a new
+        // index), and purges, as couch_index_updater counts them.
+        let docs = if st.seq == 0 { snap.header.doc_count + snap.header.del_count } else { snap.pending_after(st.seq) };
+        let total = docs + pending_purges;
         let task = crate::tasks::add(json!({
             "type": "indexer",
             "database": self.db_name,
@@ -1293,7 +1370,13 @@ impl Index {
             self.commit(&st)?;
             *self.state.write() = st.clone();
             Ok(st)
-        })();
+        })()
+        .and_then(|st| {
+            if purged {
+                self.save_purge_checkpoint(db, st.purge_seq)?;
+            }
+            Ok(st)
+        });
         self.updater_running.store(false, std::sync::atomic::Ordering::Relaxed);
         if res.is_ok() {
             crate::db::notify(&self.db_name, crate::db::DbEvent::IndexCommit(self.def.ddoc_id.clone()));
@@ -1629,6 +1712,29 @@ impl Index {
     }
 }
 
+fn purge_checkpoint_id(sig: &str) -> String {
+    format!("_local/purge-mrview-{sig}")
+}
+
+/// couch_mrview_index:verify_index_exists/2: whether a purge checkpoint's
+/// index still exists, its design doc there with the same signature. One
+/// that can't be checked is assumed to.
+pub fn purge_client_exists(snap: &Snapshot, props: &Map<String, Value>) -> bool {
+    if props.get("type").and_then(Value::as_str) != Some("mrview") {
+        return false;
+    }
+    let Some(ddoc_id) = props.get("ddoc_id").and_then(Value::as_str) else { return true };
+    let ddoc = match crate::changes::load_ddoc(snap, ddoc_id) {
+        Ok(d) => d,
+        Err(e) if e.error == "not_found" => return false,
+        Err(_) => return true,
+    };
+    match IndexDef::from_ddoc(&ddoc, snap.partitioned()) {
+        Ok(def) => props.get("signature").and_then(Value::as_str) == Some(def.sig.as_str()),
+        Err(_) => true,
+    }
+}
+
 /// Find or open the index for a design doc.
 pub fn get_index(db: &Arc<Db>, ddoc: &Value, index_dir: PathBuf) -> Result<Arc<Index>> {
     let def = IndexDef::from_ddoc(ddoc, db.snapshot().partitioned())?;
@@ -1639,6 +1745,9 @@ pub fn get_index(db: &Arc<Db>, ddoc: &Value, index_dir: PathBuf) -> Result<Arc<I
         }
     let idx = Arc::new(Index::open(db, def, index_dir)?);
     db.ext.lock().insert(key, idx.clone());
+    if let Err(e) = idx.ensure_purge_checkpoint(db) {
+        tracing::warn!("purge checkpoint for {}/{}: {}", db.name, idx.def.ddoc_id, e.reason);
+    }
     Ok(idx)
 }
 
@@ -2097,6 +2206,19 @@ pub fn cleanup_index_files(server: &Server, db: &Arc<Db>) -> Result<()> {
             && let Ok(def) = IndexDef::from_ddoc(&d, snap.partitioned()) {
                 live.insert(def.sig);
             }
+    }
+    // couch_index_util:cleanup_purges/3: their purge checkpoints too.
+    let prefix = purge_checkpoint_id("");
+    let range = Range { start: Some(prefix.clone()), end: Some("_local/purge-mrview.".into()), inclusive_end: false };
+    let mut dead = Vec::new();
+    snap.fold_locals(&range, Dir::Fwd, |id, _| {
+        if id.strip_prefix(&prefix).is_some_and(|sig| !live.contains(sig)) {
+            dead.push(id.to_string());
+        }
+        true
+    })?;
+    for id in dead {
+        db.put_local_blocking(&id, None)?;
     }
     let dir = index_dir_of(server, &db.name);
     if let Ok(rd) = std::fs::read_dir(&dir) {

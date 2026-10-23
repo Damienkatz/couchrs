@@ -49,6 +49,26 @@ const PROPS_KEY: &[u8] = b"props";
 /// When the database was created, in seconds (its instance_start_time,
 /// as a CouchDB shard's file name records it).
 const CREATED_KEY: &[u8] = b"created";
+/// Purge infos, each under this prefix and its purge seq.
+const PURGE_INFO_PREFIX: &[u8] = b"purge_info/";
+/// The first key after them.
+const PURGE_INFO_END: &[u8] = b"purge_info0";
+/// How many purge infos compaction keeps (once indexes have seen them).
+const PURGE_LIMIT_KEY: &[u8] = b"purge_infos_limit";
+const DEFAULT_PURGE_INFOS_LIMIT: u64 = 1000;
+
+fn purge_info_key(seq: u64) -> Vec<u8> {
+    [PURGE_INFO_PREFIX, &be(seq)].concat()
+}
+
+/// One purge request item, recorded whether or not it removed anything:
+/// the doc id and the revisions asked for, sorted and deduplicated.
+#[derive(Clone, Debug)]
+pub struct PurgeInfo {
+    pub seq: u64,
+    pub id: String,
+    pub revs: Vec<(u64, String)>,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FdiVal {
@@ -183,6 +203,69 @@ impl Snapshot {
             Some(b) => Ok(Some(fdi_from(id, dec(&b)?))),
             None => Ok(None),
         }
+    }
+
+    /// The purge infos after `seq`, oldest first.
+    pub fn purge_infos_after(&self, seq: u64) -> Result<Vec<PurgeInfo>> {
+        let (lo, hi) = (purge_info_key(seq.saturating_add(1)), PURGE_INFO_END);
+        let mut out = Vec::new();
+        self.view.scan(CF_META, Some(&lo), Some(hi), false, |k, v| {
+            let seq = u64::from_be_bytes(k[PURGE_INFO_PREFIX.len()..].try_into().map_err(|_| CouchError::internal("bad purge info key"))?);
+            let (id, revs): (String, Vec<(u64, String)>) = dec(v)?;
+            out.push(PurgeInfo { seq, id, revs });
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// The purges an index at purge seq `seq` hasn't seen, or None when
+    /// some are gone (pruned by compaction, or from before infos were
+    /// kept) and the index has to be rebuilt.
+    pub fn purges_since(&self, seq: u64) -> Result<Option<Vec<PurgeInfo>>> {
+        let infos = self.purge_infos_after(seq)?;
+        let complete = infos.len() as u64 == self.header.purge_seq.saturating_sub(seq) && infos.first().is_none_or(|i| i.seq == seq + 1);
+        Ok(complete.then_some(infos))
+    }
+
+    /// The oldest purge info kept, or 0 for none.
+    pub fn oldest_purge_seq(&self) -> Result<u64> {
+        let mut oldest = 0;
+        self.view.scan(CF_META, Some(PURGE_INFO_PREFIX), Some(PURGE_INFO_END), false, |k, _| {
+            oldest = k[PURGE_INFO_PREFIX.len()..].try_into().map(u64::from_be_bytes).unwrap_or(0);
+            Ok(false)
+        })?;
+        Ok(oldest)
+    }
+
+    pub fn purge_infos_limit(&self) -> Result<u64> {
+        match self.view.get(CF_META, PURGE_LIMIT_KEY)? {
+            Some(b) => dec(&b),
+            None => Ok(DEFAULT_PURGE_INFOS_LIMIT),
+        }
+    }
+
+    /// couch_db:get_minimum_purge_seq/1: the purge seq compaction may
+    /// drop infos up to. Infos beyond the limit are kept while a purge
+    /// checkpoint (`_local/purge-*`) of a client that still exists needs
+    /// them, and every one kept while a checkpoint has no purge seq.
+    pub fn minimum_purge_seq(&self, client_exists: impl Fn(&Map<String, Value>) -> bool) -> Result<u64> {
+        let purge_seq = self.header.purge_seq as i128;
+        let floor = purge_seq - self.purge_infos_limit()? as i128;
+        let oldest = self.oldest_purge_seq()? as i128;
+        let mut min = floor;
+        let range = Range { start: Some("_local/purge-".into()), end: Some("_local/purge.".into()), inclusive_end: false };
+        self.fold_locals(&range, Dir::Fwd, |_, l| {
+            let props: Map<String, Value> = serde_json::from_slice(&l.body).unwrap_or_default();
+            match props.get("purge_seq").and_then(|v| v.as_number()).and_then(crate::json::int128) {
+                Some(cs) if cs >= floor => {}
+                Some(cs) if client_exists(&props) => min = min.min(cs),
+                Some(_) => {}
+                None => min = min.min(oldest),
+            }
+            true
+        })?;
+        let min = if min < floor { min } else { floor };
+        Ok(min.max(0) as u64)
     }
 
     pub fn get_local(&self, id: &str) -> Result<Option<LocalDoc>> {
@@ -475,6 +558,7 @@ enum Msg {
     Update { docs: Vec<Doc>, new_edits: bool, reply: oneshot::Sender<Vec<UpdateResult>> },
     SetSecurity(Vec<u8>, oneshot::Sender<()>),
     SetRevsLimit(u64, oneshot::Sender<()>),
+    SetPurgeInfosLimit(u64, oneshot::Sender<()>),
     Purge(Vec<(String, Vec<(u64, String)>)>, oneshot::Sender<Result<Value>>),
     /// Compaction: forget bodies of non-leaf revisions (ptr < limit) for
     /// these docs and any doc changed after `since`.
@@ -807,6 +891,29 @@ impl Db {
         rx.await.map_err(|_| CouchError::internal("update failed"))
     }
 
+    pub async fn set_purge_infos_limit(&self, n: u64) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Msg::SetPurgeInfosLimit(n, reply))?;
+        rx.await.map_err(|_| CouchError::internal("update failed"))
+    }
+
+    /// Write (or, with no body, delete) a _local doc from code that may
+    /// be running async or blocking, and wait for it: purge checkpoints.
+    pub fn put_local_blocking(&self, id: &str, body: Option<Map<String, Value>>) -> Result<()> {
+        let rev = self.snapshot().get_local(id)?.map(|l| l.rev.to_string());
+        let doc = Doc {
+            id: id.to_string(),
+            revs: (0, rev.into_iter().collect()),
+            deleted: body.is_none(),
+            body: body.unwrap_or_default(),
+            ..Default::default()
+        };
+        let (reply, rx) = oneshot::channel();
+        self.send(Msg::Update { docs: vec![doc], new_edits: true, reply })?;
+        let mut res = tokio::task::block_in_place(|| rx.blocking_recv()).map_err(|_| CouchError::internal("update failed"))?;
+        res.pop().unwrap_or_else(|| Err(CouchError::internal("update failed"))).map(|_| ())
+    }
+
     pub async fn purge(&self, req: Vec<(String, Vec<(u64, String)>)>) -> Result<Value> {
         let (reply, rx) = oneshot::channel();
         self.send(Msg::Purge(req, reply))?;
@@ -944,6 +1051,14 @@ impl Db {
 
         sweep(&self.store, CF_BODY, &live_bodies, limit)?;
         sweep(&self.store, CF_ATT, &live_chunks, limit)?;
+        // Purge infos up to the minimum purge seq go, as
+        // couch_bt_engine_compactor copies only those after it.
+        let min_purge = snap.minimum_purge_seq(|props| crate::views::purge_client_exists(&snap, props))?;
+        if min_purge > 0 {
+            let mut batch = WriteBatch::default();
+            batch.delete_range_cf(&self.store.cf(CF_META), purge_info_key(0), purge_info_key(min_purge + 1));
+            self.store.db.write(batch).map_err(rerr)?;
+        }
         // RocksDB keeps what any snapshot older than the sweep can see,
         // so let go of ours and have readers move to a new one first.
         drop(snap);
@@ -1074,8 +1189,19 @@ fn handle_other(db: &Db, m: Msg) {
             let _ = commit(db, WriteBatch::default(), h);
             let _ = reply.send(());
         }
+        Msg::SetPurgeInfosLimit(n, reply) => {
+            let mut batch = WriteBatch::default();
+            batch.put_cf(&db.store.cf(CF_META), PURGE_LIMIT_KEY, enc(&n));
+            let _ = commit(db, batch, snap.header.clone());
+            let _ = reply.send(());
+        }
         Msg::Purge(req, reply) => {
-            let _ = reply.send(do_purge(db, snap, req));
+            let res = do_purge(db, snap, req);
+            if res.is_ok() {
+                // Indexes (ken) catch up with purges as with updates.
+                notify(&db.name, DbEvent::Updated);
+            }
+            let _ = reply.send(res);
         }
         Msg::DropOldBodies { ids, since, limit, reply } => {
             let _ = reply.send(drop_old_bodies(db, snap, ids, since, limit));
@@ -1500,11 +1626,17 @@ fn update_replicated(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDocI
 }
 
 fn do_purge(db: &Db, snap: Snapshot, req: Vec<(String, Vec<(u64, String)>)>) -> Result<Value> {
-    let mut purged = Map::new();
+    // Answered in request order, but applied (and given purge seqs) last
+    // to first, as fabric_doc_purge hands a shard its requests.
+    let mut purged: Map<String, Value> = req.iter().map(|(id, _)| (id.clone(), Value::Null)).collect();
     let mut header = snap.header.clone();
     let mut seq = header.update_seq;
     let mut batch = WriteBatch::default();
-    for (id, revs) in req {
+    for (id, mut revs) in req.into_iter().rev() {
+        revs.sort();
+        revs.dedup();
+        header.purge_seq += 1;
+        batch.put_cf(&db.store.cf(CF_META), purge_info_key(header.purge_seq), enc(&(&id, &revs)));
         let Some(mut fdi) = snap.get_fdi(&id)? else {
             purged.insert(id, json!([]));
             continue;
@@ -1520,7 +1652,18 @@ fn do_purge(db: &Db, snap: Snapshot, req: Vec<(String, Vec<(u64, String)>)>) -> 
         if fdi.tree.is_empty() {
             batch.delete_cf(&db.store.cf(CF_ID), id.as_bytes());
         } else {
-            seq += 1;
+            // Every remaining leaf gets a new seq, as couch_db_updater
+            // relabels them, so the doc is re-indexed.
+            fdi.tree = keytree::map_vals(&fdi.tree, &mut |_, _, v, leaf| {
+                if !leaf {
+                    return v.clone();
+                }
+                seq += 1;
+                match v {
+                    RevVal::Avail(l) => RevVal::Avail(LeafVal { seq, ..l.clone() }),
+                    RevVal::Missing => RevVal::Missing,
+                }
+            });
             fdi.update_seq = seq;
             fdi.deleted = fdi.winner().deleted;
             count_doc(&mut header, Some(&fdi), 1);
@@ -1529,7 +1672,6 @@ fn do_purge(db: &Db, snap: Snapshot, req: Vec<(String, Vec<(u64, String)>)>) -> 
         }
     }
     header.update_seq = seq;
-    header.purge_seq += 1;
     let purge_seq = header.purge_seq;
     commit(db, batch, header)?;
     Ok(json!({"purge_seq": purge_seq, "purged": purged}))
