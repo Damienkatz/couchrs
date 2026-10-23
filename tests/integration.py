@@ -732,6 +732,10 @@ def purges_update_views_incrementally():
         eq(req("GET", f"/{db}/_purged_infos_limit")[1], 2)
         req("POST", f"/{db}/_purge", {"x1": ["1-a"], "x2": ["1-b"], "x3": ["1-c"]})
         eq(req("GET", f"/{db}/_design/v/_view/n")[1]["rows"], [{"key": None, "value": 1000}])
+        # Compaction gives every design doc's view index its checkpoint,
+        # opened or not.
+        req("PUT", f"/{db}/_design/u", {"autoupdate": False, "views": {"m": {"map": "function(d) { emit(d._id, null); }"}}})
+        eq(len(req("GET", f"/{db}/_local_docs?include_system=true")[1]["rows"]), 1)
         req("POST", f"/{db}/_compact", {})
         for _ in range(100):
             if not req("GET", f"/{db}")[1]["compact_running"]:
@@ -739,6 +743,7 @@ def purges_update_views_incrementally():
             time.sleep(0.1)
         time.sleep(0.5)
         eq([i["id"] for i in req("GET", f"/{db}/_purged_infos")[1]["purged_infos"]], ["x1", "x2"])
+        eq([r["value"]["rev"] for r in req("GET", f"/{db}/_local_docs?include_system=true")[1]["rows"]], ["0-1", "0-3"])
         # A deleted design doc's checkpoint goes with its index.
         req("DELETE", f"/{db}/_design/v?rev={req('GET', f'/{db}/_design/v')[1]['_rev']}")
         req("POST", f"/{db}/_view_cleanup", {})
@@ -2087,6 +2092,72 @@ def _nouveau_disabled():
         rev = req("GET", f"/{db}/_design/foo")[1]["_rev"]
         eq(req("PUT", f"/{db}/_design/foo?rev={rev}", {"nouveau": {"idx2": {"index": "f"}}})[0], 201)
         assert "lucene_version" not in req("GET", f"/{db}/_design/foo")[1]["nouveau"]["idx2"]
+    finally:
+        req("DELETE", f"/{db}")
+
+
+@test
+def nouveau_purges():
+    """Purged docs leave search indexes without a rebuild, matching an
+    index built afresh, and each index keeps a purge checkpoint."""
+    if req("POST", "/_nouveau_analyze", {"analyzer": "standard", "text": "x"})[0] == 404:
+        return  # Nouveau is off (CouchDB as shipped).
+    db = "t" + uuid.uuid4().hex[:12]
+    eq(req("PUT", f"/{db}?q=1")[0], 201)
+    CREATED.append(db)
+    fun = 'function(doc) { index("double", "n", doc.n, {store: true}); if (doc.t) index("text", "t", doc.t); }'
+    ddoc = lambda f: {"autoupdate": False, "nouveau": {"idx": {"index": f}}}
+    search = lambda dd, q: req("GET", f"/{db}/_design/{dd}/_nouveau/idx?q={q}&sort=%22n%22&limit=1000")[1]
+    hits = lambda b: [h["id"] for h in b["hits"]]
+    prompts = lambda: req("GET", "/_node/_local/_stats/couchdb/query_server/process_prompts")[1]["value"]
+    try:
+        _, res, _ = req("POST", f"/{db}/_bulk_docs", {"docs": [{"_id": f"d{i:04}", "n": i, "t": f"w{i % 10} common"} for i in range(300)]})
+        revs = {r["id"]: r["rev"] for r in res}
+        req("POST", f"/{db}/_bulk_docs", {"new_edits": False, "docs": [{"_id": "c", "_rev": "1-aaaa", "n": -1, "t": "alpha"}, {"_id": "c", "_rev": "1-bbbb", "n": -1, "t": "beta"}]})
+        req("PUT", f"/{db}/_design/s", ddoc(fun))
+        eq((search("s", "t:beta")["total_hits"], search("s", "*:*")["total_hits"]), (1, 301))
+        sig = req("GET", f"/{db}/_design/s/_nouveau_info/idx")[1]["search_index"]["signature"]
+        cp = f"/{db}/_local/purge-nouveau-{sig}"
+        b = req("GET", cp)[1]
+        eq((b["_rev"], b["purge_seq"], b["indexname"], b["ddoc_id"], b["signature"], b["type"]), ("0-1", 0, "idx", "_design/s", sig, "nouveau"))
+        eq(list(b), ["_id", "_rev", "purge_seq", "updated_on", "indexname", "ddoc_id", "signature", "type"])
+        before = prompts()
+        req("POST", f"/{db}/_purge", {"d0005": [revs["d0005"]], "c": ["1-bbbb"], "nope": ["1-x"]})
+        eq((hits(search("s", "t:alpha")), search("s", "t:beta")["total_hits"], search("s", "*:*")["total_hits"]), (["c"], 0, 300))
+        assert prompts() - before < 50, "purge rebuilt the search index"
+        # The same as an index built after the purges.
+        req("PUT", f"/{db}/_design/s2", ddoc(fun + " "))
+        for q in ("*:*", "t:common", "t:alpha", "t:w5"):
+            eq(hits(search("s", q)), hits(search("s2", q)), q)
+        info = req("GET", f"/{db}/_design/s/_nouveau_info/idx")[1]["search_index"]
+        eq((info["purge_seq"], info["num_docs"]), (3, 300))
+        b = req("GET", cp)[1]
+        eq((b["_rev"], b["purge_seq"]), ("0-1", 3))
+        eq(req("GET", f"/{db}/_local_docs")[1]["rows"], [])
+        eq(len(req("GET", f"/{db}/_local_docs?include_system=true")[1]["rows"]), 2)
+        # Compaction keeps the purge infos a valid checkpoint still needs,
+        # and drops those only an invalid one would.
+        req("PUT", f"/{db}/_purged_infos_limit", 1)
+        req("POST", f"/{db}/_purge", {"x1": ["1-a"]})
+        def compact():
+            req("POST", f"/{db}/_compact", {})
+            for _ in range(100):
+                if not req("GET", f"/{db}")[1]["compact_running"]:
+                    break
+                time.sleep(0.1)
+            time.sleep(0.3)
+            return len(req("GET", f"/{db}/_purged_infos")[1]["purged_infos"])
+        sig2 = req("GET", f"/{db}/_design/s2/_nouveau_info/idx")[1]["search_index"]["signature"]
+        req("DELETE", f"/{db}/_local/purge-nouveau-{sig2}")
+        req("PUT", cp, {"purge_seq": 0, "updated_on": 0, "indexname": "idx", "ddoc_id": "_design/s", "signature": sig, "type": "nouveau"})
+        eq(compact(), 4)
+        req("PUT", cp, {"purge_seq": 0, "updated_on": 0, "indexname": "idx", "ddoc_id": "_design/s", "signature": "x" + sig[1:], "type": "nouveau"})
+        eq(compact(), 1)
+        # Cleanup removes the checkpoints of indexes no design doc defines.
+        req("PUT", f"/{db}/_local/purge-nouveau-{sig2}", {"purge_seq": 4, "type": "nouveau"})
+        req("DELETE", f"/{db}/_design/s2?rev={req('GET', f'/{db}/_design/s2')[1]['_rev']}")
+        eq(req("POST", f"/{db}/_nouveau_cleanup", {})[0], 202)
+        eq((req("GET", f"/{db}/_local/purge-nouveau-{sig2}")[0], req("GET", cp)[0]), (404, 200))
     finally:
         req("DELETE", f"/{db}")
 

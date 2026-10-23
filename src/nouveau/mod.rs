@@ -207,16 +207,30 @@ fn update(db: &Arc<Db>, h: &Handle, spec: &IndexSpec) -> Result<bool> {
         None => h.create(spec, purge_seq, index::INITIAL_SLOTS)?,
     };
     let (seq, ipurge) = idx.seqs();
-    if ipurge != purge_seq || seq > snap.update_seq() {
-        // Purged documents (or a database recreated) are found again by
-        // building afresh.
-        idx = h.create(spec, purge_seq, idx.def.slots)?;
-    } else if seq == snap.update_seq() {
+    if seq == snap.update_seq() && ipurge == purge_seq {
         return Ok(false);
+    }
+    ensure_purge_checkpoint(db, spec)?;
+    if seq > snap.update_seq() || ipurge > purge_seq {
+        // The database was recreated: build afresh.
+        idx = h.create(spec, purge_seq, idx.def.slots)?;
+    } else if ipurge < purge_seq {
+        match snap.purges_since(ipurge)? {
+            // Applied with the changes, and committed with them.
+            Some(infos) => idx.apply(&purge_updates(&snap, seq, &infos)?).map_err(|e| match e {
+                UpdateError::Other(e) => e,
+                _ => CouchError::internal("purge failed"),
+            })?,
+            // Purges it hasn't seen are gone: build afresh.
+            None => idx = h.create(spec, purge_seq, idx.def.slots)?,
+        }
     }
     loop {
         match run_updates(db, &snap, &idx, spec) {
-            Ok(()) => return Ok(true),
+            Ok(()) => {
+                save_purge_checkpoint(db, spec, purge_seq)?;
+                return Ok(true);
+            }
             Err(UpdateError::SlotsFull) => {
                 tracing::info!("search index {}/{} needs more fields: rebuilding", spec.ddoc_id, spec.name);
                 idx = h.create(spec, purge_seq, idx.def.slots * 2)?;
@@ -233,6 +247,84 @@ fn update(db: &Arc<Db>, h: &Handle, spec: &IndexSpec) -> Result<bool> {
             }
         }
     }
+}
+
+/// nouveau_index_updater:purge_index/4: purged docs leave the index if
+/// they are gone, or changed since it last saw them (a purge relabels a
+/// doc's remaining revisions), in which case the changes put back the
+/// new winner. Docs that didn't change are left as they are.
+fn purge_updates(snap: &Snapshot, index_seq: u64, infos: &[crate::db::PurgeInfo]) -> Result<Vec<Update>> {
+    let mut ids: Vec<&str> = infos.iter().map(|i| i.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut out = Vec::new();
+    for id in ids {
+        if snap.get_fdi(id)?.is_none_or(|f| f.update_seq > index_seq) {
+            out.push(Update::Delete { id: id.to_string() });
+        }
+    }
+    Ok(out)
+}
+
+fn purge_checkpoint_id(sig: &str) -> String {
+    format!("_local/purge-nouveau-{sig}")
+}
+
+/// nouveau_util:maybe_create_local_purge_doc/2: an index being updated
+/// has a purge checkpoint, starting at the database's purge seq.
+fn ensure_purge_checkpoint(db: &Db, spec: &IndexSpec) -> Result<()> {
+    let snap = db.snapshot();
+    match snap.get_local(&purge_checkpoint_id(&spec.sig))? {
+        Some(_) => Ok(()),
+        None => save_purge_checkpoint(db, spec, snap.header.purge_seq),
+    }
+}
+
+/// nouveau_index_updater:update_local_doc/3: the purge seq an index has
+/// seen, rewritten after each update without a revision (so it stays
+/// 0-1), as CouchDB does.
+fn save_purge_checkpoint(db: &Db, spec: &IndexSpec, purge_seq: u64) -> Result<()> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let body = json!({
+        "purge_seq": purge_seq,
+        "updated_on": now,
+        "indexname": spec.name,
+        "ddoc_id": spec.ddoc_id,
+        "signature": spec.sig,
+        "type": "nouveau",
+    });
+    db.put_local_blocking(&purge_checkpoint_id(&spec.sig), None, body.as_object().cloned())
+}
+
+/// nouveau_util:verify_index_exists/2: whether a purge checkpoint's index
+/// still exists, its design doc defining it with the same signature. One
+/// that can't be checked is assumed to.
+pub fn purge_client_exists(snap: &Snapshot, props: &Map<String, Value>) -> bool {
+    if props.get("type").and_then(Value::as_str) != Some("nouveau") {
+        return false;
+    }
+    let Some(ddoc_id) = props.get("ddoc_id").and_then(Value::as_str) else { return true };
+    let ddoc = match crate::changes::load_ddoc(snap, ddoc_id) {
+        Ok(d) => d,
+        Err(e) if e.error == "not_found" => return false,
+        Err(_) => return true,
+    };
+    let name = props.get("indexname").and_then(Value::as_str).unwrap_or_default();
+    design_doc_to_index(&ddoc, name).is_ok_and(|spec| props.get("signature").and_then(Value::as_str) == Some(spec.sig.as_str()))
+}
+
+/// nouveau_plugin_couch_db:on_compact/2, as CouchDB 3.5.3 has it: design
+/// docs with an `indexes` member get their nouveau indexes' checkpoints.
+pub fn ensure_purge_checkpoints(db: &Db) -> Result<()> {
+    let snap = db.snapshot();
+    for ddoc in crate::views::all_ddocs(&snap)? {
+        if ddoc.get("indexes").is_some() {
+            for spec in design_doc_to_indexes(&ddoc) {
+                ensure_purge_checkpoint(db, &spec)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_updates(db: &Db, snap: &Snapshot, idx: &SearchIndex, spec: &IndexSpec) -> std::result::Result<(), UpdateError> {
@@ -790,6 +882,19 @@ pub fn cleanup(server: &Server, db: &Arc<Db>) -> Result<()> {
     let snap = db.snapshot();
     let live: std::collections::HashSet<String> =
         crate::views::all_ddocs(&snap)?.iter().flat_map(design_doc_to_indexes).map(|s| s.sig).collect();
+    // couch_index_util:cleanup_purges/3: their purge checkpoints too.
+    let prefix = purge_checkpoint_id("");
+    let range = crate::btree::Range { start: Some(prefix.clone()), end: Some("_local/purge-nouveau.".into()), inclusive_end: false };
+    let mut dead = Vec::new();
+    snap.fold_locals(&range, crate::btree::Dir::Fwd, |id, _| {
+        if id.strip_prefix(&prefix).is_some_and(|sig| !live.contains(sig)) {
+            dead.push(id.to_string());
+        }
+        true
+    })?;
+    for id in dead {
+        db.put_local_blocking(&id, None, None)?;
+    }
     let root = index_root(server, &db.name);
     let Ok(dir) = std::fs::read_dir(&root) else { return Ok(()) };
     for e in dir.flatten() {

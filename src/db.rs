@@ -897,13 +897,13 @@ impl Db {
         rx.await.map_err(|_| CouchError::internal("update failed"))
     }
 
-    /// Write (or, with no body, delete) a _local doc from code that may
-    /// be running async or blocking, and wait for it: purge checkpoints.
-    pub fn put_local_blocking(&self, id: &str, body: Option<Map<String, Value>>) -> Result<()> {
-        let rev = self.snapshot().get_local(id)?.map(|l| l.rev.to_string());
+    /// Write a _local doc as revision `rev` + 1 (0-1 without one), or
+    /// with no body delete it, from code that may be running async or
+    /// blocking, and wait for it: purge checkpoints.
+    pub fn put_local_blocking(&self, id: &str, rev: Option<u64>, body: Option<Map<String, Value>>) -> Result<()> {
         let doc = Doc {
             id: id.to_string(),
-            revs: (0, rev.into_iter().collect()),
+            revs: (0, rev.map(|r| r.to_string()).into_iter().collect()),
             deleted: body.is_none(),
             body: body.unwrap_or_default(),
             ..Default::default()
@@ -996,6 +996,13 @@ impl Db {
     /// 4. compact every column family so RocksDB reclaims the space,
     ///    including garbage collection of blob files.
     fn compact_blocking(&self) -> Result<()> {
+        // couch_db_engine:trigger_on_compact/1: indexes' purge checkpoints
+        // exist before the purge infos they protect are pruned.
+        for r in [crate::views::ensure_purge_checkpoints(self), crate::nouveau::ensure_purge_checkpoints(self)] {
+            if let Err(e) = r {
+                tracing::warn!("purge checkpoints of {}: {}", self.name, e.reason);
+            }
+        }
         let snap = self.snapshot();
         let limit = self.next_ptr.load(AtomicOrdering::SeqCst);
         let mut live_bodies: Vec<u64> = Vec::new();
@@ -1053,7 +1060,8 @@ impl Db {
         sweep(&self.store, CF_ATT, &live_chunks, limit)?;
         // Purge infos up to the minimum purge seq go, as
         // couch_bt_engine_compactor copies only those after it.
-        let min_purge = snap.minimum_purge_seq(|props| crate::views::purge_client_exists(&snap, props))?;
+        let min_purge =
+            snap.minimum_purge_seq(|props| crate::views::purge_client_exists(&snap, props) || crate::nouveau::purge_client_exists(&snap, props))?;
         if min_purge > 0 {
             let mut batch = WriteBatch::default();
             batch.delete_range_cf(&self.store.cf(CF_META), purge_info_key(0), purge_info_key(min_purge + 1));

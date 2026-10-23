@@ -1194,32 +1194,6 @@ impl Index {
         Ok(())
     }
 
-    /// couch_mrview_index:ensure_local_purge_doc/2: an index with views
-    /// has a purge checkpoint, starting at the database's purge seq.
-    fn ensure_purge_checkpoint(&self, db: &Db) -> Result<()> {
-        let snap = db.snapshot();
-        let id = purge_checkpoint_id(&self.def.sig);
-        match (!self.def.views.is_empty(), snap.get_local(&id)?.is_some()) {
-            (true, false) => self.save_purge_checkpoint(db, snap.header.purge_seq),
-            (false, true) => db.put_local_blocking(&id, None),
-            _ => Ok(()),
-        }
-    }
-
-    /// couch_mrview_index:update_local_purge_doc/3: the purge seq this
-    /// index has seen, which compaction keeps purge infos after.
-    fn save_purge_checkpoint(&self, db: &Db, purge_seq: u64) -> Result<()> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let body = json!({
-            "type": "mrview",
-            "purge_seq": purge_seq,
-            "updated_on": now,
-            "ddoc_id": self.def.ddoc_id,
-            "signature": self.def.sig,
-        });
-        db.put_local_blocking(&purge_checkpoint_id(&self.def.sig), body.as_object().cloned())
-    }
-
     fn commit(&self, st: &IndexState) -> Result<()> {
         let file = self.file.read().clone();
         let h = IndexHeader {
@@ -1373,7 +1347,7 @@ impl Index {
         })()
         .and_then(|st| {
             if purged {
-                self.save_purge_checkpoint(db, st.purge_seq)?;
+                save_purge_checkpoint(db, &self.def, st.purge_seq)?;
             }
             Ok(st)
         });
@@ -1716,6 +1690,45 @@ fn purge_checkpoint_id(sig: &str) -> String {
     format!("_local/purge-mrview-{sig}")
 }
 
+/// couch_mrview_index:ensure_local_purge_doc/2: an index with views has a
+/// purge checkpoint, starting at the database's purge seq.
+fn ensure_purge_checkpoint(db: &Db, def: &IndexDef) -> Result<()> {
+    let snap = db.snapshot();
+    let id = purge_checkpoint_id(&def.sig);
+    match (!def.views.is_empty(), snap.get_local(&id)?) {
+        (true, None) => save_purge_checkpoint(db, def, snap.header.purge_seq),
+        (false, Some(_)) => db.put_local_blocking(&id, None, None),
+        _ => Ok(()),
+    }
+}
+
+/// couch_mrview_index:update_local_purge_doc/3: the purge seq an index
+/// has seen, which compaction keeps purge infos after.
+fn save_purge_checkpoint(db: &Db, def: &IndexDef, purge_seq: u64) -> Result<()> {
+    let id = purge_checkpoint_id(&def.sig);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let body = json!({
+        "type": "mrview",
+        "purge_seq": purge_seq,
+        "updated_on": now,
+        "ddoc_id": def.ddoc_id,
+        "signature": def.sig,
+    });
+    db.put_local_blocking(&id, db.snapshot().get_local(&id)?.map(|l| l.rev), body.as_object().cloned())
+}
+
+/// couch_index_plugin_couch_db:on_compact/2: every design doc's view
+/// index has its checkpoint, opened or not.
+pub fn ensure_purge_checkpoints(db: &Db) -> Result<()> {
+    let snap = db.snapshot();
+    for ddoc in all_ddocs(&snap)? {
+        if let Ok(def) = IndexDef::from_ddoc(&ddoc, snap.partitioned()) {
+            ensure_purge_checkpoint(db, &def)?;
+        }
+    }
+    Ok(())
+}
+
 /// couch_mrview_index:verify_index_exists/2: whether a purge checkpoint's
 /// index still exists, its design doc there with the same signature. One
 /// that can't be checked is assumed to.
@@ -1745,7 +1758,7 @@ pub fn get_index(db: &Arc<Db>, ddoc: &Value, index_dir: PathBuf) -> Result<Arc<I
         }
     let idx = Arc::new(Index::open(db, def, index_dir)?);
     db.ext.lock().insert(key, idx.clone());
-    if let Err(e) = idx.ensure_purge_checkpoint(db) {
+    if let Err(e) = ensure_purge_checkpoint(db, &idx.def) {
         tracing::warn!("purge checkpoint for {}/{}: {}", db.name, idx.def.ddoc_id, e.reason);
     }
     Ok(idx)
@@ -2218,7 +2231,7 @@ pub fn cleanup_index_files(server: &Server, db: &Arc<Db>) -> Result<()> {
         true
     })?;
     for id in dead {
-        db.put_local_blocking(&id, None)?;
+        db.put_local_blocking(&id, None, None)?;
     }
     let dir = index_dir_of(server, &db.name);
     if let Ok(rd) = std::fs::read_dir(&dir) {
