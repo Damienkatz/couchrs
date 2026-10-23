@@ -2,7 +2,7 @@
 //! CouchDB's own, read from share/stats_descriptions.cfg (every CouchDB
 //! application's priv/stats_descriptions.cfg): counters, gauges, and
 //! histograms that keep a set of bins per second, so a read covers the
-//! last `[stats] interval` seconds. Metrics for machinery couchdb-rs
+//! last `[stats] interval` seconds. Metrics for machinery CouchRS
 //! doesn't have (the cluster's fabric, mem3 and rexi, the design doc and
 //! user caches, clouseau) are kept for monitoring tools and stay at zero.
 //!

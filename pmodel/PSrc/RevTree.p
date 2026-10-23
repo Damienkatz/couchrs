@@ -73,7 +73,7 @@ fun PathOf(t: tTree, r: tRev): tPath {
 
 // couch_key_tree:merge of one path. Only the leaf (path[0]) carries a body:
 // _revisions sends ancestor ids, not their contents, so new ancestors are
-// stored without a body (RevVal::Missing in couchdb-rs). A body never gets
+// stored without a body (RevVal::Missing in CouchRS). A body never gets
 // overwritten, and an arriving leaf body fills in a missing one.
 fun MergePath(t: tTree, path: tPath): tMergeResult {
   var i: int;

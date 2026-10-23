@@ -1,7 +1,7 @@
 //! RocksDB plumbing shared by the database and view engines.
 //!
 //! RocksDB's own compression is off everywhere (data blocks, bottommost
-//! level, blob files): values are LZ4-compressed by couchdb-rs before they
+//! level, blob files): values are LZ4-compressed by CouchRS before they
 //! reach RocksDB, so nothing is compressed twice.
 
 use crate::error::{CouchError, Result};

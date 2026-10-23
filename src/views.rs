@@ -1617,7 +1617,7 @@ impl Index {
                 "compact_running": self.compact_running.load(std::sync::atomic::Ordering::Relaxed),
                 "collator_versions": ["153.136"]
             },
-            "couchdb_rs_last_build": self.last_build.lock().clone()
+            "couchrs_last_build": self.last_build.lock().clone()
         })
     }
 

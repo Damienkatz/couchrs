@@ -36,7 +36,7 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: couchdb-rs [--data-dir DIR] [--ini FILE|DIR]... [--bind ADDR:PORT] [--admin USER:PASS]\n\
+        "usage: couchrs [--data-dir DIR] [--ini FILE|DIR]... [--bind ADDR:PORT] [--admin USER:PASS]\n\
          \x20                 [--fsync-mode fsync|full]\n\
          Configuration is read from the built-in defaults, then each --ini file or\n\
          directory in order (default: DATA_DIR/local.ini); changes made over the\n\

@@ -1494,7 +1494,7 @@ def fauxton_web_ui():
         eq(e.code, 301)
         eq(e.headers["Location"], f"{BASE}/_utils/")
     s, html, h = req("GET", "/_utils/", raw=True)
-    if s == 404 and req("GET", "/")[1]["vendor"]["name"] != "couchdb-rs":
+    if s == 404 and req("GET", "/")[1]["vendor"]["name"] != "CouchRS":
         print("     (this CouchDB was built without Fauxton: skipped)")
         return
     eq(s, 200)
@@ -1522,7 +1522,7 @@ def delete_and_recreate_while_in_use():
     db = new_db()
     # CouchDB's cluster layer answers 500s ("No DB shards could be opened",
     # internal_server_error) while its shards come and go.
-    couchdb = req("GET", "/")[1]["vendor"]["name"] != "couchdb-rs"
+    couchdb = req("GET", "/")[1]["vendor"]["name"] != "CouchRS"
     stop = threading.Event()
     bad = []
 
@@ -1695,9 +1695,9 @@ def stats_system_and_active_tasks():
     eq(req("PUT", "/_nosuch")[0:2], (400, {"error": "illegal_database_name",
         "reason": "Name: '_nosuch'. Only lowercase characters (a-z), digits (0-9), and any of the characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."}))
 
-    # _restart runs the server again in place (couchdb-rs only here, to
+    # _restart runs the server again in place (CouchRS only here, to
     # leave a shared CouchDB alone).
-    if req("GET", "/")[1].get("vendor", {}).get("name") == "couchdb-rs":
+    if req("GET", "/")[1].get("vendor", {}).get("name") == "CouchRS":
         up = req("GET", f"{n}/_system")[1]["uptime"]
         time.sleep(1.1)
         eq(req("GET", f"{n}/_restart")[:2], (405, {"error": "method_not_allowed", "reason": "Only POST allowed"}))

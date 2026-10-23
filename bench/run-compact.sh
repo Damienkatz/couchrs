@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compact each server's loaded database, one at a time (CouchDB first, so
-# its I/O evicts couchdb-rs's file from the page cache). Fingerprints before
+# its I/O evicts CouchRS's file from the page cache). Fingerprints before
 # and after prove compaction preserved the data.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -19,7 +19,7 @@ for s in "erlang 15984" "rust 25984"; do
   sleep 5
   # Sample the server's memory and its data directory's size throughout.
   if [ "$name" = erlang ]; then pid=$(pgrep -f "beam.smp.*couchdb-erl" | head -1); dir="$B/data-erl"
-  else pid=$(pgrep -f "couchdb-rs --data-dir $B/data-rs" | head -1); dir="$B/data-rs"; fi
+  else pid=$(pgrep -f "couch(db-)?rs --data-dir $B/data-rs" | head -1); dir="$B/data-rs"; fi
   python3 monitor.py --pid "$pid" --dir "$dir" --out "$B/mon-$name.json" --csv "$B/mon-$name.csv" &
   mon=$!
   sleep 2

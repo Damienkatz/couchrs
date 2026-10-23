@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Control the server on one benchmark node.
 #   srvctl.sh start|stop|restart|pid erlang|btree|hybrid|inline
-#   srvctl.sh repl-start          CouchDB replicator on :15984 (couchdb-rs nodes)
+#   srvctl.sh repl-start          CouchDB replicator on :15984 (CouchRS nodes)
 # The server listens on :5984 with admin/bench; data lives under /data.
 set -uo pipefail
 cmd=$1 kind=${2:-}
@@ -9,8 +9,8 @@ IMG=apache/couchdb:3.5.3
 
 couch_ini() { # port data-dir
   cat <<EOF
-; Benchmark configuration: single node, one shard (like couchdb-rs),
-; no auto-compaction (couchdb-rs has none), QuickJS, quiet logs.
+; Benchmark configuration: single node, one shard (like CouchRS),
+; no auto-compaction (CouchRS has none), QuickJS, quiet logs.
 [couchdb]
 single_node = true
 max_document_size = 4294967296

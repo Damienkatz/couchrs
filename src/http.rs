@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub const VERSION: &str = "3.5.3";
-const SERVER_HEADER: &str = concat!("CouchDB/3.5.3 (couchdb-rs ", env!("CARGO_PKG_VERSION"), ")");
+const SERVER_HEADER: &str = concat!("CouchDB/3.5.3 (CouchRS ", env!("CARGO_PKG_VERSION"), ")");
 
 #[derive(Clone)]
 pub struct Req {
@@ -398,7 +398,7 @@ async fn route(req: Req) -> Result<Response> {
         Some("_replicate") => crate::replicator::http_replicate(&req).await,
         Some("_scheduler") => crate::replicator::http_scheduler(&req),
         Some("_db_updates") => crate::changes::db_updates(req).await,
-        // Fauxton's setup page asks this; couchdb-rs is always one node.
+        // Fauxton's setup page asks this; CouchRS is always one node.
         Some("_cluster_setup") => cluster_setup(&req).await,
         Some("favicon.ico") => Err(CouchError::not_found("missing")),
         // Creating one is a bad name; anything else finds no database.
@@ -658,7 +658,7 @@ async fn cluster_setup(req: &Req) -> Result<Response> {
                 }
                 "remove_node" => {}
                 "enable_cluster" | "add_node" | "receive_cookie" => {
-                    return Err(CouchError::bad_request("couchdb-rs runs as a single node"));
+                    return Err(CouchError::bad_request("CouchRS runs as a single node"));
                 }
                 _ => return Err(CouchError::bad_request("Invalid Action'")),
             }
@@ -789,7 +789,7 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
     crate::replicator::start(&server);
     crate::changes::start_global_changes(&server);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!("couchdb-rs listening on http://{bind}");
+    tracing::info!("CouchRS listening on http://{bind}");
     crate::system::mark_start();
     if server.config.get_bool("ssl", "enable", false) {
         let cfg = crate::tls::server_config(&server.config).map_err(std::io::Error::other)?;
@@ -797,7 +797,7 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
         let port = server.config.get_or("ssl", "port", "6984");
         let sbind = if addr.contains(':') { format!("[{addr}]:{port}") } else { format!("{addr}:{port}") };
         let l = crate::tls::listen(&sbind, cfg).await?;
-        tracing::info!("couchdb-rs listening on https://{sbind}");
+        tracing::info!("CouchRS listening on https://{sbind}");
         let sapp = app.clone().layer(axum::Extension(Tls));
         tokio::spawn(async move { axum::serve(l, sapp).await });
     }

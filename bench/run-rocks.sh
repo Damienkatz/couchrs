@@ -6,7 +6,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 B="${COUCHDB_BENCH:-$HOME/couchdb-bench}"
-BIN="$(cd .. && pwd)/target/release/couchdb-rs"
+BIN="$(cd .. && pwd)/target/release/couchrs"
 OUT="${OUT:-results.json}"
 GB="${TOTAL_GB:-100}"
 U=http://admin:bench@127.0.0.1:35984
@@ -18,7 +18,7 @@ start() {
   until curl -sf http://127.0.0.1:35984/_up >/dev/null; do sleep 0.2; done
 }
 stop() {
-  pkill -f "couchdb-rs --data-dir $B/data-rocks" || true
+  pkill -f "couch(db-)?rs --data-dir $B/data-rocks" || true
   while curl -sf -m 1 http://127.0.0.1:35984/_up >/dev/null; do sleep 0.2; done
 }
 
@@ -35,7 +35,7 @@ python3 db_fingerprint.py "$U/bench" > "$B/fp-rocksdb-before.json"
 stop; start
 curl -s -o /dev/null "$U/bench"
 sleep 5
-pid=$(pgrep -f "couchdb-rs --data-dir $B/data-rocks" | head -1)
+pid=$(pgrep -f "couch(db-)?rs --data-dir $B/data-rocks" | head -1)
 python3 monitor.py --pid "$pid" --dir "$B/data-rocks" --out "$B/mon-rocksdb.json" --csv "$B/mon-rocksdb.csv" &
 mon=$!
 sleep 2

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Rebuild couchdb-rs's 100 GB view index from scratch at several write batch
+# Rebuild CouchRS's 100 GB view index from scratch at several write batch
 # sizes; record build time and index file size for each.
 set -uo pipefail
 B="$HOME/couchdb-bench"; R=http://admin:bench@127.0.0.1:25984
-BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/couchdb-rs"
+BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/couchrs"
 for N in ${SIZES:-500 5000 50000}; do
-  pkill -f "couchdb-rs --data-dir $B/data-rs"; sleep 2
+  pkill -f "couch(db-)?rs --data-dir $B/data-rs"; sleep 2
   COUCHDB_RS_VIEW_BATCH=$N RUST_LOG=warn nohup "$BIN" --data-dir "$B/data-rs" --bind 127.0.0.1:25984 --admin admin:bench < /dev/null > "$B/rs.log" 2>&1 &
   until curl -sf $R/_up >/dev/null; do sleep 0.2; done
   id="exp$N-$(date +%s)"

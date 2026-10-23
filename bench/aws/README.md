@@ -3,7 +3,7 @@
 Four pairs, each a server (i4i.4xlarge, data on local NVMe) and its own
 load generator (c7i.4xlarge with 5 secondary private IPs, the scaling
 test's six "hosts"), all in one AZ and one cluster placement group:
-CouchDB 3.5.3 (Docker), couchdb-rs `main` (B-tree), `rocksdb-experiment`
+CouchDB 3.5.3 (Docker), CouchRS `main` (B-tree), `rocksdb-experiment`
 (hybrid) and `async-blocking` (hybrid, point reads inline).
 
 1. Launch (us-east-1a, Amazon Linux 2023, default VPC), tagging
@@ -17,7 +17,7 @@ CouchDB 3.5.3 (Docker), couchdb-rs `main` (B-tree), `rocksdb-experiment`
    and write `hosts.txt`: `NAME PUBLIC_IP PRIVATE_IP ALL_PRIVATE_IPS` per line.
 2. `prep.sh server|lg|builder` on each node (as root): kernel and fd
    limits, NVMe on /data and Docker on servers, toolchain on the builder.
-3. Build the three couchdb-rs branches and couchbench on the builder;
+3. Build the three CouchRS branches and couchbench on the builder;
    copy `couchdb-rs-<kind>` and `srvctl.sh`/`monitor.py` to each server's
    `~/bin`, and `couchbench`, `couchscale`, `pair.sh`, `db_fingerprint.py`
    to each load generator. Give each load generator an SSH key for its

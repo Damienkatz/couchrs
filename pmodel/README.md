@@ -1,7 +1,7 @@
 # P model of CouchDB replication
 
 A [P](https://p-org.github.io/P/) model of the CouchDB replication protocol
-over MVCC revision trees, as implemented by couchdb-rs (and CouchDB). The
+over MVCC revision trees, as implemented by CouchRS (and CouchDB). The
 P checker explores interleavings of concurrent client edits, two-way
 replication, and replicator crashes at every step.
 
@@ -52,11 +52,11 @@ The seeded-bug and reachability tests show the specs have teeth: a passing
   it does not exhaustively prove all of them.
 - No stemming (`revs_limit`), compaction, purge, or attachments.
 - Node crashes are not modelled; `_bulk_docs` is acknowledged only once
-  durable, which couchdb-rs guarantees by fsyncing before it replies.
+  durable, which CouchRS guarantees by fsyncing before it replies.
 - Rev ids are fresh unique integers, so two nodes never independently
   produce the same rev. In real CouchDB identical edits can share a rev id,
   which only makes merging easier.
 - `_changes` returns `last_seq` from the same snapshot as its rows, which
-  couchdb-rs does. A server that took `last_seq` from a later snapshot
+  CouchRS does. A server that took `last_seq` from a later snapshot
   could checkpoint past changes it never sent. Modelling that would mean
   splitting the node's changes handler into two steps.

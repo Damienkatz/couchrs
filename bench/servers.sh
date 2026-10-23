@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Start/stop the two benchmark servers.
 #   erlang CouchDB 3.5.3 : http://127.0.0.1:15984  (data: ~/couchdb-bench/data-erl)
-#   couchdb-rs           : http://127.0.0.1:25984  (data: ~/couchdb-bench/data-rs)
+#   CouchRS           : http://127.0.0.1:25984  (data: ~/couchdb-bench/data-rs)
 # Both use admin/bench.
 set -euo pipefail
 B="${COUCHDB_BENCH:-$HOME/couchdb-bench}"
-RS_BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/couchdb-rs"
+RS_BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/couchrs"
 export PATH="/opt/homebrew/opt/erlang@27/bin:$PATH"
 
 wait_up() {
@@ -36,7 +36,7 @@ case "${1:-}" in
     ;;
   stop)
     pkill -f "$B/couchdb-erl" || true
-    pkill -f "couchdb-rs --data-dir $B/data-rs" || true
+    pkill -f "couch(db-)?rs --data-dir $B/data-rs" || true
     for _ in $(seq 1 100); do
       curl -sf -m 1 http://127.0.0.1:15984/_up >/dev/null || curl -sf -m 1 http://127.0.0.1:25984/_up >/dev/null || break
       sleep 0.2
@@ -51,7 +51,7 @@ case "${1:-}" in
         (cd "$B/couchdb-erl" && nohup ./bin/couchdb < /dev/null > "$B/erl.log" 2>&1 &)
         wait_up http://127.0.0.1:15984 ;;
       rust)
-        pkill -f "couchdb-rs --data-dir $B/data-rs" || true
+        pkill -f "couch(db-)?rs --data-dir $B/data-rs" || true
         while curl -sf -m 1 http://127.0.0.1:25984/_up >/dev/null; do sleep 0.2; done
         RUST_LOG=warn nohup "$RS_BIN" --data-dir "$B/data-rs" --bind 127.0.0.1:25984 \
           --admin admin:bench < /dev/null > "$B/rs.log" 2>&1 &

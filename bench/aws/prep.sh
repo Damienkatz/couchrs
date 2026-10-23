@@ -2,7 +2,7 @@
 # Prepare one benchmark node (run as root):  prep.sh server|lg|builder
 # - kernel and fd limits for ~100K connections
 # - server: local NVMe as XFS on /data, Docker (CouchDB runs in a container)
-# - builder: toolchain for couchdb-rs and couchbench
+# - builder: toolchain for CouchRS and couchbench
 set -euxo pipefail
 role=$1
 

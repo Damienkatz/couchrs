@@ -96,7 +96,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
 <main>
   <header>
     <div class="eyebrow">Stress benchmark · same machine, same data, same replicator</div>
-    <h1>Apache CouchDB 3.5.3 (Erlang) vs couchdb-rs</h1>
+    <h1>Apache CouchDB 3.5.3 (Erlang) vs CouchRS</h1>
     <p id="intro"></p>
     <div class="facts" id="facts"></div>
     <div class="legend" aria-hidden="true" id="legend"></div>
@@ -105,7 +105,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
 
   <section>
     <h2>Summary</h2>
-    <p>How many times faster couchdb-rs is than CouchDB on each headline measure. Right of 1× means couchdb-rs is faster; left means CouchDB is faster.</p>
+    <p>How many times faster CouchRS is than CouchDB on each headline measure. Right of 1× means CouchRS is faster; left means CouchDB is faster.</p>
     <div class="figure" id="fig-summary"></div>
     <div class="figure" id="fig-summary-rocks" hidden></div>
     <div class="figure" id="fig-summary-hybrid" hidden></div>
@@ -176,7 +176,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
 
   <section>
     <h2>Replication</h2>
-    <p>One full replication of the loaded database into a new database on the same server, driven by CouchDB's own replicator in both cases. That replicator talks to couchdb-rs over HTTP, so this also shows the two interoperate.</p>
+    <p>One full replication of the loaded database into a new database on the same server, driven by CouchDB's own replicator in both cases. That replicator talks to CouchRS over HTTP, so this also shows the two interoperate.</p>
     <div class="figure" id="fig-repl-time"></div>
     <div class="figrow"><div class="figure" id="fig-repl-mb"></div><div class="figure" id="fig-repl-docs"></div></div>
   </section>
@@ -210,10 +210,10 @@ code { font-family: var(--mono); font-size: 0.92em; }
   const SRC = { erlang: E, rust: S, rocksdb: K, hybrid: Hy, hybrid_inline: HI };
   const SERIES = [
     { key: 'erlang', name: 'CouchDB (Erlang)', color: 'var(--erlang)' },
-    { key: 'rust', name: 'couchdb-rs', color: 'var(--rust)' },
+    { key: 'rust', name: 'CouchRS', color: 'var(--rust)' },
   ];
-  if (R.results.rocksdb) SERIES.push({ key: 'rocksdb', name: 'couchdb-rs (RocksDB)', color: 'var(--rocks)' });
-  if (R.results.hybrid) SERIES.push({ key: 'hybrid', name: 'couchdb-rs (RocksDB docs + B-tree views)', color: 'var(--hybrid)' });
+  if (R.results.rocksdb) SERIES.push({ key: 'rocksdb', name: 'CouchRS (RocksDB)', color: 'var(--rocks)' });
+  if (R.results.hybrid) SERIES.push({ key: 'hybrid', name: 'CouchRS (RocksDB docs + B-tree views)', color: 'var(--hybrid)' });
   if (R.results.hybrid_inline) SERIES.push({ key: 'hybrid_inline', name: 'hybrid, point reads inline', color: 'var(--inline)' });
   // One bar-chart row: f picks the value out of each server's results.
   const row = (label, f) => { const r = { label }; for (const s of SERIES) r[s.key] = f(SRC[s.key]); return r; };
@@ -388,7 +388,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
       const tx = el('text', { x, y: H - 6, 'text-anchor': 'middle', class: 'tick' }, svg);
       tx.textContent = (tv % 1 ? tv.toFixed(1) : tv.toFixed(0)) + '×';
     }
-    // Parity line: bars to its right mean couchdb-rs is faster.
+    // Parity line: bars to its right mean CouchRS is faster.
     el('line', { x1: sx(1), x2: sx(1), y1: top - 4, y2: H - axisH + 2, stroke: 'var(--axis)', 'stroke-width': 1.5 }, svg);
     rows.forEach((r, i) => {
       const y = top + i * rowH + rowH / 2;
@@ -423,7 +423,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
   const srv = E.server || S.server || {};
   const ds = srv.dataset_bytes;
   document.getElementById('intro').textContent =
-    `${R.configs ? R.configs : R.results.hybrid ? 'All four configurations (CouchDB; couchdb-rs with its B-tree engine; couchdb-rs with RocksDB for documents and views; and couchdb-rs with RocksDB for documents and B-tree views)' : R.results.rocksdb ? 'All three servers (CouchDB, couchdb-rs with its B-tree engine, and couchdb-rs with a RocksDB engine)' : 'Both servers'} ${R.setting || 'ran on one machine, one after the other,'} against byte-identical data: ${bytes(ds)} in ${compact(srv.dataset_docs)} documents ` +
+    `${R.configs ? R.configs : R.results.hybrid ? 'All four configurations (CouchDB; CouchRS with its B-tree engine; CouchRS with RocksDB for documents and views; and CouchRS with RocksDB for documents and B-tree views)' : R.results.rocksdb ? 'All three servers (CouchDB, CouchRS with its B-tree engine, and CouchRS with a RocksDB engine)' : 'Both servers'} ${R.setting || 'ran on one machine, one after the other,'} against byte-identical data: ${bytes(ds)} in ${compact(srv.dataset_docs)} documents ` +
     `sized from 100 bytes to 1 GB, filled with generated English-like text. Each was loaded, then measured for writes, reads, deletes, view indexing and queries, and replication.`;
   const facts = document.getElementById('facts');
   const fact = (k, v) => { const s = h('span'); s.append(document.createTextNode(k + ' '), h('b', null, v)); facts.appendChild(s); };
@@ -475,7 +475,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
   const loadTxt = (n, d) => d && d.load ? `${n}: ${bytes(d.load.bytes)} in ${dur(d.load.secs)}` : null;
   document.getElementById('load-text').textContent =
     'The whole dataset, loaded with 16 concurrent connections: small docs through _bulk_docs (1,000 per batch), large ones as streamed single-document uploads. ' +
-    [loadTxt('CouchDB', E), loadTxt('couchdb-rs', S)].filter(Boolean).join(' · ') + '.';
+    [loadTxt('CouchDB', E), loadTxt('CouchRS', S)].filter(Boolean).join(' · ') + '.';
   bars('fig-load-mb', [row('Throughput', d => g(d, 'load.mb_per_sec'))], { title: 'Load throughput', sub: 'MB/s · higher is better', unit: 'MB/s' });
   bars('fig-load-docs', [row('Documents', d => g(d, 'load.docs_per_sec'))], { title: 'Load rate', sub: 'docs/s · higher is better', unit: 'docs/s' });
 

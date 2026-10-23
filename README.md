@@ -1,14 +1,14 @@
-# couchdb-rs
+# CouchRS
 
-A single-node CouchDB server in Rust, wire-compatible with the CouchDB 3.x
-HTTP API: documents with MVCC revision trees, attachments, `_changes`,
+CouchRS is a single-node document database in Rust, wire-compatible with the
+CouchDB 3.x HTTP API: documents with MVCC revision trees, attachments, `_changes`,
 map/reduce views (JavaScript via embedded QuickJS), and Mango
 (`_find` / `_index` / `_explain`). It can act as a replication source or
 target using the standard replication protocol.
 
 ```bash
 cargo build --release
-./target/release/couchdb-rs --data-dir ./data --bind 127.0.0.1:5984
+./target/release/couchrs --data-dir ./data --bind 127.0.0.1:5984
 ```
 
 Optional admin credentials (`--admin user:pass`, or `COUCHDB_USER` /

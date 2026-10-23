@@ -5,7 +5,7 @@
 # server is restarted first so every run starts from clean memory.
 # Needs the loopback aliases:  sudo ifconfig lo0 alias 127.0.0.N up
 #
-# couchdb-rs builds come from $B/bin (copy them there first):
+# CouchRS builds come from $B/bin (copy them there first):
 #   couchdb-rs-btree   main (B-tree engine)            data-rs,    25984
 #   couchdb-rs-hybrid  rocksdb-experiment              data-rocks, 35984
 #   couchdb-rs-inline  async-blocking (point reads     data-rocks, 35984

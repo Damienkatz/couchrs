@@ -5,12 +5,12 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 B="${COUCHDB_BENCH:-$HOME/couchdb-bench}"
-BIN="$(cd .. && pwd)/target/release/couchdb-rs"
+BIN="$(cd .. && pwd)/target/release/couchrs"
 OUT="${OUT:-results.json}"
 GB="${TOTAL_GB:-100}"
 G=couchbench/target/release/couchbench
 
-pkill -f "couchdb-rs --data-dir $B/data-rocks" || true
+pkill -f "couch(db-)?rs --data-dir $B/data-rocks" || true
 while curl -sf -m 1 http://127.0.0.1:35984/_up >/dev/null; do sleep 0.2; done
 # The RocksDB-format view index is unused by this engine.
 find "$B/data-rocks" -path '*mrview/*.rocks' -prune -exec rm -rf {} +
