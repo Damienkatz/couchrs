@@ -30,6 +30,10 @@ pub fn cf_options(blob: bool) -> Options {
         o.set_blob_compression_type(DBCompressionType::None);
         o.set_enable_blob_gc(true);
         o.set_blob_gc_age_cutoff(1.0);
+        // Values wait in the write buffer for a flush to move them to
+        // blob files, and every database has its own: a large upload
+        // would otherwise hold 64MB of it in memory.
+        o.set_write_buffer_size(16 << 20);
     }
     o
 }

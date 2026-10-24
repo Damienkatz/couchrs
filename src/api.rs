@@ -126,6 +126,11 @@ pub async fn db_request(req: Req) -> Result<Response> {
                 ["_show", ..] | ["_list", ..] | ["_update", ..] | ["_rewrite", ..] => {
                     crate::js::http_ddoc_fun(&req, &db, &id, rest).await
                 }
+                // Any other action needs the design doc, and is then taken
+                // for an attachment (bad_action_req/3).
+                [a, ..] if a.starts_with('_') && !db.snapshot().get_fdi(&id)?.is_some_and(|f| !f.winner().deleted) => {
+                    Err(CouchError::missing())
+                }
                 att => att_request(&req, &db, &id, &att.join("/")).await,
             }
         }
@@ -134,6 +139,7 @@ pub async fn db_request(req: Req) -> Result<Response> {
             doc_request(&req, &db, &id).await
         }
         ["_local"] => Err(CouchError::bad_request("Invalid _local document id.")),
+        ["_local", ..] => Err(CouchError::bad_request("_local documents do not accept attachments.")),
         // Not a reserved id: there is no such document to read, and none
         // may be written.
         [s, ..] if s.starts_with('_') => match req.method {
@@ -239,6 +245,19 @@ pub fn max_attachment_size(config: &crate::config::Config) -> Option<u64> {
         Some(v) => v.parse().ok(),
         None => Some(1 << 30),
     }
+}
+
+/// validate_revs/2: a doc written with new_edits=false says its revision.
+fn validate_revs(doc: &Doc, new_edits: bool) -> Result<()> {
+    if !new_edits && doc.revs.1.is_empty() {
+        return Err(revs_required());
+    }
+    Ok(())
+}
+
+/// What validate_revs/2 says of a doc without one.
+pub fn revs_required() -> CouchError {
+    CouchError::bad_request("When `new_edits: false`, the document needs `_rev` or `_revisions` specified")
 }
 
 fn att_too_large(name: &str) -> CouchError {
@@ -418,6 +437,17 @@ fn local_json(id: &str, l: &crate::db::LocalDoc) -> Value {
     let body: Map<String, Value> = serde_json::from_slice(&l.body).unwrap_or_default();
     m.extend(body);
     Value::Object(m)
+}
+
+/// extract_header_rev/2: the rev the query or If-Match gives, which must
+/// agree if both do.
+fn extract_header_rev(req: &Req) -> Result<Option<(u64, String)>> {
+    let explicit = req.q("rev").map(parse_rev).transpose()?;
+    let etag = req.header("if-match").map(|v| parse_rev(v.trim().trim_matches('"'))).transpose()?;
+    match (explicit, etag) {
+        (Some(a), Some(b)) if a != b => Err(CouchError::bad_request("Document rev and etag have different values")),
+        (a, b) => Ok(a.or(b)),
+    }
 }
 
 fn rev_from_req(req: &Req) -> Option<String> {
@@ -868,20 +898,11 @@ fn stream_pieces(snap: Snapshot, pieces: Vec<Piece>) -> Body {
     Body::from_stream(stream)
 }
 
-/// Read a multipart/related document upload as
-/// couch_doc:doc_from_multi_part_stream/2 does, storing the attachments
-/// marked "follows" as their bytes arrive: the JSON is the first part
-/// (application/json), and the attachments' bytes run through the parts
-/// after it in their order, each attachment exactly as long as the JSON
-/// says (part headers are ignored). Returns the doc and the rest of the
-/// body, still to be read through.
-async fn read_multipart_doc(req: &Req, db: &Db) -> Result<(Doc, Multipart)> {
-    let config = &req.server.config;
-    // couch_httpd:check_max_request_length/1
-    let max = config.get_int("chttpd", "max_http_request_size", 4294967296u64);
-    if req.header("content-length").and_then(|l| l.parse::<u64>().ok()).is_some_and(|l| l > max) {
-        return Err(crate::http::too_large());
-    }
+/// Start reading a multipart/related document upload as
+/// couch_doc:doc_from_multi_part_stream/2 does: the first part is the
+/// doc's JSON (application/json). Returns it, and the body with the
+/// attachments' bytes still to read (`store_multipart_atts`).
+async fn read_multipart_json(req: &Req) -> Result<(Doc, Multipart)> {
     let boundary = crate::http::multipart_boundary(req.content_type()).ok_or_else(|| CouchError::bad_request("multipart boundary missing"))?;
     let mut mp = Multipart::new(req.take_body(), &boundary);
     let headers = mp.next_part().await?.ok_or_else(|| CouchError::bad_request("empty multipart body"))?;
@@ -891,10 +912,16 @@ async fn read_multipart_doc(req: &Req, db: &Db) -> Result<(Doc, Multipart)> {
         return Err(CouchError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "bad_content_type", "Content-Type must be application/json"));
     }
     let json_bytes = mp.body().await?;
-    let mut doc = from_json(crate::json::parse(&json_bytes).ok_or_else(|| CouchError::bad_request("invalid UTF-8 JSON"))?)?;
-    // Sizes are checked of the doc as sent (its id, if any, its own),
-    // before any attachment is read.
-    check_doc_limits(config, std::slice::from_ref(&doc))?;
+    let doc = from_json(crate::json::parse(&json_bytes).ok_or_else(|| CouchError::bad_request("invalid UTF-8 JSON"))?)?;
+    Ok((doc, mp))
+}
+
+/// Store the doc's attachments marked "follows" as their bytes arrive:
+/// they run through the parts after the JSON in their order, each
+/// attachment exactly as long as the JSON says (part headers are
+/// ignored). The rest of the body is left to read through.
+async fn store_multipart_atts(req: &Req, db: &Db, doc: &mut Doc, mp: &mut Multipart) -> Result<()> {
+    let config = &req.server.config;
     for a in doc.atts.iter_mut().filter(|a| matches!(a.data, AttData::Follows)) {
         let mut w = AttWriter::new(db, config, a);
         // write_streamed_attachment/3
@@ -922,26 +949,21 @@ async fn read_multipart_doc(req: &Req, db: &Db) -> Result<(Doc, Multipart)> {
         }
         blocking(|| w.finish(a))?;
     }
-    Ok((doc, mp))
+    Ok(())
 }
 
 async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
     crate::doc::validate_path_docid(id)?;
     check_docid_length(&req.server.config, id)?;
     let new_edits = req.q_bool("new_edits")?.unwrap_or(true);
-    let multipart = is_multipart_doc(req.content_type());
-    // Attachments stored as they arrive are kept from compaction until
-    // the doc commits.
-    let _staging = multipart.then(|| db.staging());
-    let (mut doc, rest) = if multipart {
-        let (doc, rest) = read_multipart_doc(req, db).await?;
-        (doc, Some(rest))
+    let (mut doc, mut mp) = if is_multipart_doc(req.content_type()) {
+        let (doc, mp) = read_multipart_json(req).await?;
+        (doc, Some(mp))
     } else {
-        let doc = from_json(req.json_body()?)?;
-        // Sizes are checked of the doc as sent (its id, if any, its own).
-        check_doc_limits(&req.server.config, std::slice::from_ref(&doc))?;
-        (doc, None)
+        (from_json(req.json_body()?)?, None)
     };
+    // Sizes are checked of the doc as sent (its id, if any, its own).
+    check_doc_limits(&req.server.config, std::slice::from_ref(&doc))?;
     doc.id = id.to_string();
     if doc.revs.1.is_empty()
         && let Some(r) = rev_from_req(req)
@@ -949,10 +971,17 @@ async fn put_doc(req: &Req, db: &Arc<Db>, id: &str) -> Result<Response> {
         let (p, rid) = parse_rev(&r)?;
         doc.revs = (p, vec![rid]);
     }
+    validate_revs(&doc, new_edits)?;
+    // Attachments stored as they arrive are kept from compaction until
+    // the doc commits.
+    let _staging = mp.is_some().then(|| db.staging());
+    if let Some(mp) = &mut mp {
+        store_multipart_atts(req, db, &mut doc, mp).await?;
+    }
     let deleted = doc.deleted;
     let rev = save_docs(req, db, vec![doc], new_edits).await?.pop().unwrap()?;
-    if let Some(mut rest) = rest {
-        rest.drain().await;
+    if let Some(mut mp) = mp {
+        mp.drain().await;
     }
     // A deletion is "ok", not "created" (chttpd_db:update_doc/4).
     let status = if req.q("batch") == Some("ok") {
@@ -1036,37 +1065,41 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
             attachment_response(req, &snap, att)
         }
         Method::PUT | Method::DELETE => {
+            validate_att_name(name)?;
             let snap = db.snapshot();
             let fdi = snap.get_fdi(id)?;
-            let rev = rev_from_req(req);
-            let mut doc = match (&fdi, &rev) {
-                (Some(f), Some(r)) => {
-                    let (p, rid) = parse_rev(r)?;
-                    let ri = Snapshot::find_rev(f, p, &rid).ok_or_else(CouchError::conflict)?;
+            let missing_att = || CouchError::not_found("Document is missing attachment");
+            let mut doc = match (&fdi, extract_header_rev(req)?) {
+                // fabric:open_revs/4 of the rev given.
+                (f, Some((p, rid))) => {
+                    let missing_rev = || CouchError::new(StatusCode::CONFLICT, "not_found", "missing_rev");
+                    let f = f.as_ref().ok_or_else(missing_rev)?;
+                    let ri = Snapshot::find_rev(f, p, &rid).ok_or_else(missing_rev)?;
                     snap.load_doc(f, &ri)?
                 }
-                (Some(f), None) if f.deleted && req.method == Method::PUT => Doc {
-                    id: id.to_string(),
-                    ..Default::default()
-                },
-                (Some(_), None) => return Err(CouchError::conflict()),
-                (None, None) if req.method == Method::PUT => Doc {
-                    id: id.to_string(),
-                    ..Default::default()
-                },
-                (None, _) => {
-                    return Err(if req.method == Method::DELETE {
-                        CouchError::missing()
-                    } else {
-                        CouchError::conflict()
-                    });
+                // Deleting without a rev finds the doc and the attachment,
+                // and then can only conflict.
+                (f, None) if req.method == Method::DELETE => {
+                    let f = f.as_ref().ok_or_else(CouchError::missing)?;
+                    let w = f.winner();
+                    if w.deleted {
+                        return Err(CouchError::deleted());
+                    }
+                    if !snap.load_doc(f, &w)?.atts.iter().any(|a| a.name == name) {
+                        return Err(missing_att());
+                    }
+                    return Err(CouchError::conflict());
                 }
+                (Some(f), None) if !f.deleted => return Err(CouchError::conflict()),
+                _ => Doc {
+                    id: id.to_string(),
+                    ..Default::default()
+                },
             };
             // Load replaces the rev path; only the head is needed to edit.
             if !doc.revs.1.is_empty() {
                 doc.revs.1.truncate(1);
             }
-            doc.deleted = false;
             // Keep existing attachments as stubs: the writer resolves them
             // from the parent revision, so they can't go stale if the file
             // is compacted while this request is in flight.
@@ -1118,7 +1151,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                 let mut w = AttWriter::new(db, &req.server.config, &att);
                 let mut body = req.take_body();
                 while let Some(b) = body.next().await {
-                    let b = b.map_err(|e| CouchError::bad_request(e.to_string()))?;
+                    let b = b.map_err(crate::http::body_error)?;
                     if max.is_some_and(|m| w.taken() + b.len() as u64 > m) {
                         return Err(att_too_large(name));
                     }
@@ -1136,7 +1169,7 @@ async fn att_request(req: &Req, db: &Arc<Db>, id: &str, name: &str) -> Result<Re
                 let before = doc.atts.len();
                 doc.atts.retain(|a| a.name != name);
                 if before == doc.atts.len() {
-                    return Err(CouchError::not_found("Document is missing attachment"));
+                    return Err(missing_att());
                 }
             }
             let new_rev = save_docs(req, db, vec![doc], true).await?.pop().unwrap()?;
@@ -1715,10 +1748,8 @@ async fn bulk_docs(req: &Req, db: &Arc<Db>) -> Result<Response> {
     let mut parsed = Vec::with_capacity(docs.len());
     for d in docs {
         let mut doc = from_json(d.clone())?;
+        validate_revs(&doc, new_edits)?;
         if doc.id.is_empty() {
-            if !new_edits {
-                return Err(CouchError::bad_request("Document id must be specified with new_edits=false"));
-            }
             doc.id = new_uuid();
         }
         validate_docid(&doc.id)?;

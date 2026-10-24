@@ -448,17 +448,21 @@ pub fn from_json(v: Value) -> Result<Doc> {
     Ok(doc)
 }
 
+/// chttpd_db:validate_attachment_name/1.
+pub fn validate_att_name(name: &str) -> Result<()> {
+    if name.starts_with('_') {
+        return Err(CouchError::bad_request(format!("Attachment name '{name}' starts with prohibited character '_'")));
+    }
+    Ok(())
+}
+
 fn parse_atts(v: &Value) -> Result<Vec<Att>> {
     let obj = v
         .as_object()
         .ok_or_else(|| CouchError::bad_request("_attachments must be an object"))?;
     let mut atts = Vec::new();
     for (name, a) in obj {
-        if name.starts_with('_') {
-            return Err(CouchError::bad_request(
-                "Attachment name '_' prefix is reserved for internal use",
-            ));
-        }
+        validate_att_name(name)?;
         let content_type = a
             .get("content_type")
             .and_then(|c| c.as_str())

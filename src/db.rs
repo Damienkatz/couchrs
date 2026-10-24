@@ -1738,6 +1738,9 @@ fn update_interactive(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDoc
     let parent: Option<RevInfo> = match (slot.as_ref(), doc.revs.1.first()) {
         (None, None) => None,
         (None, Some(_)) => return Err(CouchError::conflict()),
+        // A deleted doc is only recreated, from no revision and not
+        // deleted (couch_db_updater:merge_rev_tree/5).
+        (Some(f), _) if f.winner().deleted && (!doc.revs.1.is_empty() || doc.deleted) => return Err(CouchError::conflict()),
         (Some(f), None) => {
             let wn = f.winner();
             if wn.deleted {
@@ -1777,7 +1780,7 @@ fn update_interactive(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDoc
 fn update_replicated(w: &mut Writes, snap: &Snapshot, slot: &mut Option<FullDocInfo>, doc: &Doc, revs_limit: u64) -> Result<(String, bool)> {
     let (pos, ids) = (&doc.revs.0, &doc.revs.1);
     if ids.is_empty() {
-        return Err(CouchError::bad_request("Document rev and _revisions are required with new_edits=false"));
+        return Err(crate::api::revs_required());
     }
     let rev_str = format!("{}-{}", pos, ids[0]);
     if let Some(f) = slot.as_ref() {
