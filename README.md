@@ -141,3 +141,11 @@ it can run against a shared server.
 - **Malformed multipart bodies:** where CouchDB crashes with a 500 and a
   stack trace, CouchRS answers 400. A body with only the JSON part, which
   CouchDB never answers, is accepted.
+
+## License
+
+CouchRS is licensed under the [Apache License, Version 2.0](LICENSE), the
+license of Apache CouchDB, which it ports. [NOTICE](NOTICE) carries Apache
+CouchDB's notices for the code it derives from and the files it bundles.
+Fauxton (`share/www`) keeps its own `LICENSE` and the license files of the
+libraries in its bundles.
