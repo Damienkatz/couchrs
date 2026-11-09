@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="PUT document latency, p99">
+<style>
+svg{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+.bg{fill:#fcfcfb;stroke:rgba(11,11,11,.12)}
+.title{font-size:15px;font-weight:600;fill:#0b0b0b}
+.sub{font-size:12px;fill:#6f6e69}
+.leg{font-size:12.5px;fill:#52514e}
+.lbl{font-size:12.5px;fill:#52514e}
+.val{font-size:11.5px;fill:#52514e;font-variant-numeric:tabular-nums}
+.ratio{font-size:12px;font-weight:600;fill:#0b0b0b;font-variant-numeric:tabular-nums}
+.tick{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}
+.grid{stroke:#e1e0d9}
+.axis{stroke:#c3c2b7}
+.s-erlang{fill:#2a78d6}
+.s-couchrs{fill:#eda100}
+@media (prefers-color-scheme:dark){
+.bg{fill:#1a1a19;stroke:rgba(255,255,255,.12)}
+.title,.ratio{fill:#f0efec}
+.sub,.tick{fill:#9a9890}
+.leg,.lbl,.val{fill:#c3c2b7}
+.grid{stroke:#2c2c2a}
+.axis{stroke:#45453f}
+.s-erlang{fill:#3987e5}
+.s-couchrs{fill:#c98500}
+}
+</style>
+<rect x="0.5" y="0.5" width="759" height="359" rx="10" class="bg"/>
+<text x="18" y="33" class="title">PUT document latency, p99</text>
+<text x="18" y="52" class="sub">ms · lower is better · no bar: no PUT succeeded</text>
+<rect x="18" y="64" width="10" height="10" rx="2" class="s-erlang"/>
+<text x="34" y="74" class="leg">CouchDB (Erlang)</text>
+<rect x="171.2" y="64" width="10" height="10" rx="2" class="s-couchrs"/>
+<text x="187.2" y="74" class="leg">CouchRS (hybrid)</text>
+<line x1="114.0" x2="114.0" y1="92" y2="324" class="grid"/>
+<text x="114.0" y="340" text-anchor="middle" class="tick">0</text>
+<line x1="257.5" x2="257.5" y1="92" y2="324" class="grid"/>
+<text x="257.5" y="340" text-anchor="middle" class="tick">10000</text>
+<line x1="401.0" x2="401.0" y1="92" y2="324" class="grid"/>
+<text x="401.0" y="340" text-anchor="middle" class="tick">20000</text>
+<line x1="544.5" x2="544.5" y1="92" y2="324" class="grid"/>
+<text x="544.5" y="340" text-anchor="middle" class="tick">30000</text>
+<line x1="688.0" x2="688.0" y1="92" y2="324" class="grid"/>
+<text x="688.0" y="340" text-anchor="middle" class="tick">40000</text>
+<line x1="114" x2="114" y1="92" y2="324" class="axis"/>
+<text x="104" y="117" text-anchor="end" class="lbl">15K</text>
+<path d="M114.0,101.0 H251.6 Q255.6,101.0 255.6,105.0 V108.0 Q255.6,112.0 251.6,112.0 H114.0 Z" class="s-erlang"/>
+<text x="261.6" y="110.5" class="val">9870</text>
+<path d="M114.0,114.0 H144.7 Q148.7,114.0 148.7,118.0 V121.0 Q148.7,125.0 144.7,125.0 H114.0 Z" class="s-couchrs"/>
+<text x="154.7" y="123.5" class="val">2419</text>
+<text x="104" y="155" text-anchor="end" class="lbl">30K</text>
+<path d="M114.0,139.0 H676.5 Q680.5,139.0 680.5,143.0 V146.0 Q680.5,150.0 676.5,150.0 H114.0 Z" class="s-erlang"/>
+<text x="686.5" y="148.5" class="val">39476</text>
+<path d="M114.0,152.0 H175.4 Q179.4,152.0 179.4,156.0 V159.0 Q179.4,163.0 175.4,163.0 H114.0 Z" class="s-couchrs"/>
+<text x="185.4" y="161.5" class="val">4559</text>
+<text x="104" y="193" text-anchor="end" class="lbl">45K</text>
+<path d="M114.0,190.0 H209.2 Q213.2,190.0 213.2,194.0 V197.0 Q213.2,201.0 209.2,201.0 H114.0 Z" class="s-couchrs"/>
+<text x="219.2" y="199.5" class="val">6911</text>
+<text x="104" y="231" text-anchor="end" class="lbl">60K</text>
+<path d="M114.0,228.0 H240.8 Q244.8,228.0 244.8,232.0 V235.0 Q244.8,239.0 240.8,239.0 H114.0 Z" class="s-couchrs"/>
+<text x="250.8" y="237.5" class="val">9118</text>
+<text x="104" y="269" text-anchor="end" class="lbl">75K</text>
+<path d="M114.0,266.0 H269.5 Q273.5,266.0 273.5,270.0 V273.0 Q273.5,277.0 269.5,277.0 H114.0 Z" class="s-couchrs"/>
+<text x="279.5" y="275.5" class="val">11115</text>
+<text x="104" y="307" text-anchor="end" class="lbl">90K</text>
+<path d="M114.0,304.0 H308.3 Q312.3,304.0 312.3,308.0 V311.0 Q312.3,315.0 308.3,315.0 H114.0 Z" class="s-couchrs"/>
+<text x="318.3" y="313.5" class="val">13820</text>
+</svg>

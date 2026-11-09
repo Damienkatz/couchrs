@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Server memory">
+<style>
+svg{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+.bg{fill:#fcfcfb;stroke:rgba(11,11,11,.12)}
+.title{font-size:15px;font-weight:600;fill:#0b0b0b}
+.sub{font-size:12px;fill:#6f6e69}
+.leg{font-size:12.5px;fill:#52514e}
+.lbl{font-size:12.5px;fill:#52514e}
+.val{font-size:11.5px;fill:#52514e;font-variant-numeric:tabular-nums}
+.ratio{font-size:12px;font-weight:600;fill:#0b0b0b;font-variant-numeric:tabular-nums}
+.tick{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}
+.grid{stroke:#e1e0d9}
+.axis{stroke:#c3c2b7}
+.s-erlang{fill:#2a78d6}
+.s-couchrs{fill:#eda100}
+@media (prefers-color-scheme:dark){
+.bg{fill:#1a1a19;stroke:rgba(255,255,255,.12)}
+.title,.ratio{fill:#f0efec}
+.sub,.tick{fill:#9a9890}
+.leg,.lbl,.val{fill:#c3c2b7}
+.grid{stroke:#2c2c2a}
+.axis{stroke:#45453f}
+.s-erlang{fill:#3987e5}
+.s-couchrs{fill:#c98500}
+}
+</style>
+<rect x="0.5" y="0.5" width="759" height="359" rx="10" class="bg"/>
+<text x="18" y="33" class="title">Server memory</text>
+<text x="18" y="52" class="sub">peak physical footprint while measuring · lower is better</text>
+<rect x="18" y="64" width="10" height="10" rx="2" class="s-erlang"/>
+<text x="34" y="74" class="leg">CouchDB (Erlang)</text>
+<rect x="171.2" y="64" width="10" height="10" rx="2" class="s-couchrs"/>
+<text x="187.2" y="74" class="leg">CouchRS (hybrid)</text>
+<line x1="114.0" x2="114.0" y1="92" y2="324" class="grid"/>
+<text x="114.0" y="340" text-anchor="middle" class="tick">0.00 B</text>
+<line x1="305.3" x2="305.3" y1="92" y2="324" class="grid"/>
+<text x="305.3" y="340" text-anchor="middle" class="tick">10.0 GB</text>
+<line x1="496.7" x2="496.7" y1="92" y2="324" class="grid"/>
+<text x="496.7" y="340" text-anchor="middle" class="tick">20.0 GB</text>
+<line x1="688.0" x2="688.0" y1="92" y2="324" class="grid"/>
+<text x="688.0" y="340" text-anchor="middle" class="tick">30.0 GB</text>
+<line x1="114" x2="114" y1="92" y2="324" class="axis"/>
+<text x="104" y="117" text-anchor="end" class="lbl">15K</text>
+<path d="M114.0,101.0 H149.3 Q153.3,101.0 153.3,105.0 V108.0 Q153.3,112.0 149.3,112.0 H114.0 Z" class="s-erlang"/>
+<text x="159.3" y="110.5" class="val">2.05 GB</text>
+<path d="M114.0,114.0 H134.0 Q138.0,114.0 138.0,118.0 V121.0 Q138.0,125.0 134.0,125.0 H114.0 Z" class="s-couchrs"/>
+<text x="144.0" y="123.5" class="val">1.25 GB</text>
+<text x="104" y="155" text-anchor="end" class="lbl">30K</text>
+<path d="M114.0,139.0 H183.5 Q187.5,139.0 187.5,143.0 V146.0 Q187.5,150.0 183.5,150.0 H114.0 Z" class="s-erlang"/>
+<text x="193.5" y="148.5" class="val">3.84 GB</text>
+<path d="M114.0,152.0 H146.2 Q150.2,152.0 150.2,156.0 V159.0 Q150.2,163.0 146.2,163.0 H114.0 Z" class="s-couchrs"/>
+<text x="156.2" y="161.5" class="val">1.89 GB</text>
+<text x="104" y="193" text-anchor="end" class="lbl">45K</text>
+<path d="M114.0,177.0 H254.5 Q258.5,177.0 258.5,181.0 V184.0 Q258.5,188.0 254.5,188.0 H114.0 Z" class="s-erlang"/>
+<text x="264.5" y="186.5" class="val">7.55 GB</text>
+<path d="M114.0,190.0 H157.1 Q161.1,190.0 161.1,194.0 V197.0 Q161.1,201.0 157.1,201.0 H114.0 Z" class="s-couchrs"/>
+<text x="167.1" y="199.5" class="val">2.46 GB</text>
+<text x="104" y="231" text-anchor="end" class="lbl">60K</text>
+<path d="M114.0,215.0 H326.7 Q330.7,215.0 330.7,219.0 V222.0 Q330.7,226.0 326.7,226.0 H114.0 Z" class="s-erlang"/>
+<text x="336.7" y="224.5" class="val">11.3 GB</text>
+<path d="M114.0,228.0 H168.2 Q172.2,228.0 172.2,232.0 V235.0 Q172.2,239.0 168.2,239.0 H114.0 Z" class="s-couchrs"/>
+<text x="178.2" y="237.5" class="val">3.04 GB</text>
+<text x="104" y="269" text-anchor="end" class="lbl">75K</text>
+<path d="M114.0,253.0 H481.3 Q485.3,253.0 485.3,257.0 V260.0 Q485.3,264.0 481.3,264.0 H114.0 Z" class="s-erlang"/>
+<text x="491.3" y="262.5" class="val">19.4 GB</text>
+<path d="M114.0,266.0 H178.9 Q182.9,266.0 182.9,270.0 V273.0 Q182.9,277.0 178.9,277.0 H114.0 Z" class="s-couchrs"/>
+<text x="188.9" y="275.5" class="val">3.60 GB</text>
+<text x="104" y="307" text-anchor="end" class="lbl">90K</text>
+<path d="M114.0,291.0 H596.2 Q600.2,291.0 600.2,295.0 V298.0 Q600.2,302.0 596.2,302.0 H114.0 Z" class="s-erlang"/>
+<text x="606.2" y="300.5" class="val">25.4 GB</text>
+<path d="M114.0,304.0 H189.5 Q193.5,304.0 193.5,308.0 V311.0 Q193.5,315.0 189.5,315.0 H114.0 Z" class="s-couchrs"/>
+<text x="199.5" y="313.5" class="val">4.16 GB</text>
+</svg>

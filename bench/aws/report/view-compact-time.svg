@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="170" viewBox="0 0 760 170" role="img" aria-label="View compaction time">
+<style>
+svg{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+.bg{fill:#fcfcfb;stroke:rgba(11,11,11,.12)}
+.title{font-size:15px;font-weight:600;fill:#0b0b0b}
+.sub{font-size:12px;fill:#6f6e69}
+.leg{font-size:12.5px;fill:#52514e}
+.lbl{font-size:12.5px;fill:#52514e}
+.val{font-size:11.5px;fill:#52514e;font-variant-numeric:tabular-nums}
+.ratio{font-size:12px;font-weight:600;fill:#0b0b0b;font-variant-numeric:tabular-nums}
+.tick{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}
+.grid{stroke:#e1e0d9}
+.axis{stroke:#c3c2b7}
+.s-erlang{fill:#2a78d6}
+.s-couchrs{fill:#eda100}
+@media (prefers-color-scheme:dark){
+.bg{fill:#1a1a19;stroke:rgba(255,255,255,.12)}
+.title,.ratio{fill:#f0efec}
+.sub,.tick{fill:#9a9890}
+.leg,.lbl,.val{fill:#c3c2b7}
+.grid{stroke:#2c2c2a}
+.axis{stroke:#45453f}
+.s-erlang{fill:#3987e5}
+.s-couchrs{fill:#c98500}
+}
+</style>
+<rect x="0.5" y="0.5" width="759" height="169" rx="10" class="bg"/>
+<text x="18" y="33" class="title">View compaction time</text>
+<text x="18" y="52" class="sub">seconds · lower is better</text>
+<rect x="18" y="64" width="10" height="10" rx="2" class="s-erlang"/>
+<text x="34" y="74" class="leg">CouchDB (Erlang)</text>
+<rect x="171.2" y="64" width="10" height="10" rx="2" class="s-couchrs"/>
+<text x="187.2" y="74" class="leg">CouchRS (hybrid)</text>
+<line x1="114.0" x2="114.0" y1="92" y2="134" class="grid"/>
+<text x="114.0" y="150" text-anchor="middle" class="tick">0</text>
+<line x1="305.3" x2="305.3" y1="92" y2="134" class="grid"/>
+<text x="305.3" y="150" text-anchor="middle" class="tick">10</text>
+<line x1="496.7" x2="496.7" y1="92" y2="134" class="grid"/>
+<text x="496.7" y="150" text-anchor="middle" class="tick">20</text>
+<line x1="688.0" x2="688.0" y1="92" y2="134" class="grid"/>
+<text x="688.0" y="150" text-anchor="middle" class="tick">30</text>
+<line x1="114" x2="114" y1="92" y2="134" class="axis"/>
+<text x="104" y="117" text-anchor="end" class="lbl">Compaction</text>
+<path d="M114.0,101.0 H673.5 Q677.5,101.0 677.5,105.0 V108.0 Q677.5,112.0 673.5,112.0 H114.0 Z" class="s-erlang"/>
+<text x="683.5" y="110.5" class="val">29</text>
+<path d="M114.0,114.0 H404.4 Q408.4,114.0 408.4,118.0 V121.0 Q408.4,125.0 404.4,125.0 H114.0 Z" class="s-couchrs"/>
+<text x="414.4" y="123.5" class="val">15</text>
+</svg>

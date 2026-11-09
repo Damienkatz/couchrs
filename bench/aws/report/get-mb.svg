@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="398" viewBox="0 0 760 398" role="img" aria-label="GET throughput">
+<style>
+svg{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+.bg{fill:#fcfcfb;stroke:rgba(11,11,11,.12)}
+.title{font-size:15px;font-weight:600;fill:#0b0b0b}
+.sub{font-size:12px;fill:#6f6e69}
+.leg{font-size:12.5px;fill:#52514e}
+.lbl{font-size:12.5px;fill:#52514e}
+.val{font-size:11.5px;fill:#52514e;font-variant-numeric:tabular-nums}
+.ratio{font-size:12px;font-weight:600;fill:#0b0b0b;font-variant-numeric:tabular-nums}
+.tick{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}
+.grid{stroke:#e1e0d9}
+.axis{stroke:#c3c2b7}
+.s-erlang{fill:#2a78d6}
+.s-couchrs{fill:#eda100}
+@media (prefers-color-scheme:dark){
+.bg{fill:#1a1a19;stroke:rgba(255,255,255,.12)}
+.title,.ratio{fill:#f0efec}
+.sub,.tick{fill:#9a9890}
+.leg,.lbl,.val{fill:#c3c2b7}
+.grid{stroke:#2c2c2a}
+.axis{stroke:#45453f}
+.s-erlang{fill:#3987e5}
+.s-couchrs{fill:#c98500}
+}
+</style>
+<rect x="0.5" y="0.5" width="759" height="397" rx="10" class="bg"/>
+<text x="18" y="33" class="title">GET throughput</text>
+<text x="18" y="52" class="sub">MB/s by size band · higher is better</text>
+<rect x="18" y="64" width="10" height="10" rx="2" class="s-erlang"/>
+<text x="34" y="74" class="leg">CouchDB (Erlang)</text>
+<rect x="171.2" y="64" width="10" height="10" rx="2" class="s-couchrs"/>
+<text x="187.2" y="74" class="leg">CouchRS (hybrid)</text>
+<line x1="114.0" x2="114.0" y1="92" y2="362" class="grid"/>
+<text x="114.0" y="378" text-anchor="middle" class="tick">0</text>
+<line x1="257.5" x2="257.5" y1="92" y2="362" class="grid"/>
+<text x="257.5" y="378" text-anchor="middle" class="tick">500</text>
+<line x1="401.0" x2="401.0" y1="92" y2="362" class="grid"/>
+<text x="401.0" y="378" text-anchor="middle" class="tick">1.0K</text>
+<line x1="544.5" x2="544.5" y1="92" y2="362" class="grid"/>
+<text x="544.5" y="378" text-anchor="middle" class="tick">1.5K</text>
+<line x1="688.0" x2="688.0" y1="92" y2="362" class="grid"/>
+<text x="688.0" y="378" text-anchor="middle" class="tick">2.0K</text>
+<line x1="114" x2="114" y1="92" y2="362" class="axis"/>
+<text x="104" y="117" text-anchor="end" class="lbl">100 B</text>
+<path d="M114.0,101.0 H116.0 Q118.0,101.0 118.0,103.0 V110.0 Q118.0,112.0 116.0,112.0 H114.0 Z" class="s-erlang"/>
+<text x="124.0" y="110.5" class="val">3.75</text>
+<path d="M114.0,114.0 H116.1 Q118.2,114.0 118.2,116.1 V122.9 Q118.2,125.0 116.1,125.0 H114.0 Z" class="s-couchrs"/>
+<text x="124.2" y="123.5" class="val">14.6</text>
+<text x="104" y="155" text-anchor="end" class="lbl">1 KB</text>
+<path d="M114.0,139.0 H119.9 Q123.9,139.0 123.9,143.0 V146.0 Q123.9,150.0 119.9,150.0 H114.0 Z" class="s-erlang"/>
+<text x="129.9" y="148.5" class="val">34.4</text>
+<path d="M114.0,152.0 H144.5 Q148.5,152.0 148.5,156.0 V159.0 Q148.5,163.0 144.5,163.0 H114.0 Z" class="s-couchrs"/>
+<text x="154.5" y="161.5" class="val">120</text>
+<text x="104" y="193" text-anchor="end" class="lbl">10 KB</text>
+<path d="M114.0,177.0 H200.6 Q204.6,177.0 204.6,181.0 V184.0 Q204.6,188.0 200.6,188.0 H114.0 Z" class="s-erlang"/>
+<text x="210.6" y="186.5" class="val">316</text>
+<path d="M114.0,190.0 H520.0 Q524.0,190.0 524.0,194.0 V197.0 Q524.0,201.0 520.0,201.0 H114.0 Z" class="s-couchrs"/>
+<text x="530.0" y="199.5" class="val">1.4K</text>
+<text x="104" y="231" text-anchor="end" class="lbl">100 KB</text>
+<path d="M114.0,215.0 H406.9 Q410.9,215.0 410.9,219.0 V222.0 Q410.9,226.0 406.9,226.0 H114.0 Z" class="s-erlang"/>
+<text x="416.9" y="224.5" class="val">1.0K</text>
+<path d="M114.0,228.0 H494.0 Q498.0,228.0 498.0,232.0 V235.0 Q498.0,239.0 494.0,239.0 H114.0 Z" class="s-couchrs"/>
+<text x="504.0" y="237.5" class="val">1.3K</text>
+<text x="104" y="269" text-anchor="end" class="lbl">1 MB</text>
+<path d="M114.0,253.0 H443.8 Q447.8,253.0 447.8,257.0 V260.0 Q447.8,264.0 443.8,264.0 H114.0 Z" class="s-erlang"/>
+<text x="453.8" y="262.5" class="val">1.2K</text>
+<path d="M114.0,266.0 H554.9 Q558.9,266.0 558.9,270.0 V273.0 Q558.9,277.0 554.9,277.0 H114.0 Z" class="s-couchrs"/>
+<text x="564.9" y="275.5" class="val">1.6K</text>
+<text x="104" y="307" text-anchor="end" class="lbl">10 MB</text>
+<path d="M114.0,291.0 H380.7 Q384.7,291.0 384.7,295.0 V298.0 Q384.7,302.0 380.7,302.0 H114.0 Z" class="s-erlang"/>
+<text x="390.7" y="300.5" class="val">943</text>
+<path d="M114.0,304.0 H554.5 Q558.5,304.0 558.5,308.0 V311.0 Q558.5,315.0 554.5,315.0 H114.0 Z" class="s-couchrs"/>
+<text x="564.5" y="313.5" class="val">1.5K</text>
+<text x="104" y="345" text-anchor="end" class="lbl">100 MB</text>
+<path d="M114.0,329.0 H267.4 Q271.4,329.0 271.4,333.0 V336.0 Q271.4,340.0 267.4,340.0 H114.0 Z" class="s-erlang"/>
+<text x="277.4" y="338.5" class="val">549</text>
+<path d="M114.0,342.0 H550.9 Q554.9,342.0 554.9,346.0 V349.0 Q554.9,353.0 550.9,353.0 H114.0 Z" class="s-couchrs"/>
+<text x="560.9" y="351.5" class="val">1.5K</text>
+</svg>

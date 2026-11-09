@@ -6,6 +6,8 @@ test's six "hosts"), all in one AZ and one cluster placement group:
 CouchDB 3.5.3 (Docker), CouchRS `main` (B-tree), `rocksdb-experiment`
 (hybrid) and `async-blocking` (hybrid, point reads inline).
 
+The results for CouchDB and the hybrid CouchRS: [report.md](report.md).
+
 1. Launch (us-east-1a, Amazon Linux 2023, default VPC), tagging
    everything `Project=couchdb-rs-bench`: import a key pair
    `couchdb-rs-bench-damien`, create security group `couchdb-rs-bench`
@@ -26,7 +28,9 @@ CouchDB 3.5.3 (Docker), CouchRS `main` (B-tree), `rocksdb-experiment`
    `nohup ./pair.sh NAME KIND SERVER_PRIVATE_IP HOST_IPS > run.log &`
    (`TOTAL_GB` and `SCALE_ARGS` shrink it for a rehearsal).
 5. `collect.py` fetches and merges the results into `results-aws.json`;
-   `REPORT_ENV=aws ../report.py ../results-aws.json ../report-aws.html`.
+   `REPORT_ENV=aws ../report.py ../results-aws.json ../report-aws.html`
+   writes the interactive report, and `../report_md.py` writes
+   `report.md` and its charts in `report/` for GitHub.
 6. `down.sh` terminates everything tagged `Project=couchdb-rs-bench` and
    deletes the placement group, security group and key pair.
 

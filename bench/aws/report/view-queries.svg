@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="284" viewBox="0 0 760 284" role="img" aria-label="View queries">
+<style>
+svg{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+.bg{fill:#fcfcfb;stroke:rgba(11,11,11,.12)}
+.title{font-size:15px;font-weight:600;fill:#0b0b0b}
+.sub{font-size:12px;fill:#6f6e69}
+.leg{font-size:12.5px;fill:#52514e}
+.lbl{font-size:12.5px;fill:#52514e}
+.val{font-size:11.5px;fill:#52514e;font-variant-numeric:tabular-nums}
+.ratio{font-size:12px;font-weight:600;fill:#0b0b0b;font-variant-numeric:tabular-nums}
+.tick{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}
+.grid{stroke:#e1e0d9}
+.axis{stroke:#c3c2b7}
+.s-erlang{fill:#2a78d6}
+.s-couchrs{fill:#eda100}
+@media (prefers-color-scheme:dark){
+.bg{fill:#1a1a19;stroke:rgba(255,255,255,.12)}
+.title,.ratio{fill:#f0efec}
+.sub,.tick{fill:#9a9890}
+.leg,.lbl,.val{fill:#c3c2b7}
+.grid{stroke:#2c2c2a}
+.axis{stroke:#45453f}
+.s-erlang{fill:#3987e5}
+.s-couchrs{fill:#c98500}
+}
+</style>
+<rect x="0.5" y="0.5" width="759" height="283" rx="10" class="bg"/>
+<text x="18" y="33" class="title">View queries</text>
+<text x="18" y="52" class="sub">queries/s · higher is better</text>
+<rect x="18" y="64" width="10" height="10" rx="2" class="s-erlang"/>
+<text x="34" y="74" class="leg">CouchDB (Erlang)</text>
+<rect x="171.2" y="64" width="10" height="10" rx="2" class="s-couchrs"/>
+<text x="187.2" y="74" class="leg">CouchRS (hybrid)</text>
+<line x1="128.0" x2="128.0" y1="92" y2="248" class="grid"/>
+<text x="128.0" y="264" text-anchor="middle" class="tick">0</text>
+<line x1="314.7" x2="314.7" y1="92" y2="248" class="grid"/>
+<text x="314.7" y="264" text-anchor="middle" class="tick">10K</text>
+<line x1="501.3" x2="501.3" y1="92" y2="248" class="grid"/>
+<text x="501.3" y="264" text-anchor="middle" class="tick">20K</text>
+<line x1="688.0" x2="688.0" y1="92" y2="248" class="grid"/>
+<text x="688.0" y="264" text-anchor="middle" class="tick">30K</text>
+<line x1="128" x2="128" y1="92" y2="248" class="axis"/>
+<text x="118" y="117" text-anchor="end" class="lbl">Key lookup</text>
+<path d="M128.0,101.0 H285.7 Q289.7,101.0 289.7,105.0 V108.0 Q289.7,112.0 285.7,112.0 H128.0 Z" class="s-erlang"/>
+<text x="295.7" y="110.5" class="val">8.7K</text>
+<path d="M128.0,114.0 H542.9 Q546.9,114.0 546.9,118.0 V121.0 Q546.9,125.0 542.9,125.0 H128.0 Z" class="s-couchrs"/>
+<text x="552.9" y="123.5" class="val">22K</text>
+<text x="118" y="155" text-anchor="end" class="lbl">Key + reduce</text>
+<path d="M128.0,139.0 H266.9 Q270.9,139.0 270.9,143.0 V146.0 Q270.9,150.0 266.9,150.0 H128.0 Z" class="s-erlang"/>
+<text x="276.9" y="148.5" class="val">7.7K</text>
+<path d="M128.0,152.0 H643.2 Q647.2,152.0 647.2,156.0 V159.0 Q647.2,163.0 643.2,163.0 H128.0 Z" class="s-couchrs"/>
+<text x="653.2" y="161.5" class="val">28K</text>
+<text x="118" y="193" text-anchor="end" class="lbl">Group reduce</text>
+<path d="M128.0,177.0 H144.6 Q148.6,177.0 148.6,181.0 V184.0 Q148.6,188.0 144.6,188.0 H128.0 Z" class="s-erlang"/>
+<text x="154.6" y="186.5" class="val">1.1K</text>
+<path d="M128.0,190.0 H321.8 Q325.8,190.0 325.8,194.0 V197.0 Q325.8,201.0 321.8,201.0 H128.0 Z" class="s-couchrs"/>
+<text x="331.8" y="199.5" class="val">11K</text>
+<text x="118" y="231" text-anchor="end" class="lbl">include_docs</text>
+<path d="M128.0,215.0 H167.6 Q171.6,215.0 171.6,219.0 V222.0 Q171.6,226.0 167.6,226.0 H128.0 Z" class="s-erlang"/>
+<text x="177.6" y="224.5" class="val">2.3K</text>
+<path d="M128.0,228.0 H336.1 Q340.1,228.0 340.1,232.0 V235.0 Q340.1,239.0 336.1,239.0 H128.0 Z" class="s-couchrs"/>
+<text x="346.1" y="237.5" class="val">11K</text>
+</svg>
